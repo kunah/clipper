@@ -65,6 +65,37 @@ services:
         condition: service_started
     restart: "no"
 
+  # Which channels are live + viewer counts (needs Twitch app credentials), maintenance.
+  controller:
+    build:
+      context: .
+      dockerfile: services/controller/Dockerfile
+    image: clipper/controller:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: controller
+      CLIPPER_TWITCH_CLIENT_ID: ${CLIPPER_TWITCH_CLIENT_ID:-}
+      CLIPPER_TWITCH_CLIENT_SECRET: ${CLIPPER_TWITCH_CLIENT_SECRET:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Chat logger. Restarting it loses the chat in between, so redeploy it rarely.
+  chat-ingest:
+    build:
+      context: .
+      dockerfile: services/chat-ingest/Dockerfile
+    image: clipper/chat-ingest:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: chat-ingest
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 20s   # time to flush buffered chat on shutdown
+
 volumes:
   pgdata:
   objectdata:

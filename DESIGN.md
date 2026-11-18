@@ -4,8 +4,9 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-18):** Phase 1 / step 1 done (workspace, shared core, schema, job queue,
-> compose with Postgres + SeaweedFS). Next: step 2 (controller + chat-ingest).
+> **Status (2026-11-18):** Phase 1 / steps 1–2 done (workspace, shared core, schema, job queue,
+> unified logging, Twitch lib, controller, chat-ingest). Next: step 3 (recorder).
+> Controller live status needs Twitch app credentials in `.env`; chat logging works without.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -214,7 +215,11 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 1. ✅ Skeleton: workspace, `libs/core` (settings, timeline, contracts, models, job queue,
    media requests, leases, heartbeats, storage, partitions), migrations + `migrate`
    container, compose (Postgres 18 + pgvector, SeaweedFS), tests (34 passing).
-2. ⬜ controller + chat-ingest: live status, viewer counts, chat log, events, per-second stats.
+2. ✅ `libs/twitch` (IRC parser + anonymous chat client, Helix client, 7TV/BTTV/FFZ emotes),
+   controller (Helix polling every 30 s, streams with 2-miss grace, viewer snapshots, leader
+   lease, maintenance: partitions + stale-job requeue, `clipper-channels` CLI), chat-ingest
+   (one connection for all channels, raw messages, events, deletions, per-second stats with
+   emote counts by name; 1 s batched writes, retry on DB errors).
 3. ⬜ recorder: HLS with program-date-time, `.ts` + `.aac` chunks, gaps, enqueue transcription
    at `priority_for_range`.
 4. ⬜ transcriber: GPU, word timestamps, hot/cold priority, benchmark the 4060.
@@ -224,8 +229,10 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
 analytics loop. Then Kick/YouTube.
 
-**Before step 2**: register a Twitch app (dev.twitch.tv/console → client ID/secret), pick
-3–5 channels, check home download bandwidth.
+**Open items**: register a Twitch app (dev.twitch.tv/console → client ID/secret into `.env`
+as `CLIPPER_TWITCH_CLIENT_ID/SECRET`), pick the real channels (`clipper-channels add ...`).
+FFZ emote API was unreachable on 2026-11-18; its parser follows the documented format but is
+unverified. chat-ingest is a single instance for now (use per-channel leases to shard later).
 
 ## 15. Decision log
 
@@ -242,4 +249,8 @@ analytics loop. Then Kick/YouTube.
 | 2026-11-18 | Postgres as queue + state, no Redis/NATS yet | low volume, transactional enqueue, fewer moving parts |
 | 2026-11-18 | SeaweedFS instead of MinIO | MinIO stopped community images |
 | 2026-11-18 | Postgres host port 5433, use 127.0.0.1 | 5432 taken on this PC; `localhost` stalls on IPv6 |
+| 2026-11-18 | Twitch clients in a separate `libs/twitch` (not core) | core stays dependency-light; backfill tool will reuse IRC/Helix/emotes |
+| 2026-11-18 | Chat via anonymous IRC; own minimal client | no credentials needed, full access to tags (tmi-sent-ts, emotes, USERNOTICE) |
+| 2026-11-18 | Per-second stats store emote counts **by name**; categories applied by the detector | the emote→meaning mapping can change without re-ingesting chat |
+| 2026-11-18 | Third-party emotes (7TV/BTTV/FFZ) recognised by token match | KEKW/OMEGALUL/Pog etc. are not Twitch emotes |
 | 2026-11-18 | Unified structured logging in core (stdlib logging, JSON lines to stdout, context fields) | one format for all services and libraries; ready for CloudWatch Logs/Insights and EMF metrics later without changing call sites |

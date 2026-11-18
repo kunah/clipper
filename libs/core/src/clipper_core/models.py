@@ -41,8 +41,9 @@ class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
     type_annotation_map = {  # noqa: RUF012 - SQLAlchemy reads this class attribute
         datetime: DateTime(timezone=True),
-        dict[str, Any]: JSONB,
-        list[Any]: JSONB,
+        # none_as_null: Python None -> SQL NULL (not the JSON scalar `null`)
+        dict[str, Any]: JSONB(none_as_null=True),
+        list[Any]: JSONB(none_as_null=True),
     }
 
 

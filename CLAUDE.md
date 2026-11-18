@@ -12,8 +12,11 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `media` (time-range requests that raise priorities), `leases`, `heartbeat`, `storage`
   (S3 + key layout), `partitions` (daily chat partitions), `logs` (unified structured
   logging), `runtime` (entry helpers).
+- `libs/twitch/` (`clipper_twitch`): IRC parser + anonymous chat client, Helix API client,
+  third-party emote sets (7TV/BTTV/FFZ), `TwitchSettings` (`CLIPPER_TWITCH_*`).
 - `db/` (`clipper_db`): Alembic migrations + `clipper-migrate` one-off container.
-- `services/<name>/`: one app per service (none yet; step 2 adds controller + chat-ingest).
+- `services/controller/`: live status via Helix, streams, viewer snapshots, maintenance,
+  and the `clipper-channels` CLI. `services/chat-ingest/`: chat logger + per-second stats.
 - `tools/`: CLIs like backfill (later).
 - `compose.yaml`: Postgres 18 + pgvector, SeaweedFS (S3), migrate, and services.
 
@@ -26,6 +29,8 @@ docker compose up --build migrate           # migrations + partitions + bucket
 uv run pytest                               # all tests (integration ones need compose infra)
 uv run ruff check . --fix && uv run ruff format .
 uv run alembic -c db/alembic.ini revision -m "add x"   # then write the migration by hand
+uv run clipper-channels add xqc --mode audio_only      # list | mode <login> <mode> | enable | disable
+docker compose up -d --build controller chat-ingest
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).

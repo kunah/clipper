@@ -15,7 +15,15 @@ docker compose logs migrate          # should end with "bucket clipper ready"
 
 uv sync --all-packages               # local dev environment
 uv run pytest                        # tests (integration tests use the compose Postgres)
+
+uv run clipper-channels add xqc kaicenat --mode full   # channels to monitor
+uv run clipper-channels list
+docker compose logs -f chat-ingest controller
 ```
+
+Live status (controller) needs a Twitch app: create one at dev.twitch.tv/console and put
+`CLIPPER_TWITCH_CLIENT_ID` / `CLIPPER_TWITCH_CLIENT_SECRET` into `.env`. Chat logging works
+without it.
 
 | What | Where |
 |---|---|
