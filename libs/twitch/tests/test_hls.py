@@ -33,7 +33,8 @@ def test_live_playlist_segments_have_utc_times():
     pl = parse_media_playlist(LIVE)
     assert pl.target_duration == 6.0
     assert pl.media_sequence == 26499
-    assert not pl.ended and pl.init_uri is None
+    assert not pl.ended
+    assert all(s.init_uri is None for s in pl.segments)  # MPEG-TS: no init section
     assert [s.sequence for s in pl.segments] == [26499, 26500, 26501]
     first = pl.segments[0]
     assert first.start == T0 and first.start.tzinfo is not None
@@ -105,9 +106,26 @@ def test_playlist_without_any_date_is_rejected():
         parse_media_playlist("<html>")
 
 
-def test_fmp4_init_section_is_reported():
-    text = '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n'
-    assert parse_media_playlist(text, "https://h/p/x.m3u8").init_uri == "https://h/p/init.mp4"
+def test_fmp4_segments_carry_their_init_section():
+    text = """#EXTM3U
+#EXT-X-VERSION:6
+#EXT-X-MAP:URI="init-a.mp4"
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T22:28:14.013Z
+#EXTINF:2.000,live
+a.mp4
+#EXTINF:2.000,live
+b.mp4
+#EXT-X-DISCONTINUITY
+#EXT-X-MAP:URI="init-b.mp4"
+#EXTINF:2.000,live
+c.mp4
+"""
+    pl = parse_media_playlist(text, "https://h/p/x.m3u8")
+    assert [s.init_uri for s in pl.segments] == [
+        "https://h/p/init-a.mp4",
+        "https://h/p/init-a.mp4",
+        "https://h/p/init-b.mp4",
+    ]
 
 
 def test_attribute_lists():

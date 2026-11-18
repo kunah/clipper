@@ -73,7 +73,7 @@ may contain copyrighted music (Content ID).
 | Twitch status | Helix Get Streams: up to 100 channels per request, includes viewer count. |
 | Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. |
 | Twitch clips | Get Clips returns top viewer-made clips with `vod_offset` → free ground truth for testing the detector. |
-| Twitch HLS | 2 s MPEG-TS segments (H.264 + AAC 48 kHz + timed ID3), each with `EXT-X-PROGRAM-DATE-TIME`; the live playlist holds only ~30 s, so a recorder restarted within ~30 s loses nothing. Source 1080p60 ≈ 8.4 Mbps (~63 MB/min); audio ≈ 165 kbps (~1.2 MB/min). Ads are inserted for our recorder (a viewer): segments titled "Amazon…" or inside a `twitch-stitched-ad` DATERANGE; filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
+| Twitch HLS | 2 s segments, each with `EXT-X-PROGRAM-DATE-TIME`, in one of two containers depending on the channel (seen 2026-11-18): MPEG-TS (H.264 + AAC 48 kHz + timed ID3; e.g. xqc) or fragmented MP4 (`EXT-X-MAP` init section + `.mp4` fragments, all renditions incl. audio_only; e.g. ohnepixel), even when only H.264 is requested; the live playlist holds only ~30 s, so a recorder restarted within ~30 s loses nothing. Source 1080p60 ≈ 8.4 Mbps (~63 MB/min); audio ≈ 165 kbps (~1.2 MB/min). Ads are inserted for our recorder (a viewer): segments titled "Amazon…" or inside a `twitch-stitched-ad` DATERANGE; filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
 | MinIO | Community Docker images stopped Oct 2025 → we use **SeaweedFS** (`weed mini`). |
 
 ## 4. Detection
@@ -238,12 +238,12 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
 analytics loop. Then Kick/YouTube.
 
-**Open items**: register a Twitch app (dev.twitch.tv/console → client ID/secret into `.env`
-as `CLIPPER_TWITCH_CLIENT_ID/SECRET`), pick the real channels (`clipper-channels add ...`).
+**Open items**: Twitch app registered and in `.env` (2026-11-18); first channel ohnepixel
+(`full`); pick the rest of the real channels (`clipper-channels add ...`).
 FFZ emote API was unreachable on 2026-11-18; its parser follows the documented format but is
 unverified. chat-ingest is a single instance for now (use per-channel leases to shard later).
 Recorder: ad detection follows streamlink's rules but hasn't been seen live yet (no ad during
-the test); fMP4/HEVC renditions are not supported (we request H.264, which Twitch serves as TS);
+the test); we request H.264 only (HEVC/AV1 renditions untested);
 gap rows become visible with the chunk after the gap (up to ~60 s later); video retention
 (delete after ~48 h) is not implemented yet; recording starts up to ~40 s after go-live
 (controller poll 30 s + recorder sync 10 s), and the playlist's ~30 s backlog covers most of it.
@@ -273,3 +273,4 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-18 | Spool chunks on local disk before upload; a state file per chunk, rewritten after each segment | S3/DB outages and crashes don't lose media; recovery cuts back to the last complete segment |
 | 2026-11-18 | Chunks are continuous; a gap row is committed with the chunk that follows it | exact time mapping inside a chunk; gap + chunk are atomic and survive crashes |
 | 2026-11-18 | New gap reason `not_recorded` (no recorder running: joined late, restart) | consumers can tell "nothing was there" (ad) from "we missed it" |
+| 2026-11-18 | fMP4 streams: spool init section + fragments as `.mp4`, remux to `.ts` (ffmpeg copy) when the chunk is finished; a changed init section starts a new chunk | storage and every consumer keep one format (`.ts` + `.aac`); the spool file stays readable after a crash |

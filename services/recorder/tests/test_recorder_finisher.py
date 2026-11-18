@@ -31,19 +31,26 @@ class MemoryStore:
         self.objects[key] = (Path(path).read_bytes(), content_type)
 
 
-def make_ts(path: Path, *, video=True, audio=True, seconds=2) -> None:
-    """A small MPEG-TS like Twitch's (built-in encoders only, so any ffmpeg build works)."""
+def make_media(path: Path, *, video=True, audio=True, seconds=2, container="ts") -> None:
+    """A small MPEG-TS, or fragmented MP4 (init + fragments), like Twitch serves.
+
+    Built-in encoders only, so any ffmpeg build works.
+    """
     args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     if video:
         args += ["-f", "lavfi", "-i", f"testsrc=size=160x120:rate=30:duration={seconds}"]
     if audio:
         args += ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={seconds}"]
     if video:
-        args += ["-c:v", "mpeg2video"]
+        args += ["-c:v", "mpeg2video" if container == "ts" else "mpeg4"]
     if audio:
         args += ["-c:a", "aac"]
+    if container == "ts":
+        args += ["-f", "mpegts"]
+    else:
+        args += ["-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([*args, "-f", "mpegts", str(path)], check=True)
+    subprocess.run([*args, str(path)], check=True)
 
 
 async def setup_stream(sessions) -> int:
@@ -62,18 +69,21 @@ async def setup_stream(sessions) -> int:
         ).scalar_one()
 
 
-def spooled_chunk(spool: Spool, stream_id: int, seq: int, mode=RecordingMode.FULL, **ts_kwargs):
+def spooled_chunk(
+    spool: Spool, stream_id: int, seq: int, mode=RecordingMode.FULL, container="ts", **kwargs
+):
     state = ChunkState(
         stream_id=stream_id,
         channel="dallas",
         seq=seq,
         mode=mode,
+        container=container,
         start=T0 + timedelta(seconds=60 * seq),
         end=T0 + timedelta(seconds=60 * seq + 2),
         closed=True,
         segments=1,
     )
-    make_ts(spool.media_path(state), **ts_kwargs)
+    make_media(spool.media_path(state), container=container, **kwargs)
     state = state.model_copy(update={"bytes": spool.media_path(state).stat().st_size})
     spool.save(state)
     return state
@@ -176,6 +186,23 @@ async def test_crashed_chunk_is_cut_back_to_its_last_complete_segment(sessions, 
     assert await finisher.drain(timeout_s=30)
     assert store.objects[keys.chunk_video(stream_id, 0)][0] == good
     assert spool.pending() == []
+
+
+async def test_fmp4_chunk_is_stored_as_ts(sessions, tmp_path):
+    stream_id = await setup_stream(sessions)
+    spool, store = Spool(tmp_path), MemoryStore()
+    state = spooled_chunk(spool, stream_id, 0, container="mp4")
+    assert spool.media_path(state).suffix == ".mp4"
+
+    await Finisher(sessions, store, spool).finish(state)
+
+    video, ctype = store.objects[keys.chunk_video(stream_id, 0)]
+    assert ctype == "video/mp2t"
+    assert video[0] == 0x47 and video[188] == 0x47  # MPEG-TS packets
+    assert store.objects[keys.chunk_audio(stream_id, 0)][0][:2] == b"\xff\xf1"  # ADTS
+    (job,) = await rows(sessions, "SELECT kind FROM jobs")
+    assert job.kind == "transcribe"
+    assert not any(tmp_path.rglob("*.*"))  # .mp4, remuxed .ts, .aac and state all gone
 
 
 def test_empty_leftover_is_dropped(tmp_path):

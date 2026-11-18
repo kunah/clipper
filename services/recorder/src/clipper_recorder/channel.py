@@ -5,6 +5,8 @@ in order -> append to the open chunk -> close the chunk at `chunk_seconds`, on a
 when nothing arrives for `idle_close_s` -> hand closed chunks to the finisher.
 Playlist errors: 3 failures in a row -> resolve again; offline -> retry every `offline_retry_s`
 until the controller ends the stream (the service then stops this recorder).
+fMP4 streams: each chunk file starts with the init section (EXT-X-MAP) its fragments belong to;
+a different init section starts a new chunk.
 """
 
 from __future__ import annotations
@@ -76,6 +78,7 @@ class ChannelRecorder:
         self.chunks = 0
         self._last_append = time.monotonic()
         self._offline_logged = False
+        self._inits: dict[str, bytes] = {}  # fMP4 init sections by URI (tiny, ~1 KB each)
 
     async def run(self, stop: asyncio.Event) -> None:
         with log_context(channel=self.a.login, stream_id=self.a.stream_id):
@@ -119,10 +122,6 @@ class ChannelRecorder:
                     return
                 await _wait(stop, 1.0 if self.reload_interval_s is None else self.reload_interval_s)
                 continue
-            if playlist.init_uri:
-                log.error("fMP4 playlists (EXT-X-MAP) are not supported yet", url=url)
-                await _wait(stop, 60.0)
-                return
 
             new = 0
             for seg in playlist.segments:
@@ -134,8 +133,10 @@ class ChannelRecorder:
 
             if self.writer and time.monotonic() - self._last_append > self.idle_close_s:
                 self._close_chunk()
-            if playlist.ended:
+            if playlist.ended:  # broadcast over (or restarting): wait before asking again
                 log.info("playlist ended")
+                self._close_chunk()
+                await _wait(stop, self.offline_retry_s)
                 return
             await _wait(stop, self._reload_delay(playlist, new))
 
@@ -145,7 +146,11 @@ class ChannelRecorder:
                 log.info("ad break started", at=seg.start.isoformat())
             self._close_chunk()
             return
-        data = await self._download(seg)
+        init = await self._init_section(seg.init_uri) if seg.init_uri else None
+        if seg.init_uri and init is None:
+            data = None  # a fragment is useless without its init section
+        else:
+            data = await self._download(seg)
         if data is None:
             self.tracker.lost(seg)
             return
@@ -157,7 +162,7 @@ class ChannelRecorder:
                 seconds=round(plan.gap.seconds, 3),
                 start=plan.gap.start.isoformat(),
             )
-        if plan.split:
+        if plan.split or (self.writer and self.writer.init != init):
             self._close_chunk()
         if self.writer is None:
             self.writer = ChunkWriter.open(
@@ -168,6 +173,7 @@ class ChannelRecorder:
                 mode=self.a.mode,
                 first=seg,
                 gap_before=_gap_state(plan.gap),
+                init=init,
             )
             self.next_seq += 1
         await self.writer.append(seg, data)
@@ -188,17 +194,26 @@ class ChannelRecorder:
         resp.raise_for_status()
         return parse_media_playlist(resp.text, str(resp.url))
 
-    async def _download(self, seg: Segment, attempts: int = 3) -> bytes | None:
+    async def _download(self, seg: Segment) -> bytes | None:
+        return await self._get(seg.uri, what="segment", start=seg.start.isoformat())
+
+    async def _init_section(self, uri: str) -> bytes | None:
+        if uri not in self._inits:
+            data = await self._get(uri, what="init section")
+            if data is None:
+                return None
+            self._inits = {uri: data}  # keep only the current one
+        return self._inits[uri]
+
+    async def _get(self, url: str, *, what: str, attempts: int = 3, **fields) -> bytes | None:
         for attempt in range(1, attempts + 1):
             try:
-                resp = await self.http.get(seg.uri)
+                resp = await self.http.get(url)
                 resp.raise_for_status()
                 return resp.content
             except httpx.HTTPError as exc:
                 if attempt == attempts:
-                    log.warning(
-                        "segment lost", start=seg.start.isoformat(), error=str(exc) or repr(exc)
-                    )
+                    log.warning("download failed", what=what, error=str(exc) or repr(exc), **fields)
                     return None
                 await asyncio.sleep(0.5 * attempt)
         return None

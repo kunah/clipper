@@ -40,27 +40,30 @@ class Store(Protocol):
     def put_file(self, key: str, path: Path | str, content_type: str | None = None) -> None: ...
 
 
-def extract_audio(ffmpeg: str, media: Path, out: Path) -> str | None:
-    """Copy the first audio track into an ADTS .aac file (no re-encode).
-
-    Returns an error message, or None on success.
-    """
+def _ffmpeg_copy(ffmpeg: str, media: Path, out: Path, args: list[str]) -> str | None:
+    """Run ffmpeg without re-encoding. Returns an error message, or None on success."""
+    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(media)]
     try:
-        args = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(media)]
-        args += ["-map", "0:a:0", "-c", "copy", "-f", "adts", str(out)]
         result = subprocess.run(
-            [ffmpeg, *args],
-            capture_output=True,
-            text=True,
-            timeout=300,
+            [*cmd, *args, "-c", "copy", str(out)], capture_output=True, text=True, timeout=300
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"{type(exc).__name__}: {exc}"
     if result.returncode != 0:
         return result.stderr.strip()[-500:] or f"ffmpeg exited with {result.returncode}"
     if not out.exists() or out.stat().st_size == 0:
-        return "ffmpeg produced no audio"
+        return "ffmpeg wrote nothing"
     return None
+
+
+def extract_audio(ffmpeg: str, media: Path, out: Path) -> str | None:
+    """First audio track -> ADTS .aac file."""
+    return _ffmpeg_copy(ffmpeg, media, out, ["-map", "0:a:0", "-f", "adts"])
+
+
+def remux_to_ts(ffmpeg: str, media: Path, out: Path) -> str | None:
+    """Fragmented MP4 (init + fragments) -> MPEG-TS, so storage only ever holds .ts video."""
+    return _ffmpeg_copy(ffmpeg, media, out, ["-map", "0:v:0", "-map", "0:a:0?", "-f", "mpegts"])
 
 
 class Finisher:
@@ -140,9 +143,18 @@ class Finisher:
         video_key = audio_key = None
         video_bytes = audio_bytes = None
         if state.mode == RecordingMode.FULL:
-            video_key = keys.chunk_video(state.stream_id, state.seq)
-            video_bytes = media_path.stat().st_size
-            await asyncio.to_thread(self.store.put_file, video_key, media_path, "video/mp2t")
+            video_path = self.spool.video_path(state)
+            video_error = None
+            if video_path != media_path:  # fMP4: remux to .ts first
+                video_error = await asyncio.to_thread(
+                    remux_to_ts, self.ffmpeg, media_path, video_path
+                )
+            if video_error:
+                log.error("remux to .ts failed, chunk has no video", error=video_error)
+            else:
+                video_key = keys.chunk_video(state.stream_id, state.seq)
+                video_bytes = video_path.stat().st_size
+                await asyncio.to_thread(self.store.put_file, video_key, video_path, "video/mp2t")
         if not error:
             audio_key = keys.chunk_audio(state.stream_id, state.seq)
             audio_bytes = audio_path.stat().st_size

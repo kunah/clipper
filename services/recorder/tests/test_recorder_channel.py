@@ -18,15 +18,19 @@ def at(i: int) -> datetime:
     return T0 + timedelta(seconds=2 * i)
 
 
-def playlist(indices, ads=(), discontinuities=()) -> str:
+def playlist(indices, ads=(), discontinuities=(), maps=None) -> str:
+    """maps: {segment index: init name} -> fMP4 playlist (EXT-X-MAP before that segment)."""
     lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:6", f"#EXT-X-MEDIA-SEQUENCE:{indices[0]}"]
+    ext = "mp4" if maps else "ts"
     for i in indices:
         if i in discontinuities:
             lines.append("#EXT-X-DISCONTINUITY")
+        if maps and i in maps:
+            lines.append(f'#EXT-X-MAP:URI="https://cdn.test/v1/segment/init-{maps[i]}.mp4"')
         stamp = at(i).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         lines.append(f"#EXT-X-PROGRAM-DATE-TIME:{stamp}")
         lines.append(f"#EXTINF:2.000,{'Amazon|1' if i in ads else 'live'}")
-        lines.append(f"https://cdn.test/v1/segment/{i}.ts")
+        lines.append(f"https://cdn.test/v1/segment/{i}.{ext}")
     return "\n".join(lines) + "\n"
 
 
@@ -38,6 +42,7 @@ class FakeCdn:
         self.stop = stop
         self.missing = set(missing)
         self.segment_requests: list[int] = []
+        self.init_requests: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith(".m3u8"):
@@ -48,7 +53,11 @@ class FakeCdn:
             if isinstance(step, int):
                 return httpx.Response(step)
             return httpx.Response(200, text=step)
-        i = int(request.url.path.rsplit("/", 1)[1].removesuffix(".ts"))
+        name = request.url.path.rsplit("/", 1)[1].rsplit(".", 1)[0]
+        if name.startswith("init-"):
+            self.init_requests.append(name)
+            return httpx.Response(200, content=f"<{name}>".encode())
+        i = int(name)
         self.segment_requests.append(i)
         if i in self.missing:
             return httpx.Response(404)
@@ -133,5 +142,32 @@ async def test_offline_then_playlist_errors_resolve_again(tmp_path):
     assert resolver.calls == 3  # offline, live, again after 3 failed reloads
     assert [(c.start, c.end) for c in closed] == [(at(0), at(2)), (at(5), at(7))]
     assert closed[0].gap_before is None  # go-live == first segment
+    gap = closed[1].gap_before
+    assert (gap.start, gap.end, gap.reason) == (at(2), at(5), GapReason.RECONNECT)
+
+
+async def test_fmp4_chunks_start_with_their_init_section(tmp_path):
+    a, b = {0: "a"}, {0: "a", 3: "b"}  # the init section changes at segment 3
+    script = [playlist([0, 1], maps=a), playlist([0, 1, 2, 3, 4], maps=b)]
+    closed, spool, cdn = await record(tmp_path, script, chunk_seconds=60)
+
+    assert cdn.init_requests == ["init-a", "init-b"]  # fetched once each, not per segment
+    assert [(c.start, c.end, c.container) for c in closed] == [
+        (at(0), at(3), "mp4"),
+        (at(3), at(5), "mp4"),  # new init -> new chunk, but no gap
+    ]
+    assert closed[1].gap_before is None
+    assert spool.media_path(closed[0]).read_bytes() == b"<init-a><seg0><seg1><seg2>"
+    assert spool.media_path(closed[1]).read_bytes() == b"<init-b><seg3><seg4>"
+    assert closed[0].bytes == len(b"<init-a><seg0><seg1><seg2>") and closed[0].segments == 3
+
+
+async def test_ended_playlist_closes_the_chunk_and_resolves_again(tmp_path):
+    resolver = FakeResolver()
+    script = [playlist([0, 1]) + "#EXT-X-ENDLIST\n", playlist([5])]
+    closed, _, _ = await record(tmp_path, script, resolver=resolver, chunk_seconds=60)
+
+    assert resolver.calls == 2
+    assert [(c.start, c.end) for c in closed] == [(at(0), at(2)), (at(5), at(6))]
     gap = closed[1].gap_before
     assert (gap.start, gap.end, gap.reason) == (at(2), at(5), GapReason.RECONNECT)

@@ -8,6 +8,8 @@ Only what the recorder needs, following Twitch's format (ad rules as in streamli
   or with "Amazon" in the title.
 - `EXT-X-TWITCH-PREFETCH` (low-latency segments that aren't finished yet) is ignored: they show
   up as normal segments on a later reload.
+- Twitch serves either MPEG-TS segments or fragmented MP4 (`EXT-X-MAP` init section + `.mp4`
+  fragments), depending on the channel. Each segment carries the init section in effect for it.
 - The playlist only holds the last ~30 s, so it has to be reloaded every couple of seconds.
 """
 
@@ -32,6 +34,7 @@ class Segment:
     title: str | None
     ad: bool
     discontinuity: bool  # EXT-X-DISCONTINUITY before this segment
+    init_uri: str | None = None  # EXT-X-MAP in effect: fMP4 fragment, needs this init section first
 
     @property
     def end(self) -> datetime:
@@ -44,7 +47,6 @@ class MediaPlaylist:
     target_duration: float
     media_sequence: int
     ended: bool  # EXT-X-ENDLIST: no more segments will come
-    init_uri: str | None  # EXT-X-MAP: fMP4 segments that need an init section
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +110,7 @@ def parse_media_playlist(text: str, base_url: str = "") -> MediaPlaylist:
                     "title": pending.get("title"),
                     "start": pending.get("start"),
                     "discontinuity": pending.get("discontinuity", False),
+                    "init_uri": init_uri,
                 }
             )
             pending = {}
@@ -145,10 +148,11 @@ def parse_media_playlist(text: str, base_url: str = "") -> MediaPlaylist:
             title=r["title"],
             ad="Amazon" in (r["title"] or "") or any(a.contains(r["start"]) for a in ads),
             discontinuity=r["discontinuity"],
+            init_uri=r["init_uri"],
         )
         for r in raw
     ]
-    return MediaPlaylist(segments, target, media_sequence, ended, init_uri)
+    return MediaPlaylist(segments, target, media_sequence, ended)
 
 
 def _fill_times(raw: list[dict]) -> None:
