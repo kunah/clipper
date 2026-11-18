@@ -200,6 +200,9 @@ audio ~4 GB/day; ~60 h audio/day to transcribe (≈1–3 GPU-hours, to be benchm
 
 ## 13. Tech stack
 
+Logging: `clipper_core.logs`, structured JSON lines on stdout (console format on a TTY),
+per-task context fields; CloudWatch Embedded Metric Format can be added as a formatter later.
+
 Python 3.12, uv workspace, ruff, pytest (+pytest-asyncio), SQLAlchemy 2 (async, psycopg 3),
 Alembic, Pydantic v2 / pydantic-settings, boto3, Postgres 18 + pgvector, SeaweedFS,
 streamlink (playlist URL only) + own HLS loop, ffmpeg (NVENC), faster-whisper, FastAPI,
@@ -239,3 +242,4 @@ analytics loop. Then Kick/YouTube.
 | 2026-11-18 | Postgres as queue + state, no Redis/NATS yet | low volume, transactional enqueue, fewer moving parts |
 | 2026-11-18 | SeaweedFS instead of MinIO | MinIO stopped community images |
 | 2026-11-18 | Postgres host port 5433, use 127.0.0.1 | 5432 taken on this PC; `localhost` stalls on IPv6 |
+| 2026-11-18 | Unified structured logging in core (stdlib logging, JSON lines to stdout, context fields) | one format for all services and libraries; ready for CloudWatch Logs/Insights and EMF metrics later without changing call sites |

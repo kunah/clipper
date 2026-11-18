@@ -10,7 +10,8 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
 - `libs/core/` (`clipper_core`): the contract between services. Settings, `timeline` (UTC),
   `contracts` (priorities, job kinds, payloads), `models` (all tables), `jobs` (queue),
   `media` (time-range requests that raise priorities), `leases`, `heartbeat`, `storage`
-  (S3 + key layout), `partitions` (daily chat partitions), `runtime` (entry helpers).
+  (S3 + key layout), `partitions` (daily chat partitions), `logs` (unified structured
+  logging), `runtime` (entry helpers).
 - `db/` (`clipper_db`): Alembic migrations + `clipper-migrate` one-off container.
 - `services/<name>/`: one app per service (none yet; step 2 adds controller + chat-ingest).
 - `tools/`: CLIs like backfill (later).
@@ -32,6 +33,11 @@ uv was installed with winget; in an old shell it may not be on PATH yet (restart
 ## Rules
 
 - Times are **timezone-aware UTC** only; build ranges with `timeline.Interval`.
+- **Logging**: call `logs.setup_logging(settings)` once at process start, then
+  `log = logs.get_logger(__name__)` and pass data as fields:
+  `log.info("chunk saved", chunk_id=5)`, not f-strings and never `print`. Use
+  `log_context(...)`/`bind_context(...)` for per-channel/per-job fields. Output is JSON lines in
+  containers (CloudWatch/Loki-ready) and readable text in a terminal (`CLIPPER_LOG_FORMAT`).
 - **One writer service per table**; contracts change only in `libs/core`.
 - **Migrations are additive** and hand-written. `db/tests/test_migrations.py` fails if
   models and migrations differ.

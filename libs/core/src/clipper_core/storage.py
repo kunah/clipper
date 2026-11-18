@@ -5,7 +5,6 @@ boto3 is blocking; from async code call these methods via asyncio.to_thread.
 
 from __future__ import annotations
 
-import logging
 import time
 from pathlib import Path
 
@@ -14,8 +13,9 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError
 
 from clipper_core.config import Settings
+from clipper_core.logs import get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class keys:
@@ -60,14 +60,14 @@ class ObjectStore:
             except ClientError as exc:
                 if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchBucket", "NotFound"):
                     self._client.create_bucket(Bucket=self.bucket)
-                    log.info("created bucket %s", self.bucket)
+                    log.info("created bucket", bucket=self.bucket)
                     return
                 if time.monotonic() > deadline:
                     raise
             except EndpointConnectionError:
                 if time.monotonic() > deadline:
                     raise
-            log.info("waiting for object storage...")
+            log.info("waiting for object storage", endpoint=self._client.meta.endpoint_url)
             time.sleep(2)
 
     def put_file(self, key: str, path: Path | str, content_type: str | None = None) -> None:

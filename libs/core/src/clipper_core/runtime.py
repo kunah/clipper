@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 import signal
 import sys
 from collections.abc import Callable, Coroutine
@@ -30,12 +29,3 @@ def stop_event_on_signals() -> asyncio.Event:
         with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop.set)
     return stop
-
-
-def setup_logging(service: str, level: str = "INFO") -> None:
-    logging.basicConfig(
-        level=level.upper(),
-        format=f"%(asctime)s %(levelname)s {service} %(name)s: %(message)s",
-        stream=sys.stdout,
-        force=True,
-    )

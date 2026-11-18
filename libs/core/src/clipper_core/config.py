@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +28,8 @@ class Settings(BaseSettings):
     service_name: str = "unknown"
     worker_id: str = Field(default_factory=_default_worker_id)
     log_level: str = "INFO"
+    log_format: Literal["auto", "json", "console"] = "auto"  # auto: console on a TTY, else json
+    log_levels: str = ""  # per-logger overrides, e.g. "sqlalchemy.engine=INFO,botocore=DEBUG"
 
     @property
     def database_dsn(self) -> str:

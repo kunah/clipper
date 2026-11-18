@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,8 +23,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from clipper_core.contracts import JobStatus
+from clipper_core.logs import get_logger, log_context
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 NOTIFY_CHANNEL = "clipper_jobs"
 
@@ -231,18 +232,25 @@ class JobRunner:
             job = await claim(session, self._kinds, self._worker_id)
         if job is None:
             return False
-        log.info(
-            "job %s %s (priority %s, attempt %s)", job.id, job.kind, job.priority, job.attempts
-        )
-        try:
-            await self._handlers[job.kind](job)
-        except Exception as exc:
-            log.exception("job %s %s failed", job.id, job.kind)
-            async with self._sessions.begin() as session:
-                await fail(session, job, f"{type(exc).__name__}: {exc}")
-        else:
-            async with self._sessions.begin() as session:
-                await complete(session, job.id)
+        # Every log line written while handling the job carries job_id/job_kind.
+        with log_context(job_id=job.id, job_kind=job.kind):
+            log.info("job started", priority=job.priority, attempt=job.attempts)
+            started = time.monotonic()
+            try:
+                await self._handlers[job.kind](job)
+            except Exception as exc:
+                async with self._sessions.begin() as session:
+                    status = await fail(session, job, f"{type(exc).__name__}: {exc}")
+                log.exception(
+                    "job failed",
+                    attempt=job.attempts,
+                    will_retry=status == JobStatus.QUEUED,
+                    duration_s=round(time.monotonic() - started, 3),
+                )
+            else:
+                async with self._sessions.begin() as session:
+                    await complete(session, job.id)
+                log.info("job done", duration_s=round(time.monotonic() - started, 3))
         return True
 
     async def _listen(self, stop: asyncio.Event) -> None:
@@ -258,7 +266,7 @@ class JobRunner:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.warning("job listener disconnected; retrying in 5s", exc_info=True)
+                log.warning("job listener disconnected, retrying", retry_in_s=5, exc_info=True)
                 await _wait_any(stop, wait_s=5)
 
 
