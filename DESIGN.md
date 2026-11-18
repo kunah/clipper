@@ -4,9 +4,10 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-18):** Phase 1 / steps 1–2 done (workspace, shared core, schema, job queue,
-> unified logging, Twitch lib, controller, chat-ingest). Next: step 3 (recorder).
-> Controller live status needs Twitch app credentials in `.env`; chat logging works without.
+> **Status (2026-11-18):** Phase 1 / steps 1–3 done (workspace, shared core, schema, job queue,
+> unified logging, Twitch lib, controller, chat-ingest, recorder). Next: step 4 (transcriber).
+> Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
+> the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -72,7 +73,7 @@ may contain copyrighted music (Content ID).
 | Twitch status | Helix Get Streams: up to 100 channels per request, includes viewer count. |
 | Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. |
 | Twitch clips | Get Clips returns top viewer-made clips with `vod_offset` → free ground truth for testing the detector. |
-| Twitch HLS | ~2 s segments with `EXT-X-PROGRAM-DATE-TIME`. Ads are inserted for our recorder (a viewer); filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
+| Twitch HLS | 2 s MPEG-TS segments (H.264 + AAC 48 kHz + timed ID3), each with `EXT-X-PROGRAM-DATE-TIME`; the live playlist holds only ~30 s, so a recorder restarted within ~30 s loses nothing. Source 1080p60 ≈ 8.4 Mbps (~63 MB/min); audio ≈ 165 kbps (~1.2 MB/min). Ads are inserted for our recorder (a viewer): segments titled "Amazon…" or inside a `twitch-stitched-ad` DATERANGE; filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
 | MinIO | Community Docker images stopped Oct 2025 → we use **SeaweedFS** (`weed mini`). |
 
 ## 4. Detection
@@ -96,10 +97,14 @@ may contain copyrighted music (Content ID).
 
 - Everything is **timezone-aware UTC**; naive datetimes are rejected (`clipper_core.timeline`).
 - Video time = HLS `EXT-X-PROGRAM-DATE-TIME` (streamlink drops these tags, so the recorder
-  will likely use streamlink only to get the playlist URL and fetch segments itself).
+  uses streamlink only to get the playlist URL and fetches playlist + segments itself).
+  Measured on Twitch: one PDT per 2 s segment, segment PDT ≈ server time when produced.
 - Chat time = Twitch `tmi-sent-ts` (server time), not our receive time.
-- Gaps (ads, reconnects) are stored explicitly in `stream_gaps`. Never compute time as
-  `chunk_seq × 60`.
+- Gaps (ads, reconnects, recorder down) are stored explicitly in `stream_gaps`. Never compute
+  time as `chunk_seq × 60`.
+- A chunk is **continuous media**: every gap or HLS discontinuity starts a new chunk, so
+  `start_utc + offset` is exact inside a chunk (the transcriber relies on this). Chunk lengths
+  vary (ads, restarts, shutdown); ~60 s is a target, not a rule.
 - `video_time ≈ chat_time − channel_delay`.
 
 ## 6. Priorities and media requests
@@ -140,9 +145,9 @@ Services talk only through Postgres and object storage.
 | Service | Does | Writes tables | Image |
 |---|---|---|---|
 | `db` (migrate) | migrations, chat partitions, bucket; one-off | schema | slim |
-| controller | Helix polling, streams, viewer counts, recorder assignment (leases), stale-job sweeper | channels, streams, viewer_snapshots | slim |
+| controller | Helix polling, streams, viewer counts, stale-job sweeper | channels, streams, viewer_snapshots | slim |
 | chat-ingest | IRC, raw chat, events, per-second stats. **Rarely redeployed** (restart = lost chat) | chat_messages, chat_events, chat_metrics_1s | slim |
-| recorder | HLS segments → 60 s `.ts` + `.aac`, gaps, enqueue transcription. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
+| recorder | HLS segments → ~60 s `.ts` + `.aac` (local spool first, crash-safe), gaps, enqueue transcription. Claims channels itself via leases. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments | CUDA |
 | detector | live (reads per-second stats, ~1 s behind) + offline. Separate so tuning never restarts chat logging | candidates (later) | slim |
 | judge | LLM verdict + edit plan, context requests | clips (later) | slim |
@@ -195,8 +200,9 @@ bottleneck otherwise. Chunk length is configurable (30 s saves up to ~30 s).
 
 ## 12. Rough numbers (10 channels × 6 h/day)
 
-Ingest up to ~60 Mbps; video ~160 GB/day (~1.1 TB at 7 days, so 48 h retention on this PC);
-audio ~4 GB/day; ~60 h audio/day to transcribe (≈1–3 GPU-hours, to be benchmarked on the
+Ingest up to ~85 Mbps; video ~230 GB/day at source quality (measured 8.4 Mbps at 1080p60;
+~1.6 TB at 7 days, so 48 h retention on this PC, or `CLIPPER_RECORDER_QUALITIES=720p60,best`);
+audio ~4.5 GB/day; ~60 h audio/day to transcribe (≈1–3 GPU-hours, to be benchmarked on the
 4060); ~1 M chat rows/day.
 
 ## 13. Tech stack
@@ -220,8 +226,11 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    lease, maintenance: partitions + stale-job requeue, `clipper-channels` CLI), chat-ingest
    (one connection for all channels, raw messages, events, deletions, per-second stats with
    emote counts by name; 1 s batched writes, retry on DB errors).
-3. ⬜ recorder: HLS with program-date-time, `.ts` + `.aac` chunks, gaps, enqueue transcription
-   at `priority_for_range`.
+3. ✅ recorder: streamlink resolves the playlist URL, own HLS loop (PDT times, ad filter,
+   dedupe across reloads/restarts), local spool (`.ts` + state file per chunk, recovered after a
+   crash), ffmpeg copies audio to `.aac`, upload, then chunk + gap + transcription job (priority
+   from `priority_for_range`) in one transaction. Channels claimed via leases. Verified live on
+   Twitch (full + audio_only, graceful stop, hard kill + recovery, restart without gaps).
 4. ⬜ transcriber: GPU, word timestamps, hot/cold priority, benchmark the 4060.
 5. ⬜ backfill tool: past VODs + chat replay + top clips → detector development offline.
 
@@ -233,6 +242,11 @@ analytics loop. Then Kick/YouTube.
 as `CLIPPER_TWITCH_CLIENT_ID/SECRET`), pick the real channels (`clipper-channels add ...`).
 FFZ emote API was unreachable on 2026-11-18; its parser follows the documented format but is
 unverified. chat-ingest is a single instance for now (use per-channel leases to shard later).
+Recorder: ad detection follows streamlink's rules but hasn't been seen live yet (no ad during
+the test); fMP4/HEVC renditions are not supported (we request H.264, which Twitch serves as TS);
+gap rows become visible with the chunk after the gap (up to ~60 s later); video retention
+(delete after ~48 h) is not implemented yet; recording starts up to ~40 s after go-live
+(controller poll 30 s + recorder sync 10 s), and the playlist's ~30 s backlog covers most of it.
 
 ## 15. Decision log
 
@@ -254,3 +268,8 @@ unverified. chat-ingest is a single instance for now (use per-channel leases to 
 | 2026-11-18 | Per-second stats store emote counts **by name**; categories applied by the detector | the emote→meaning mapping can change without re-ingesting chat |
 | 2026-11-18 | Third-party emotes (7TV/BTTV/FFZ) recognised by token match | KEKW/OMEGALUL/Pog etc. are not Twitch emotes |
 | 2026-11-18 | Unified structured logging in core (stdlib logging, JSON lines to stdout, context fields) | one format for all services and libraries; ready for CloudWatch Logs/Insights and EMF metrics later without changing call sites |
+| 2026-11-18 | Recorders claim channels themselves (lease `record:channel:{id}`); the controller doesn't assign | no extra coordination; a second recorder machine just starts and takes unleased channels |
+| 2026-11-18 | Record one rendition (video incl. audio) and copy the audio out with ffmpeg; `audio_only` mode uses Twitch's audio rendition | one download per channel; no re-encoding; audio stays sample-aligned with the video |
+| 2026-11-18 | Spool chunks on local disk before upload; a state file per chunk, rewritten after each segment | S3/DB outages and crashes don't lose media; recovery cuts back to the last complete segment |
+| 2026-11-18 | Chunks are continuous; a gap row is committed with the chunk that follows it | exact time mapping inside a chunk; gap + chunk are atomic and survive crashes |
+| 2026-11-18 | New gap reason `not_recorded` (no recorder running: joined late, restart) | consumers can tell "nothing was there" (ad) from "we missed it" |

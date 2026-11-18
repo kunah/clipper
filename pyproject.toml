@@ -20,7 +20,7 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "RUF"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["clipper_core", "clipper_db", "clipper_twitch", "clipper_chat_ingest", "clipper_controller"]
+known-first-party = ["clipper_core", "clipper_db", "clipper_twitch", "clipper_chat_ingest", "clipper_controller", "clipper_recorder"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

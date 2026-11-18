@@ -96,6 +96,27 @@ services:
     restart: unless-stopped
     stop_grace_period: 20s   # time to flush buffered chat on shutdown
 
+  # Records live streams into ~60 s chunks (video .ts + audio .aac) and queues transcription.
+  # Restarting loses the stream in between (recorded as a gap), so redeploy it rarely.
+  recorder:
+    build:
+      context: .
+      dockerfile: services/recorder/Dockerfile
+    image: clipper/recorder:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: recorder
+      CLIPPER_WORKER_ID: recorder-1   # stable id: a restart takes its channel leases right back
+      CLIPPER_RECORDER_QUALITIES: ${CLIPPER_RECORDER_QUALITIES:-best}
+    volumes:
+      - spool:/spool   # chunks not uploaded yet survive restarts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 45s   # close open chunks and upload them
+
 volumes:
   pgdata:
   objectdata:
+  spool:

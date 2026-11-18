@@ -18,12 +18,12 @@ uv run pytest                        # tests (integration tests use the compose 
 
 uv run clipper-channels add xqc kaicenat --mode full   # channels to monitor
 uv run clipper-channels list
-docker compose logs -f chat-ingest controller
+docker compose logs -f chat-ingest controller recorder
 ```
 
 Live status (controller) needs a Twitch app: create one at dev.twitch.tv/console and put
 `CLIPPER_TWITCH_CLIENT_ID` / `CLIPPER_TWITCH_CLIENT_SECRET` into `.env`. Chat logging works
-without it.
+without it; recording does not (the recorder records streams the controller marked live).
 
 | What | Where |
 |---|---|
@@ -34,6 +34,7 @@ without it.
 
 ```
 libs/core/      shared contract: settings, models, timeline, job queue, storage
+libs/twitch/    Twitch chat (IRC), Helix API, emotes, live HLS playlists
 db/             migrations + `migrate` container
 services/       one app + Docker image per service (added step by step)
 compose.yaml    the whole stack

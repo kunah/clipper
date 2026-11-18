@@ -47,9 +47,10 @@ class DataSource(StrEnum):
 
 
 class GapReason(StrEnum):
-    AD = "ad"
-    RECONNECT = "reconnect"
-    UNKNOWN = "unknown"
+    AD = "ad"  # Twitch replaced the stream with an ad break
+    RECONNECT = "reconnect"  # playlist/network trouble, or the stream was briefly offline
+    NOT_RECORDED = "not_recorded"  # no recorder was running (joined late, restart, crash)
+    UNKNOWN = "unknown"  # the media timeline jumped without a known cause
 
 
 class Payload(BaseModel):
@@ -58,6 +59,11 @@ class Payload(BaseModel):
 
 class TranscribePayload(Payload):
     chunk_id: int
+
+
+def recording_lease(channel_id: int) -> str:
+    """Lease a recorder holds while it records a channel (only one recorder per channel)."""
+    return f"record:channel:{channel_id}"
 
 
 def dedupe_key(kind: JobKind, ref_id: int) -> str:
