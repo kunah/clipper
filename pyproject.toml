@@ -1,0 +1,30 @@
+# Workspace root (virtual: it is not a package itself).
+# Every app lives in its own folder with its own pyproject.toml and Dockerfile.
+# Add new services to `members` as they are created.
+
+[tool.uv.workspace]
+members = ["libs/*", "db"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["clipper_core", "clipper_db"]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["libs", "db"]
+markers = ["integration: needs the Postgres from compose.yaml (skipped when unreachable)"]
