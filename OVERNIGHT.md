@@ -42,7 +42,25 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 
 ## Open questions for the user
 
-- (none yet)
+Designs written overnight and marked "proposed, not yet agreed" in DESIGN.md: §17 backfill,
+§18 detector. Their decision rows sit under each section, not in the decision log, until you
+agree. Questions from them:
+
+- **Backfill (§17):** use Twitch's undocumented GQL API at all (VOD playback token + chat
+  replay; Twitch discourages third-party use, client ids can be revoked)? Without it, backfill
+  gets only Helix metadata + top clips. Which channels and how many VODs back? Audio only, or video
+  ranges too? May clips from backfilled VODs ever be published (§2 rights), or is it dev data
+  only? OK with the new gap reason `muted` and no `chat_events` from replay? New rule "one writer
+  per table *and source*" (backfill writes the rows of backfilled streams in live tables) and the
+  controller guard (never touch `source='backfill'` streams).
+- **Detector (§18):** defaults OK: 8 s chat delay until learned, ≤ 8 judge (LLM) calls per
+  stream-hour? Suppress raid / gifted-sub spikes, or do campaigns want those moments? May the
+  detector hold Twitch app credentials (it polls Get Clips itself)? Extra IRC tags (first message,
+  channel-point reward, highlighted message) as `_`-keys in `badges` like `_action`, or a proper
+  column (needs a chat-ingest redeploy either way)?
+- **Transcriber:** the decision log says faster-whisper with its built-in VAD; our own Silero gate
+  already runs in front (§16). The adapter keeps `vad_filter` as a setting; see the e2e note
+  below for which value was measured better.
 
 ## Credentials / decisions needed
 

@@ -239,10 +239,14 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    Model picked from `tools/asr-bench` (real stream audio, measured on the 4060).
    Full design: [§16](#16-transcriber-design-step-4).
 5. ⬜ backfill tool: past VODs + chat replay + top clips → detector development offline.
+   Design: [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed
+   2026-11-19, not yet agreed).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
-analytics loop. Then Kick/YouTube.
+analytics loop. Then Kick/YouTube. Detector design:
+[§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not yet
+agreed).
 
 **Open items**: Twitch app registered and in `.env` (2026-11-18); first channel ohnepixel
 (`full`); pick the rest of the real channels (`clipper-channels add ...`).
@@ -286,6 +290,7 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-18 | Pick models by benchmark on real stream audio (`tools/asr-bench`), not by leaderboard | leaderboard sets are clean speech; stream audio has game sound, music, several speakers |
 | 2026-11-19 | Speech model: **Whisper large-v3-turbo** via faster-whisper (float16, beam 5, built-in VAD, word timestamps), "for now" | benchmark (§16): fast enough (49× realtime, ~1.2 GPU-h/day for 60 h audio), least GPU memory (2.3 GB), no made-up text on music/silence, most central transcript of the 5 candidates, word timing close to the others, light runtime (no torch/NeMo); Parakeet is 4× faster but transcribes song lyrics and needs NeMo; Qwen3-ASR too slow on the 4060 |
 | 2026-11-19 | Sound classifier: CED-base (`mispeech/ced-base`), **provisional, not yet confirmed by the user** | 666× realtime, 0.5 GB, works on 2 s windows (per-second resolution); AST needs 10 s windows. Neither could be judged for accuracy: the sample had little laughter/screaming |
+| 2026-11-19 | Voice-activity gate: Silero VAD v6.2 run by onnxruntime on the CPU (pinned model URL + sha256), numpy port of `get_speech_timestamps`; no torch in the transcriber for it | gate is model-independent (§16 step 4); ~185× realtime on one CPU thread; onnxruntime is small, torch would be ~GBs |
 
 ## 16. Transcriber design (step 4)
 
@@ -449,3 +454,508 @@ are marked fulfilled by whoever asked, not by the transcriber.
 **Runtime.** CUDA base image, model weights in a `models` volume (`HF_HOME`), GPU reserved in
 compose. Heartbeat info: models, device, realtime factor, queue depth by priority. Crashed jobs
 are requeued by the controller after 15 min (exists).
+
+## 17. Backfill tool (step 5) — proposed 2026-11-19, not yet agreed
+
+**Status:** proposal, nothing built; the smoke test (5b) checks every UNVERIFIED fact first.
+
+**Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
+`docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)
+and viewer clips in the live format, so transcriber, detector and judge need no special case.
+
+**Commands** (idempotent; `--dry-run` does all reads, prints the plan, writes nothing):
+- `vod <id|url>... [--no-media] [--video [Q]] [--video-range A-B]... [--no-chat] [--no-clips]
+  [--no-transcribe]`: default is audio_only + chat + clips + jobs. `--video` takes a video rendition
+  and copies its audio out, like the recorder; `--video-range` adds video to the chunks it overlaps.
+- `channel <login> [--since D] [--limit N]`: the newest N archives, **oldest first** (VODs expire).
+- `clips <login>`, `status`, `calibrate <video_id>` (read-only; a stream also recorded live): T0
+  methods vs live PDT by audio correlation, `createdAt` vs `tmi-sent-ts`.
+
+**Skipped:** highlights/uploads (no `stream_id`), archives still live, streams with
+`source = 'live'` (clips only), sub-only media (usher 403 → one `not_recorded` gap; chat tried).
+
+**Idempotency and resume.** `streams` (unique on the archive's `stream_id`) and the new `vods` row
+are created together and found again on a re-run; a lease `backfill:vod:{id}` keeps runs apart.
+- Media: the chunk row, its gaps, its `transcribe` job and `vods.media_done_s` (VOD offset reached)
+  commit together. The open chunk sits in a temp dir (no spool: the VOD can be fetched again). A
+  crash loses only that chunk, and a re-run continues at `media_done_s` with the next `seq`.
+- Chat: messages use `ON CONFLICT DO NOTHING` (PK `sent_at, msg_id`, deterministic). Metrics are
+  final only before `vods.chat_metrics_to`, which commits with `chat_done_s`, so a resume re-reads
+  from just before it. Jobs use `dedupe_key`; clips are upserted.
+
+**Who writes what: one writer per table *and source*** (replaces the §8 rule; decision log). Only
+backfill writes a backfilled stream's rows (`streams.source = 'backfill'`): the stream, its
+`chunks`, `stream_gaps`, `chat_messages` and `chat_metrics_1s`. Rows are marked by `source` where
+the column exists, else by their stream. Neither side writes the other's. Derived tables
+(transcripts, audio metrics) keep one writer for both; `vods`/`viewer_clips` are backfill-only.
+- Guard 1: the controller's stream upsert gets `WHERE streams.source = 'live'`. Otherwise a stream
+  id seen live again would flip a backfilled stream to `live`, and the recorder would write into it.
+- Guard 2: a live `chat_metrics_1s` row of the channel in the VOD range → chat `skipped` (the PK
+  can't hold both). Missing channels are inserted inactive (`off`), never changed.
+
+**Time model.** VOD playlists have no PDT (UNVERIFIED), so offset `t` (ΣEXTINF) maps to
+`UTC = T0 + t`. T0 is frozen on the first run in `vods.t0_utc` (= `streams.started_at`).
+- **Chat anchor (default):** `x = createdAt − contentOffsetSeconds` over ~15 sampled pages,
+  whole-hour outliers (timezone bug) fixed first. Offsets are whole seconds, so T0 = median(x)
+  − 0.5 s if truncated (median if rounded). Error ±0.5 s + Twitch's anchor; chat↔media = its replay.
+- **Helix `created_at`** (1 s, a few s off) is fallback below 20 comments. > 30 s off the chat
+  anchor = old-VOD offset bug → Helix + flag `t0_conflict`. Path `<epoch>`, TDTG: logged only.
+- **Audio** (`calibrate`, ±20 ms, needs a live recording) measures both methods' bias once.
+- **Chat time:** `sent_at = createdAt` (ms, the `tmi-sent-ts` clock). Replay shows comments late by
+  latency + reaction, like live, so `video_time ≈ chat_time − channel_delay` keeps the live delay.
+  Missing or > 2 s off → `T0 + offset + 0.5 s`. ~1 s suffices (per-second features).
+- **Gaps:** VODs have no ads. Each `EXT-X-DISCONTINUITY` starts a chunk and a *part*. T0 is
+  re-checked per part; a step ≥ 1 s becomes a gap (`unknown`) that shifts the rest.
+  TOTAL-SECS − ΣEXTINF > 1 s with no step → flag `timeline_uncertain`.
+- **Muted** (`N-muted.ts`) → gap reason **`muted`**, not a chunk flag. Silence isn't
+  stored/transcribed; `coverage()` already counts gaps as "never", and the detector reads "audio
+  unknown", not "quiet". `--video`: video-only chunk. < 24 h: try `N.ts`. Bias: no music moments.
+
+**Media.** Playlist URL from streamlink (`audio_only`, ~1.2 MB/min). 10 s TS/fMP4 segments, six per
+~60 s chunk, ending early at a discontinuity, init change, muted run or the end, so chunks stay
+contiguous and exact. ffmpeg copy → `.ts` + `.aac` at `storage.keys`; 403 → re-resolve, 404 → `gone`
+(data kept). Jobs: `priority_for_range(default=BACKFILL)`.
+- **Shared:** ffmpeg helpers → `clipper_core.ffmpeg`; chunk + gaps + job commit →
+  `clipper_core.chunks.commit_chunk()`, used by the recorder too; plus a new
+  `hls.parse_vod_playlist()`. **Duplicated:** the segment download with retries (live gives up fast,
+  backfill retries long). The live loop, tracker and spool stay in the recorder.
+
+**Chat replay.** GQL `VideoCommentsByOffsetOrCursor` → chat-ingest's rows, same code:
+`MessageRow`/`MetricRow`/`SecondAggregator`/`ChatWriter` move to `clipper_core.chat` (so live and
+backfill match), `message_emotes()` → `clipper_twitch.emotes` (takes parsed Twitch emotes).
+- Mapping: `msg_id` = comment id. The user comes from `commenter` (null: kept, not a chatter).
+  Twitch emotes come from fragments; 7TV/BTTV/FFZ match the *current* sets, so removed ones are
+  lost. Badges: `{setID: version}`. Clock: `T0 + offset`.
+- **Not recoverable:** deleted messages (backfill is quieter in spam/mod waves) and all events (no
+  USERNOTICE/CLEAR*/ROOMSTATE; bits only as text). So: **no** `chat_events` or `viewer_snapshots`,
+  which the detector reads as "unknown", not "none".
+
+**Viewer clips (ground truth).** New table `viewer_clips` (writer: backfill tool, PK `(platform,
+clip_id)`), from Helix Get Clips per stream window (top by views) and matched to our live or
+backfilled stream via the VOD's `stream_id`. Span: `T0 + vod_offset` for `duration`, ± `slack_s`
+(duration + 10 s: reported offset bug; + Helix T0 error). Re-runs fill a null `vod_offset`. Phase-2
+evaluation: view-weighted recall of top clips, hit rate of top-N candidates (a precision lower
+bound), and median (peak − clip start) for `chat_delay_s`. Muted seconds, flagged VODs excluded.
+
+**Interfaces and tests.** Twitch access sits behind Protocols in `libs/twitch`, each with a fake:
+`VodSource.playlist_url()` (raises `VodRestricted`/`VodGone`; real: streamlink) and
+`ChatReplay.page(video_id, offset=|cursor=)` (real: `GqlChatReplay`, hash and client id overridable
+via `CLIPPER_TWITCH_GQL_*`). Helix uses the existing client on `httpx.MockTransport`; segments are
+built with lavfi; DB tests are `integration`. Smoke test (`twitch_live`, off unless
+`CLIPPER_TWITCH_LIVE_TESTS=1`): one VOD, no rows, saves fixtures.
+
+**Risks, politeness, budget.**
+- GQL is undocumented, discouraged by Twitch for third parties, and its client ids can be revoked:
+  anonymous use, isolated, personal research only, no redistributed media; `GqlBroken` stops a run.
+- Politeness: GQL ≤ 2 req/s, one at a time, backoff, stop after 10 errors; ≤ 4 segment downloads.
+- Budget per 6 h VOD: audio ≈ 430 MB (kept forever), chat ≈ 50 MB, GPU ≈ 10–20 min. Source
+  video ≈ 23 GB: full `--video` needs `--yes` above 10 GB; `--max-gb` caps a run; video: 48 h rule.
+- **User decisions:** GQL at all (else Helix metadata + clips only); channels and depth; audio or
+  video; may backfilled clips be published (§2); the `muted` gap; no `chat_events`.
+
+**Build plan.**
+1. **5a Shared pieces + contract:** migration 0003, `GapReason.MUTED`,
+   `clipper_core.{ffmpeg,chunks,chat}` (recorder + chat-ingest switched), controller guard,
+   `parse_vod_playlist`. *Done when:* old tests pass unchanged and the parser and guard are tested.
+2. **5b Twitch VOD access:** Helix `get_videos`/`get_clips`, `VodSource`, `GqlChatReplay` (limiter,
+   retries), fakes, fixtures, smoke test. *Done when:* everything is tested offline and §3 holds the
+   smoke answers (PDT, container, muted names, rounding, timezone).
+3. **5c Media + time:** the CLI with `--dry-run`, a pure T0 estimator and chunk planner,
+   `commit_chunk`. *Done when:* a mock VOD gives contiguous chunks, `muted` gaps and priority-0
+   jobs; a crash plus a re-run gives identical rows; and a dry run writes nothing.
+4. **5d Chat + clips (+ calibrate):** mapping, watermark resume, the live-chat skip, `clips`,
+   DESIGN.md updates. *Done when:* fixture pages give the live aggregator's metrics, a resume adds
+   no duplicates, and clips map to `T0 + vod_offset`.
+
+### Proposed decision-log rows
+
+| Date | Decision | Why |
+|---|---|---|
+| 2026-11-19 | One writer per table **and source**: everything belonging to a backfilled stream (`streams.source = 'backfill'`: the stream row, its chunks, gaps, chat messages, chat metrics) is written only by the backfill tool, and live services never touch it; derived tables (transcripts, audio metrics) keep one writer for all sources | backfill must write the live tables in the live format; two writers on the same rows would race |
+| 2026-11-19 | The controller never updates a stream with `source = 'backfill'` (upsert `WHERE streams.source = 'live'`) | a stream id that shows up live again would flip it to live, and the recorder would write into it |
+| 2026-11-19 | Backfill skips VODs of streams recorded live (clips only), and writes chat only where the channel has no live chat | live data is better (ms chat times, events, PDT); the `chat_metrics_1s` PK `(channel_id, ts)` can't hold both |
+| 2026-11-19 | VOD time: `UTC = T0 + offset`. T0 from the chat anchor (median of `createdAt − contentOffsetSeconds`, ±0.5 s); Helix `created_at` as fallback and cross-check (> 30 s apart → Helix + flag); frozen per VOD in `vods.t0_utc` | VOD playlists have no PDT; the chat anchor reproduces Twitch's own replay sync |
+| 2026-11-19 | VOD chat `sent_at = createdAt` (fallback `T0 + offset + 0.5 s`) | the same server clock as `tmi-sent-ts`, at ms resolution; `video ≈ chat − delay` holds with the delay learned live |
+| 2026-11-19 | Muted VOD segments become a gap with reason `muted`; their audio is not stored or transcribed | silence would read as a quiet moment; `coverage()` and the detector already understand gaps |
+| 2026-11-19 | Backfill takes audio_only by default; video only on request (full, or ranges added to existing chunks) | ~1.2 MB/min vs ~63 MB/min; detector development needs audio + chat |
+| 2026-11-19 | Chat row types, per-second aggregation and the chunk commit move into `libs/core` (`chat`, `chunks`); ffmpeg copy helpers into `clipper_core.ffmpeg`; `message_emotes` into `clipper_twitch.emotes` | live and backfill must compute and commit identically; a tool must not import a service |
+| 2026-11-19 | Viewer clips go into `viewer_clips` (writer: backfill tool) with span ± (duration + 10 s) | ground truth for the detector; Helix `vod_offset` is reportedly off by about the clip length |
+| 2026-11-19 | Backfill writes no `chat_events` and no `viewer_snapshots` | replay has no USERNOTICE/CLEAR*/ROOMSTATE and there is no viewer history; the detector reads backfill as "unknown", not "none" |
+| 2026-11-19 | GQL chat replay is isolated in `clipper_twitch.gql`: anonymous, ≤ 2 req/s, client id and hash overridable by env | an undocumented API can change or be revoked; a config change fixes most breaks |
+| 2026-11-19 | Channels missing for a backfill are inserted inactive (`off`); existing rows are never changed | backfill must not start live monitoring |
+
+### Contract changes
+
+**Migration `0003_backfill`** (additive: two new tables, nothing else). `stream_gaps.reason` has no
+CHECK, so `muted` needs no DDL. `streams`, `chunks` and `chat_messages` already have `source`. CHECK
+texts are repeated in the models, as in 0002 (`db/tests/test_migrations.py` compares them).
+
+**`models.py`**
+```python
+class Vod(Base):
+    """A platform archive we backfilled, and the time anchor of its media. Writer: backfill tool.
+
+    `t0_utc` = UTC of VOD offset 0 (= the stream's `started_at`), frozen on the first run; every
+    backfilled time is `t0_utc + offset` (shifted per part after a timeline step, see flags).
+    """
+    __tablename__ = "vods"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "platform_video_id"),
+        UniqueConstraint("stream_id"),
+        CheckConstraint(
+            "media_status IN ('pending', 'done', 'restricted', 'gone', 'off')", name="media_status"
+        ),
+        CheckConstraint(
+            "chat_status IN ('pending', 'done', 'skipped', 'unavailable', 'off')",
+            name="chat_status",
+        ),
+    )
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    platform_video_id: Mapped[str] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(Text)
+    platform_created_at: Mapped[datetime]          # Helix created_at
+    duration_s: Mapped[float] = mapped_column(Float)
+    t0_utc: Mapped[datetime]
+    t0_method: Mapped[str] = mapped_column(Text)   # contracts.T0Method
+    t0_candidates: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    #   {"helix": iso, "path_epoch": iso, "chat": iso, "chat_spread_s": 1.0, "comments": 812}
+    rendition: Mapped[str | None] = mapped_column(Text)  # audio_only, 720p60, chunked, ...
+    media_status: Mapped[str] = mapped_column(Text, server_default="pending")
+    media_done_s: Mapped[float] = mapped_column(Float, server_default="0")  # chunks+gaps committed
+    chat_status: Mapped[str] = mapped_column(Text, server_default="pending")
+    chat_done_s: Mapped[int] = mapped_column(Integer, server_default="0")  # messages committed
+    chat_metrics_to: Mapped[datetime | None]       # chat_metrics_1s rows before this are final
+    flags: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    #   {"t0_conflict": true, "timeline_uncertain_s": 3.2, "steps": [...], "muted_s": 840,
+    #    "chat_time_fallbacks": 3, "comments_without_user": 12}
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class ViewerClip(Base):
+    """Viewer-made platform clips: ground truth for the detector. Writer: backfill tool.
+
+    `start_utc`/`end_utc` = the VOD's T0 + `vod_offset_s` (+ `duration_s`); the moment lies within
+    ± `slack_s`. NULL while the platform hasn't assigned a VOD offset yet. `platform_created_at` is
+    when the clip was made, not the moment.
+    """
+    __tablename__ = "viewer_clips"
+    __table_args__ = (
+        PrimaryKeyConstraint("platform", "clip_id"),
+        Index(None, "stream_id", "start_utc"),
+        Index(None, "channel_id", "platform_created_at"),
+    )
+    platform: Mapped[str] = mapped_column(Text, server_default="twitch")
+    clip_id: Mapped[str] = mapped_column(Text)               # Twitch clip slug
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int | None] = mapped_column(ForeignKey("streams.id"))  # live or backfilled
+    platform_video_id: Mapped[str | None] = mapped_column(Text)  # Helix "" -> NULL
+    vod_offset_s: Mapped[int | None] = mapped_column(Integer)
+    duration_s: Mapped[float] = mapped_column(Float)
+    start_utc: Mapped[datetime | None]
+    end_utc: Mapped[datetime | None]
+    slack_s: Mapped[float | None] = mapped_column(Float)
+    time_source: Mapped[str | None] = mapped_column(Text)  # vod_t0 | helix_created_at
+    title: Mapped[str | None] = mapped_column(Text)
+    creator_login: Mapped[str | None] = mapped_column(Text)
+    view_count: Mapped[int] = mapped_column(Integer)
+    is_featured: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    platform_created_at: Mapped[datetime]
+    fetched_at: Mapped[datetime] = _created_at()             # last refresh
+```
+Docstrings only (no DDL): `Stream`: "Writer: controller (`source='live'`), backfill tool
+(`source='backfill'`)". `StreamGap` and `ChatMetricSecond`: the same split (recorder or chat-ingest
+for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-ingest only.
+
+**`contracts.py`**
+- `GapReason.MUTED = "muted"`: VOD audio silenced by the platform (copyrighted music), so there is
+  no usable audio. Video may exist as a video-only chunk.
+- `class T0Method(StrEnum)`: `CHAT = "chat"`, `HELIX = "helix"`, `AUDIO = "audio"`.
+- `class VodMediaStatus(StrEnum)`: `pending`, `done`, `restricted`, `gone`, `off`.
+  `class VodChatStatus(StrEnum)`: `pending`, `done`, `skipped`, `unavailable`, `off`.
+- `def backfill_lease(video_id: str) -> str: return f"backfill:vod:{video_id}"`.
+- Unchanged and used as they are: `Priority.BACKFILL`, `DataSource.BACKFILL`, `dedupe_key`,
+  `CHUNK_JITTER`.
+
+**New `libs/core` modules (moved code, no behaviour change)**
+- `clipper_core.chunks.commit_chunk(session, *, stream_id, seq, interval, video_key, audio_key,
+  video_bytes, audio_bytes, source, gaps_before, default_priority) -> tuple[int, bool]`. It does the
+  chunk upsert, inserts the gap rows only when the chunk is new, and enqueues the transcribe job
+  with `priority_for_range` when the chunk has audio. It comes from `recorder.finisher.finish`,
+  generalised from one gap to a list. The caller owns the transaction, so backfill can add its
+  `vods` update to it.
+- `clipper_core.chat`: `MessageRow` (`received_at: datetime | None`), `EventRow`, `MetricRow`,
+  `SecondAggregator`, `ChatWriter`, moved unchanged from chat-ingest (`mapping`, `aggregator`,
+  `writer`).
+- `clipper_core.ffmpeg`: `copy()`, `extract_audio()`, `remux_to_ts()` from `recorder.finisher`.
+
+**Outside `libs/core` (for completeness)**
+- `clipper_twitch`:
+  - `hls.parse_vod_playlist()`: `VodSegment(index, uri, offset_s, duration, muted, discontinuity,
+    init_uri)` + `total_secs`.
+  - `helix.get_videos()`, `get_clips()`, `parse_duration()`.
+  - `gql` (the `ChatReplay` Protocol, `GqlChatReplay`, `CommentPage`, `GqlBroken`) and
+    `vod.VodSource` (streamlink).
+  - `emotes.message_emotes()`.
+  - `TwitchSettings` gets `gql_client_id` and `gql_comments_hash`.
+- Controller `poller._upsert_stream`: `... DO UPDATE ... WHERE streams.source = 'live'`, with
+  `.first()` instead of `.one()`, and a log line when the row belongs to a backfilled stream.
+- Root `pyproject.toml`: add `tools/backfill` to `members` (not `tools/*`: asr-bench stays outside),
+  add it to `testpaths`, add `clipper_backfill` to `known-first-party`, and add the marker
+  `twitch_live`. `compose.yaml`: a `backfill` service under `profiles: [tools]` (image with ffmpeg,
+  like the recorder).
+
+## 18. Detector (phase 2) — proposed 2026-11-19, not yet agreed
+
+**Status:** proposal. Schema, scorer and live service can be built now with provisional defaults;
+thresholds, lexicon and offline weights are tuned by backtest once step 5 and the transcriber
+deliver data. v1 needs no chat-ingest change.
+
+**Role.** `services/detector` (slim), one process for all channels, `CLIPPER_DETECTOR_MODE` =
+`live|offline|all`. Writer of `candidates`, `chat_delay_estimates` (new), its own `media_requests`
+rows and `judge`/`detect_offline` jobs. **One scorer, three callers:** `ChannelScorer.step(second)`
+is a pure, clock-free state machine (time comes from the rows) run by the live loop, the offline
+job and the backtest CLI, so a backtest reproduces live exactly. Tunables in one `DetectorParams`
+model (code defaults, optional TOML); `detector_version` = code + params hash + lexicon version.
+
+**1. Live scoring (stage 1: per-second stats).**
+- **Input**: chat_metrics_1s of held channels by `channel_id` (`stream_id` is null until
+  chat-ingest's 30 s sync; assign the stream by time); no row = 0. Final at `ts < now() − 8 s`
+  (5 s grace + 1 s flush): ~8 s behind chat, not ~1 s as §8 says; harmless for the budget.
+- **Activity** `A(t)` = Σ `unique_chatters` over the last 10 s. **Baseline** `B(t)` = median of `A`
+  over `[t − 20 min, t − 60 s]` (not EWMA, which a long moment drags up; the last minute is left out
+  so a moment doesn't raise its own bar); scale `S = max(1.4826·MAD, √B, 2)` (Poisson floor).
+- **Viewers normalise, never trigger**: `B' = B · clamp(V_now / V_med, 0.67, 2)` (latest
+  viewer_snapshot vs its median over the baseline window): covers the start ramp and raids.
+- **Scores** `z = (A − B') / S`, `ρ = A / max(B', 3)`, floor `A ≥ max(8, 0.005·V)`. **Episode**
+  opens at `z ≥ 4 ∧ ρ ≥ 2 ∧ floor`, stays open while `z ≥ 2`, closes after 10 s below (bursts
+  < 10 s apart merge), force-closes at 180 s. *Suspect* (`z ≥ 3 ∧ ρ ≥ 1.5`) starts stage 2 early.
+- **Time of stream**: the first 10 min after `streams.started_at` (and 5 min after a slow/emote/
+  subs-only toggle) need `z ≥ 6 ∧ ρ ≥ 3`; until 20 min of history exist `B = max(own, prior)`,
+  prior = median `A` of the channel's previous stream × viewer ratio. "hi"/"bye" floods: §3.
+- **Missing chat**: a zero run ≥ 60 s where `B ≥ 5` is missing data, not fed to the baseline.
+- **State in memory only** (per channel: ring buffer, viewers, open episode, recent candidates).
+  Restart: replay `[now − 21 min, final]`, emit only episodes peaking in the last 15 min that
+  overlap no candidate (±60 s); the offline pass catches longer outages.
+
+**2. Emote lexicon.** `clipper_detector/data/lexicon.toml` in git, `version = N` (in
+`detector_version`; ships with a cheap detector redeploy), applied to names at read time (§15).
+`[emotes]` exact name → category: funny (KEKW, OMEGALUL), hype (Pog, EZ), shock (NOWAYING, D:),
+tense (monkaS), sad (Sadge), cringe, wholesome (<3), greeting (peepoHey); `[words]` case-insensitive
+(lmao, w, f, no way, hi, clip it); `[patterns]` regexes at weight 0.5 for 7TV variants (`kek|lul` →
+funny); `[bots]`; `[transcript]` phrases; `[channels.<login>]` overrides. Unknown emotes count as
+`uncategorised`; `clipper-detector lexicon --unknown` lists the most used (a table only once
+non-developers edit it). **Moment type** = dominant category of per-message votes (one per message
+and category, one per user; `emote_counts` counts tokens, so it's used only where raw chat isn't
+read): top share ≥ 0.4, else `mixed`; < 5 votes `unknown`.
+
+**3. Stage 2: raw chat and fake spikes.** On suspect/close, read the channel's `chat_messages`
+`[onset − 20 s, peak + 5 s]` and `chat_events` `[onset − 60 s, peak + 5 s]` (index `channel_id,
+sent_at`; raw rows commit ~5 s before their second's stats). **Clean uniques** = distinct users
+without bots, `!commands`, deleted messages, one user's repeats; `z_clean` = `z` with `A ×
+clean_fraction`; emitting needs `z_clean ≥ 4` (warm-up 6). **Shares**: `reaction` (category emote/
+word), `greeting`, `command`, `bot`, `vote` (message = one number/letter or believe/doubt), `dup`
+(top normalised text among *non-reaction* messages: mass "KEKW" is real, a copypasta is not),
+`deleted`. **Score** (first guess): `z_clean · (0.6 + 0.8·min(reaction, 0.5))` + boosts (§4). A
+matching rule stores the candidate as `suppressed` + reason (no judge job), to audit the filter:
+
+| Reason | Rule (window `[onset − 20 s, peak]`) | Data stored today |
+|---|---|---|
+| raid | `raid` from `onset − 30 s`, unless `z_clean ≥ 8 ∧ reaction ≥ 0.5` | chat_events |
+| subs | `submysterygift` with `mass-gift-count ≥ 5`, or ≥ 10 sub/resub/subgift | chat_events |
+| bits | cheers ≥ 30 % of messages (≥ 1000 bits is a feature only: TTS reactions can be real) | chat_events |
+| commands | command share ≥ 0.3 (`!enter` giveaways, bot games) | raw text |
+| copypasta / vote | dup ≥ 0.4 or vote ≥ 0.4 (polls, predictions, "type 1 if…") | raw text |
+| bots / greeting | bot share ≥ 0.3 / greeting share ≥ 0.4 | `user_login`, text |
+| mode_toggle | `roomstate` change from `onset − 10 s` (also starts a 5 min warm-up) | chat_events |
+| spam_wave | `clearchat`/timeouts and deleted ≥ 0.3 | chat_events, `deleted` |
+
+**Backfilled streams** (§17) have no `chat_events`, `viewer_snapshots` or deleted rows: read as
+*unknown* (no viewer scaling, event rules off, bits from `Cheer\d+` text; dup still catches raids).
+**Not stored**: polls, predictions, hype trains, channel points (not on anonymous IRC; EventSub
+needs the broadcaster's token), so vote/dup/command heuristics stand in; tags `first-msg`,
+`custom-reward-id`, `msg-id=highlighted-message`. **Chat-ingest proposal for its next necessary
+redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` keys in `badges`
+(`_action` precedent); `chat_metrics_1s` + ints `command_messages`, `top_text_count`,
+`clip_mentions`, jsonb `emote_messages`: stage 1 filters without raw reads at scale; `NOTIFY` too.
+
+**4. Explicit signals.**
+- **"Clip it"**: every 5 s, scan new raw messages of held channels for `\bclip(ped| it| that|
+  this)?\b|^!clip`; ≥ max(3, 3 % of clean uniques) users within 30 s → trigger (chat peak = first
+  mention − 5 s). Clip URLs in chat (bot replies, viewer links) count as viewer clips.
+- **Viewer clips**: the **detector** polls Helix Get Clips per held live channel every 60 s
+  (`started_at = now − 10 min`; 1 point per call of the client id's 800/min, shared with the
+  controller's ~2/min). Only it needs fresh clips: kept in memory + `candidates.features`, so
+  `viewer_clips` stays backfill-only (§17). Live clips lack `vod_offset` for minutes → moment ≈
+  `[created_at − duration − 5 s, created_at − 5 s]`. ≥ 2 creators overlapping within 90 s (3 above
+  20 clips/h) → trigger.
+- **Boosts** +2 (clip mentions), +1 (viewer clip). A signal within ±60 s of a candidate is attached
+  to it; a *suppressed* one is then re-emitted (a viewer thought it was real).
+
+**5. Merge, delay, media request.**
+- **Emit at episode close** (≤ ~20 s after the peak): stable peak/window; the judge waits for
+  T + 30 s anyway. **Peak** (chat time) = argmax of the 3 s centred mean of `unique_chatters`;
+  **onset** = first second in `[open − 10 s, peak]` where that mean reaches a quarter of the rise.
+- **Delay** `d` = `channels.chat_delay_s` (manual override) → median of the last 5 valid
+  `chat_delay_estimates` → **8 s**; fixed per stream. `T = peak_utc = chat_peak − d`. **Window**
+  (§7) `[min(T − 90 s, onset − d − 30 s), max(T + 30 s, close − d + 15 s)]`, at most 5 min.
+- **Cooldown 60 s**: a weaker episode opening < 60 s after a candidate closed folds into it
+  (`features.followups`); a stronger one is emitted with `features.prev_candidate_id`. **Budget**:
+  ≤ 8 emitted per stream per rolling hour, then only above the lowest of them (caps LLM cost).
+- **One transaction per candidate**: insert → `media.request_media(stream, window, Priority.TRIGGER,
+  requested_by="detector")` → `jobs.enqueue(JUDGE, ref_id=id, dedupe_key=dedupe_key(JUDGE, id),
+  priority=TRIGGER)` → commit. A 60 s sweep marks its requests fulfilled once `coverage(window)`
+  is complete or 15 min after `window_to`. Until the judge exists: `CLIPPER_DETECTOR_JUDGE_JOBS=0`.
+
+**6. Offline pass (v1) and chat delay.**
+- **Job** `detect_offline` (ref = stream), enqueued by a 5 min sweep for ended streams with complete
+  `coverage([started_at, ended_at])` (backfill: also `vods.chat_metrics_to ≥ ended_at` or chat not
+  available) and no job for this version (dedupe `detect_offline:{stream}:{version}`).
+- **Triggers** (video time, merged when peaks are < 30 s apart): (a) chat: the live scorer replayed,
+  shifted by `d` (so backfilled streams get it too); (b) audio_metrics_1s: laughter ≥ 0.5 in 2 of
+  4 s, screaming/shouting ≥ 0.6, cheering/gasp/crying ≥ 0.5 for 2 s, 3 s loudness − 5 min median
+  ≥ 10 dB; not where music or gunfire_explosion ≥ 0.6; needs `z ≥ 2.5` in `[t + d − 5 s, t + d +
+  15 s]` unless two groups fire or laughter ≥ 0.7 for 3 s (thresholds depend on the tagger picked);
+  (c) transcript_segments text vs lexicon phrases, strongest the streamer saying "clip that".
+- **Score** = max trigger score + 0.5 per extra kind; top 4 *new* candidates per stream-hour; judge
+  priority `LIVE`/`BACKFILL`. **Deferred**: stories/rants chat didn't spike on (LLM/embeddings over
+  transcript windows; needs judge/review labels), emotion models, an incremental pass while live.
+- **Delay learning** (first step of each job): onsets of laughter/screaming/cheering ≥ 0.5 (≥ 20 s
+  apart, not under music); event-triggered average of chat `z` at lags 1–30 s (cross-correlation of
+  event train and chat excess); `d` = argmax after 3 s smoothing, valid with ≥ 15 events and a peak
+  ≥ 1.5 above the median over lags. One `chat_delay_estimates` row per stream; its own offline
+  candidates use it, later streams the median of the last 5. **Writer conflict**: the detector never
+  writes `channels`; `channels.chat_delay_s` becomes the operator's manual override.
+
+**7. Data model.** `candidates` holds detector output only (columns below). §7's `candidate` = an
+emitted row with a judge job and no clip yet; from `waiting_for_media` on, the lifecycle lives in
+the judge's `clips` (`candidate_id` unique FK): one writer each. Detector status is `emitted` /
+`suppressed` (+ reason). The `judge` job wakes the judge (durable, prioritised, deduped; no new
+NOTIFY); waiting clips LISTEN on `clipper_transcripts` (§16). Ground truth: §17's `viewer_clips`.
+
+**8. Evaluation (backtest).** Truth: `viewer_clips` (§17) with a span (`start_utc`..`end_utc` ±
+`slack_s`), top 10 per stream by views plus all ≥ its p75; hit = candidate peak inside the span.
+Streams: backfilled ones (chat + audio only) and our own live-recorded ones once `backfill clips`
+has attached their clips (the only set with events and viewers). At `k = ceil(4 × hours)` (also
+2/h, 8/h): hit rate@k (precision lower bound: unclipped good moments exist), view-weighted
+recall@k, median (peak − clip start) as a delay check, candidates/h, false suppressions per
+reason; §17's exclusions apply (muted, `timeline_uncertain`). `clipper-detector backtest --stream
+12 | --channel x --since 2026-11-01 [--params p.toml] [--grid z_on=3,4,5]`: read-only, a table.
+
+**9. Service shape.** Loops: live 1 s (one query `channel_id = ANY(:held) AND ts > :last AND
+ts < now() − 8 s` on the PK → scorers in ts order); explicit 5 s; streams/leases 10 s; sweeps 60 s /
+5 min; offline `jobs.JobRunner` (CPU work in a thread); heartbeat 15 s. **Polling, not LISTEN**:
+chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates latency. **Leases**
+`detect:channel:{id}` (TTL 60 s, renewed every 20 s; a stable `CLIPPER_WORKER_ID` retakes them).
+**Heartbeat**: versions, channels held, max lag, emitted/suppressed by reason (1 h), offline jobs.
+`CLIPPER_TWITCH_*` enables Get Clips. Controller: `STALE_AFTER` += judge 10 min, offline 30 min.
+
+**10. Build plan.**
+1. **Contracts + migration** (now). *Done:* `test_migrations` passes; payload/enum tests.
+2. **Scorer, stage 2, lexicon** (now; pure, synthetic fixtures). *Done:* noise → nothing; 15 s ×4
+   burst → one candidate, peak ± 2 s; start ramp → nothing; raid, mass gift, copypasta, `!enter`,
+   "1/2" votes, greeting flood → suppressed with the right reason; replay from a later start → same.
+3. **Live service** (now; defaults provisional). *Done:* integration test: stats + raw chat →
+   candidate + media request + bumped transcribe jobs + judge job in one transaction; restart → no
+   duplicate; a live run decides ≤ 10 s after a second is final.
+4. **Backtest CLI** (needs step 5 data). *Done:* hit rate/recall@k for ≥ 10 streams, < 1 min each;
+   then tune the defaults (**depends on real data**) and log them with their numbers.
+5. **Offline pass, delay learning, explicit signals** (needs the transcriber running, the tagger
+   choice, §17's `get_clips`). *Done:* delay within ± 3 s of a hand measurement on 3 channels;
+   backtest reports offline vs chat-only recall (measured, no target yet).
+
+### Proposed decision-log rows
+
+| Date | Decision | Why |
+|---|---|---|
+| 2026-11-19 | Two-stage live detection: per-second stats find suspects, the raw chat of that window confirms and filters | exact unique users, copypasta, commands, bots, votes, "clip it" without changing or redeploying chat-ingest |
+| 2026-11-19 | Baseline = 20 min rolling median of 10 s unique-chatter sums (last minute excluded), robust z + ratio, scaled by viewers | robust to the spike itself and to viewer ramps/raids; viewers only normalise |
+| 2026-11-19 | One pure, clock-free scorer for live, offline and backtest; live state in memory, rebuilt from chat_metrics_1s | backtests reproduce live exactly; no state table |
+| 2026-11-19 | Emit a candidate when its chat episode closes, not at the first crossing | stable peak/window; the judge waits for T + 30 s transcripts anyway |
+| 2026-11-19 | Emote categories in a versioned `lexicon.toml` in the detector (names, words, patterns, bots, per-channel overrides) | ships with the often-redeployed detector; version in `detector_version` keeps backtests reproducible |
+| 2026-11-19 | Fake-spike matches are stored as `suppressed` candidates with a reason, without a judge job | audit and tune the filter against viewer clips |
+| 2026-11-19 | Detector writes `candidates`; judge writes `clips` (`candidate_id`); a `judge` job + `request_media(TRIGGER)` go in the candidate's transaction | one writer per table; durable, prioritised, deduped wake-up; no new NOTIFY channel |
+| 2026-11-19 | Learned chat delay goes to the detector's `chat_delay_estimates` (per stream); `channels.chat_delay_s` is a manual override | keeps one writer per table; delay changes with the streamer's latency mode |
+| 2026-11-19 | The detector polls Helix Get Clips for its live channels itself and keeps fresh clips in memory/candidate features; `viewer_clips` stays backfill-only | it is the only consumer of fresh clips; keeps `viewer_clips` single-writer (§17); 1 point/channel/min of the shared 800/min |
+| 2026-11-19 | Backfilled streams are read as "events and viewers unknown": no viewer scaling, event rules off | §17 writes no `chat_events`/`viewer_snapshots`; "unknown" must not look like "none" |
+| 2026-11-19 | Detector follows chat_metrics_1s by 1 s polling, no NOTIFY from chat-ingest | chat-ingest is rarely redeployed; its 5 s grace dominates latency |
+| 2026-11-19 | Offline pass v1 = chat replay + audio events + transcript phrases; story/rant finder deferred | simple first; the finder needs labels from judge/review |
+
+### Contract changes
+
+All additive: one hand-written migration **`0004_detector`** (after §17's `0003_backfill`, which
+creates `viewer_clips`), two new tables, no change to existing tables.
+
+`contracts.py`:
+
+```python
+class JobKind(StrEnum):
+    TRANSCRIBE = "transcribe"
+    JUDGE = "judge"  # ref_id = candidates.id; enqueued by the detector with the candidate
+    DETECT_OFFLINE = "detect_offline"  # ref_id = streams.id; enqueued by the detector's sweep
+
+class CandidateSource(StrEnum):
+    LIVE = "live"
+    OFFLINE = "offline"
+
+class CandidateStatus(StrEnum):
+    EMITTED = "emitted"  # judge job enqueued
+    SUPPRESSED = "suppressed"  # fake-spike rule or budget; see suppress_reason
+
+class MomentType(StrEnum):
+    FUNNY = "funny"
+    HYPE = "hype"
+    SHOCK = "shock"
+    TENSE = "tense"
+    SAD = "sad"
+    CRINGE = "cringe"
+    WHOLESOME = "wholesome"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+class JudgePayload(Payload):
+    candidate_id: int
+
+class DetectOfflinePayload(Payload):
+    stream_id: int
+    detector_version: str
+
+def dedupe_key(kind: JobKind, ref_id: int, *parts: str | int) -> str:
+    """One job per (kind, object[, parts]); extra parts for jobs that may run again, e.g. per
+    detector version. `dedupe_key(kind, 5)` stays "kind:5"."""
+    return ":".join(str(p) for p in (kind, ref_id, *parts))
+
+def detect_lease(channel_id: int) -> str:
+    """Lease a detector process holds while it scores a channel live."""
+    return f"detect:channel:{channel_id}"
+```
+
+`models.py` (and the same in the migration):
+
+- **`Candidate`** (`candidates`), writer: detector. `id` bigint PK; `stream_id` FK streams,
+  `channel_id` FK channels (not null); `source` text CHECK IN ('live','offline'); `status` text
+  CHECK IN ('emitted','suppressed'); `suppress_reason` text null (raid, subs, bits, commands,
+  copypasta, vote, bots, greeting, mode_toggle, spam_wave, budget); `trigger` text (chat,
+  clip_mentions, viewer_clips, audio, transcript; no CHECK, it grows); `peak_utc` timestamptz (video
+  time); `chat_peak_utc` timestamptz null; `chat_delay_s` float; `delay_source` text (override,
+  learned, default); `moment_from`, `moment_to` timestamptz (CHECK `moment_to >= moment_from`);
+  `window_from`, `window_to` timestamptz (CHECK `window_to > window_from`); `score` float;
+  `moment_type` text default 'unknown'; `features` jsonb default '{}' (z, ρ, baseline, uniques,
+  viewers, shares, categories, top emotes, events, explicit signals, audio, transcript hits,
+  followups); `detector_version` text; `media_request_id` FK media_requests null; `created_at`,
+  `updated_at`. UNIQUE (`stream_id`, `source`, `peak_utc`); INDEX (`stream_id`, `peak_utc`); INDEX
+  (`channel_id`, `created_at`).
+- **`ChatDelayEstimate`** (`chat_delay_estimates`), writer: detector. `id` bigint PK; `channel_id`
+  FK; `stream_id` FK; `method` text ('audio_events'); `delay_s` float; `events` int; `strength`
+  float (peak above the median over lags); `valid` bool; `detector_version` text; `computed_at`
+  default now(). UNIQUE (`stream_id`, `method`); INDEX (`channel_id`, `computed_at`).
+- `viewer_clips`: unchanged from §17 (writer: backfill tool only); the detector only reads it.
+- Docstrings only: `Channel.chat_delay_s` = manual override by the operator (learned values in
+  `chat_delay_estimates`); `MediaRequest`: detector requests are linked from
+  `candidates.media_request_id`, `clip_id` stays for the judge.
+
+Outside core: controller `maintenance.STALE_AFTER` += `JUDGE: 10 min`, `DETECT_OFFLINE: 30 min`;
+the detector uses `clipper_twitch.helix.get_clips` (added by §17) with `TwitchSettings`.
+No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
