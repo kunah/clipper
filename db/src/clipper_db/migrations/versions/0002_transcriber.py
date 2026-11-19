@@ -1,4 +1,4 @@
-"""transcriber contract: owned ranges + provisional tails, audio_metrics_1s
+"""transcriber contract: owned ranges + provisional tails, segment scores, audio_metrics_1s
 
 Revision ID: 0002
 Revises: 0001
@@ -42,6 +42,7 @@ def upgrade() -> None:
         "transcript_segments",
         sa.Column("provisional", sa.Boolean, server_default=sa.text("false"), nullable=False),
     )
+    op.add_column("transcript_segments", sa.Column("confidence", sa.Float))
     # The transcriber replaces a chunk's segments (delete by chunk_id) on every job.
     op.create_index(op.f("ix_transcript_segments_chunk_id"), "transcript_segments", ["chunk_id"])
 
@@ -67,6 +68,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("audio_metrics_1s")
     op.drop_index(op.f("ix_transcript_segments_chunk_id"), table_name="transcript_segments")
+    op.drop_column("transcript_segments", "confidence")
     op.drop_column("transcript_segments", "provisional")
     op.drop_constraint(op.f("ck_chunk_transcripts_owned_range"), "chunk_transcripts", type_="check")
     for column in ("tail_from", "owned_to", "owned_from"):

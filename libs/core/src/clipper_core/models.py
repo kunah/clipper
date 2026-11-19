@@ -264,7 +264,9 @@ class TranscriptSegment(Base):
     `chunk_id` is the chunk whose words file the sentence came from (it may start before that
     chunk's `start_utc` when the chunk took over the previous chunk's tail). `provisional`: the
     sentence ran into the end of the chunk and will be replaced by the next contiguous chunk's
-    version (its words are at or after the chunk's `tail_from`).
+    version (its words are at or after the chunk's `tail_from`). Quality scores (NULL when the
+    engine has none): `avg_logprob` / `no_speech_prob` (whisper-style), `confidence` 0..1 (the
+    engine's segment score, else the mean word probability).
     """
 
     __tablename__ = "transcript_segments"
@@ -283,6 +285,7 @@ class TranscriptSegment(Base):
     language: Mapped[str | None] = mapped_column(Text)
     avg_logprob: Mapped[float | None] = mapped_column(Float)
     no_speech_prob: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[float | None] = mapped_column(Float)  # 0..1: engine score or mean word prob
     model: Mapped[str] = mapped_column(Text)
     provisional: Mapped[bool] = mapped_column(server_default=sql_text("false"))
     text_tsv: Mapped[Any] = mapped_column(

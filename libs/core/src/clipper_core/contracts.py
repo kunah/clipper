@@ -67,6 +67,23 @@ class GapReason(StrEnum):
     UNKNOWN = "unknown"  # the media timeline jumped without a known cause
 
 
+class SoundGroup(StrEnum):
+    """Sound-class groups: the keys of `audio_metrics_1s.classes` (written by the transcriber,
+    read by the detector). Each value is a score 0..1 for one second: the max over the group's
+    AudioSet labels (the label mapping lives in the transcriber)."""
+
+    LAUGHTER = "laughter"
+    SCREAMING = "screaming"
+    SHOUTING = "shouting"
+    CHEERING = "cheering"
+    GASP = "gasp"
+    CRYING = "crying"
+    MUSIC = "music"
+    SINGING = "singing"
+    SPEECH = "speech"
+    GUNFIRE_EXPLOSION = "gunfire_explosion"
+
+
 class Payload(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

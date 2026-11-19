@@ -367,11 +367,45 @@ Details decided while building it (step 4a):
   read newer files after additive changes); incompatible changes bump `version` (now 1), which
   old readers reject.
 
+Details decided while building it (step 4b-1, processing pipeline `clipper_transcriber.pipeline`):
+- **Voice activity**: Silero VAD v6.2 ONNX on onnxruntime (CPU, no torch; pinned URL + sha256,
+  downloaded into the models dir), regions by a numpy port of `get_speech_timestamps` with
+  `max_speech_s = 29.6` (gate max − 2 × pad), so long speech splits at its longest pause.
+  `EnergyVad` (loudness threshold) for tests and as a fallback.
+- **Gating**: speech stretches (regions closer than 1 s merged, 0.2 s padding, at most 30 s) go
+  to the engine in one `transcribe_many` call per window (batching adapters); the engine also
+  hears audio after `owned_to` (context), words are clamped to it.
+- **Time grid**: all window offsets are whole microseconds (Postgres precision); a word must
+  start, and a tail must start, at least 1 µs before the window end (`owned_to` or the end of the
+  audio, rounded down), so `start + offset < owned_to` holds after the conversion.
+- **Sentences**: text and times always come from the words; engine segments only group words
+  (by word midpoint) and carry their scores (`avg_logprob`, `no_speech_prob`, `confidence`, else
+  the mean word confidence; non-finite → NULL). New nullable `transcript_segments.confidence`.
+- **Junk filter**: sentences without letters/digits always; sentences made only of phantom
+  phrases or starting with a credit prefix ("subtitles by", ...) when their words' mean VAD
+  speech share is < 0.8; "thank you"/"you"/"bye"-type sentences when < 0.5; words whose span
+  stays > 0.2 s away from all VAD speech; loops = a 3-gram recurring every ≤ 20 words ≥ 4 times
+  in a row, across sentences ("here" × 6 → "here here here"), cut only where the engine gives no
+  scores or they agree (compression ratio > 2.4 or avg_logprob < −1).
+- **Tail** also when VAD speech runs into the cut but the engine gave no words for its end (the
+  cut word is often dropped): the tail sentence is then the last one if it reaches into that
+  speech region, else the region itself. The tail starts 0.2 s (gate pad) before it, as lead-in
+  for the next chunk (engines put word starts late), but never before the previous words' end,
+  so no word changes owner.
+- **Metric rows**: a UTC second belongs to the chunk whose own range contains its middle
+  (`ts + 0.5 s`): chunks write disjoint seconds even with jitter, and each row has ≥ 0.5 s of the
+  chunk's audio. A row uses the window audio it has (the first and last may be partial);
+  `speech_ratio` = share of samples in VAD frames with prob ≥ threshold; loudness RMS dBFS clamped
+  to [−100, 0]. The tagger gets audio starting on a whole second: up to 2 s of window audio
+  before the first row as context, zero-padded when the first second starts before the audio.
+- **Decode errors**: `audio.AudioError` (ffmpeg missing, OS error, timeout: retry) vs
+  `audio.DecodeError` (ffmpeg can't decode the file: give up on the chunk).
+
 **Contract changes (libs/core, additive migration 0002):**
 - `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable),
   CHECK `owned_from <= owned_to` and `owned_from <= tail_from < owned_to`.
-- `transcript_segments`: + `provisional` (bool, default false), index on `chunk_id` (the
-  transcriber replaces a chunk's segments on every job).
+- `transcript_segments`: + `provisional` (bool, default false), + `confidence` (float,
+  nullable), index on `chunk_id` (the transcriber replaces a chunk's segments on every job).
 - new `audio_metrics_1s` (PK `stream_id, ts`, FK streams; `loudness_db`, `speech_ratio`,
   `classes` jsonb; CHECK ranges). Writer: transcriber; the detector reads it next to
   `chat_metrics_1s`.

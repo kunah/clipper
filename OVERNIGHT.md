@@ -13,16 +13,19 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   `clipper_core.transcripts` (`words()`, `coverage()` with transcribed / provisional /
   untranscribed / gap / unrecorded). DESIGN.md §16 updated with the details. 123 tests.
 
+- Step 4b-1 (commit "Transcriber pipeline"): `services/transcriber` package: ffmpeg decode to
+  16 kHz mono f32, engine interfaces (`SpeechEngine` incl. batched `transcribe_many`,
+  `SoundTagger`, `VoiceActivityDetector`), Silero VAD v6.2 via onnxruntime (no torch; bit-exact
+  vs the reference), VAD gating, sentence split, junk filter, provisional tail, per-second
+  metrics (a second belongs to the chunk containing ts + 0.5 s), fakes. `contracts.SoundGroup`;
+  `transcript_segments.confidence` added to (undeployed) migration 0002. 221 tests.
+
 ## In progress
-
-- Step 4b-1: services/transcriber processing pipeline (decode, engine interfaces, Silero VAD via
-  onnxruntime, sentences, junk filter, metrics, tail detection), no DB.
-- Read-only design drafts (scratchpad, not in the repo yet): §17 backfill, §18 detector.
-
-## Next
 
 - 4b-2: transcriber job handler (window/handover/re-runs, transaction, NOTIFY, heartbeat, main)
   + integration tests with fake engines.
+
+## Next
 - Real model adapters, CUDA Dockerfile, compose service: wait for
   `C:\Users\hkuna\developer\clips\data\bench\BENCHMARK_DONE` AND the model choice in the decision
   log of DESIGN.md on main.
@@ -31,10 +34,11 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 ## Status of external gates
 
 - Benchmark finished 2026-11-19 01:05Z (`BENCHMARK_DONE` exists): GPU and Docker builds allowed
-  (keep Docker disk use modest, E: holds live recordings). Model choice NOT made yet → real
-  engine adapters + CUDA Dockerfile + compose service still skipped. Candidates (from the main
-  session): faster-whisper large-v3 / large-v3-turbo, NeMo Parakeet TDT 0.6B v2, Qwen3-ASR;
-  taggers AST, CED.
+  (keep Docker disk use modest, E: holds live recordings).
+- Model decision on main (a2a3487, 2026-11-19): speech = **Whisper large-v3-turbo**
+  (faster-whisper) decided; sound classifier = **CED-base, PROVISIONAL** (not confirmed by the
+  user; its adapter is built behind the SoundTagger interface and stays swappable).
+  Not merged (rule: never merge); the DESIGN.md commit is cherry-picked onto `transcriber`.
 
 ## Open questions for the user
 
@@ -42,4 +46,4 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 
 ## Credentials / decisions needed
 
-- Speech model + sound classifier choice (write it into DESIGN.md's decision log on main).
+- Confirm the sound classifier (CED-base is provisional).
