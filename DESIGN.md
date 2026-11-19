@@ -127,7 +127,8 @@ Jobs have a **priority that can change after they're queued** (demand-driven):
 - Running jobs aren't interrupted (a 60 s chunk takes seconds).
 - Own job queue in Postgres (`clipper_core.jobs`), not a library: `FOR UPDATE SKIP LOCKED`,
   `pg_notify` wake-ups (sent on commit), dedupe keys (re-enqueue only raises priority),
-  retries with backoff, stale-lock requeue.
+  retries with backoff (a handler raises `jobs.PermanentJobError` to fail a job at once when
+  retrying can't help), stale-lock requeue.
 
 ## 7. Clip lifecycle
 
@@ -328,7 +329,7 @@ works with CTranslate2 4.9: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` (see
 **Per job (chunk N):**
 1. Load chunk N. No `audio_key` → nothing to do, job done.
 2. **Window.** If the previous chunk P (same stream, `seq - 1`) is contiguous (`P.end_utc ==
-   N.start_utc` within 50 ms), already transcribed, and has a provisional tail (`tail_from` not
+   N.start_utc` within `CHUNK_JITTER`, 0.5 s), already transcribed, and has a provisional tail (`tail_from` not
    null), the window starts at `max(P.tail_from, P.start_utc, N.start_utc − 30 s)`: download P's
    audio too and prepend that part. When the 30 s cap applies, P keeps (now non-provisional)
    ownership of `[P.tail_from, window start)`. Otherwise the window starts at `N.start_utc`.
@@ -427,8 +428,44 @@ Details decided while building it (step 4b-1, processing pipeline `clipper_trans
   `speech_ratio` = share of samples in VAD frames with prob ≥ threshold; loudness RMS dBFS clamped
   to [−100, 0]. The tagger gets audio starting on a whole second: up to 2 s of window audio
   before the first row as context, zero-padded when the first second starts before the audio.
-- **Decode errors**: `audio.AudioError` (ffmpeg missing, OS error, timeout: retry) vs
-  `audio.DecodeError` (ffmpeg can't decode the file: give up on the chunk).
+- **Decode errors**: `audio.AudioError` (ffmpeg missing, OS error, timeout, killed by a signal:
+  retry) vs `audio.DecodeError` (ffmpeg can't decode the file: give up on the chunk).
+
+Details decided while building it (step 4b-2, job handler `clipper_transcriber.handler`, entry
+`clipper-transcriber`):
+- **Planning is a pure function** (`plan_window`) of N, P, S and their transcript rows.
+  **Re-take**: when N already has a row starting before N's start and the contiguous P ends exactly
+  there without a tail, an earlier attempt took P's tail over; the window starts at that
+  `owned_from` again and P is left alone (else a retry/re-run would leave `[owned_from, N.start)`
+  unowned). A takeover needs P to have audio and `window start >= P.owned_from` (degenerate rows
+  are left alone).
+- **Contiguous = at most `CHUNK_JITTER` (0.5 s) apart** (not 50 ms), like coverage's jitter
+  bridging and the recorder's gap tolerance; setting `contiguity_tolerance_s`.
+- **Window audio**: P's slice is cut or zero-padded to exactly `round((N.start − window start) ×
+  16 kHz)` samples, so N's audio starts at the offset of N's start (jitter holes become silence,
+  overlaps are cut).
+- **Concurrency**: the commit takes `pg_advisory_xact_lock` per stream, re-reads P's, N's and S's
+  transcripts and compares them with what the plan saw; any difference is a `HandoverConflict`:
+  the handler plans again (up to 3 plans per job, decoded audio reused), then the job runner
+  retries (backoff). Several workers may process neighbours at the same time without breaking
+  the tiling (a randomised model of plan + commit checks this in the tests).
+- **Words file inside the locked transaction**, after the re-check and before the DB writes: a
+  stale attempt can never overwrite the file of a newer committed one. A transaction failing
+  after the upload leaves the new file under the old row until the retry (same window for the
+  same row state; the file carries its own `t0`).
+- **After a takeover** P's segments are deleted where provisional or starting at or after
+  `least(old tail_from, new owned_to)` (a tail inside a jitter overlap starts after N's start),
+  the rebuilt ones inserted (capped case: sentences split from P's words file, no engine scores,
+  P's model/language), and P's `segment_count` recounted. A tail dropped for the CHECK leaves no
+  segment provisional.
+- **`processing_s`** = pipeline time (VAD + speech + tagger), without download/decode; realtime
+  factor = window audio / that (the heartbeat shows an EWMA, α = 0.2). A `DecodeError` becomes
+  `jobs.PermanentJobError`: the job fails at once (a broken file never decodes), coverage keeps
+  showing the chunk as untranscribed. Both audio downloads finish before the temp dir goes.
+- **Engines by name** (`SPEECH_ENGINES`, `SOUND_TAGGERS` in `service.py`); "fake" only when set
+  explicitly, no default engine yet. Heartbeat `info`: `models` (speech, tagger, vad), `device`,
+  `realtime_factor`, `jobs_done`, `jobs_failed` (failed attempts), `current_chunk`, `queue`
+  (queued transcribe jobs by priority, keys are the priority as text).
 
 **Contract changes (libs/core, additive migration 0002):**
 - `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable),

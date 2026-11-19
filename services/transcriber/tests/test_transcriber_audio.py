@@ -7,6 +7,7 @@ import subprocess
 import numpy as np
 import pytest
 
+from clipper_transcriber import audio
 from clipper_transcriber.audio import (
     SAMPLE_RATE,
     AudioError,
@@ -83,6 +84,19 @@ def test_failures_that_are_worth_a_retry_are_audio_errors(ffmpeg, tmp_path):
     with pytest.raises(AudioError):
         encode_aac(np.zeros(100, np.float32), path, ffmpeg=str(tmp_path / "no-ffmpeg-here"))
     assert not issubclass(DecodeError, AudioError) and not issubclass(AudioError, DecodeError)
+
+
+@pytest.mark.parametrize("code", [-9, -15, 0xC0000005])
+def test_ffmpeg_killed_by_a_signal_is_an_audio_error(code, tmp_path, monkeypatch):
+    path = tmp_path / "a.aac"
+    path.write_bytes(b"x" * 100)
+
+    def killed(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, code, b"", b"")
+
+    monkeypatch.setattr(audio.subprocess, "run", killed)
+    with pytest.raises(AudioError, match="killed"):
+        decode(path)
 
 
 def test_video_without_audio_is_a_decode_error(ffmpeg, tmp_path):

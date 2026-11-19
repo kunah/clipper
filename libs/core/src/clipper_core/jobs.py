@@ -4,6 +4,8 @@
 - Workers claim the highest-priority job with FOR UPDATE SKIP LOCKED.
 - pg_notify wakes idle workers instantly (sent on commit); they also poll as a fallback.
 - Priority can only go up: re-enqueueing or bumping uses GREATEST(old, new).
+- A failing handler is retried with backoff up to max_attempts; raising PermanentJobError
+  fails the job at once (retrying can't help, e.g. a broken input file).
 """
 
 from __future__ import annotations
@@ -28,6 +30,12 @@ from clipper_core.logs import get_logger, log_context
 log = get_logger(__name__)
 
 NOTIFY_CHANNEL = "clipper_jobs"
+
+
+class PermanentJobError(Exception):
+    """Raised by a handler when retrying can't help (a broken input file, an impossible
+    payload): JobRunner marks the job failed at once instead of using its remaining attempts.
+    Subclass it or raise it `from` the original error."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,9 +157,11 @@ def retry_delay(attempts: int) -> timedelta:
     return timedelta(seconds=min(5 * 2 ** max(attempts - 1, 0), 600))
 
 
-async def fail(session: AsyncSession, job: ClaimedJob, error: str) -> JobStatus:
-    """Retry later with backoff, or give up after max_attempts."""
-    final = job.attempts >= job.max_attempts
+async def fail(
+    session: AsyncSession, job: ClaimedJob, error: str, *, permanent: bool = False
+) -> JobStatus:
+    """Retry later with backoff, or give up after max_attempts (`permanent`: give up now)."""
+    final = permanent or job.attempts >= job.max_attempts
     status = JobStatus.FAILED if final else JobStatus.QUEUED
     await session.execute(
         sql_text(
@@ -238,6 +248,15 @@ class JobRunner:
             started = time.monotonic()
             try:
                 await self._handlers[job.kind](job)
+            except PermanentJobError as exc:
+                async with self._sessions.begin() as session:
+                    await fail(session, job, f"{type(exc).__name__}: {exc}", permanent=True)
+                log.error(
+                    "job failed permanently, not retrying",
+                    attempt=job.attempts,
+                    error=str(exc),
+                    duration_s=round(time.monotonic() - started, 3),
+                )
             except Exception as exc:
                 async with self._sessions.begin() as session:
                     status = await fail(session, job, f"{type(exc).__name__}: {exc}")

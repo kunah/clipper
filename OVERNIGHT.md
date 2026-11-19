@@ -20,10 +20,18 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   metrics (a second belongs to the chunk containing ts + 0.5 s), fakes. `contracts.SoundGroup`;
   `transcript_segments.confidence` added to (undeployed) migration 0002. 221 tests.
 
+- Step 4b-2 (commit "Transcriber job handler"): `plan_window` (takeover, capped takeover,
+  re-take on retry, out-of-order, re-runs), window audio assembly, one locked transaction per
+  stream (advisory lock, re-validation, words-file upload under the lock, segments, P update,
+  audio metrics, NOTIFY), re-plan on HandoverConflict, `jobs.PermanentJobError` in core (broken
+  files fail at once), service + heartbeat (queue depth by priority), `clipper-transcriber`
+  entry. Contiguity tolerance = `CHUNK_JITTER` (0.5 s). A randomised handover model test
+  (300 seeds) + DB tests for every ordering. 279 tests. Root ruff config excludes `*.md`.
+
 ## In progress
 
-- 4b-2: transcriber job handler (window/handover/re-runs, transaction, NOTIFY, heartbeat, main)
-  + integration tests with fake engines.
+- 4b-3: faster-whisper large-v3-turbo adapter, CED adapter (provisional), CUDA Dockerfile,
+  compose service (not started), end-to-end run in a container on a throwaway DB + bucket.
 
 ## Next
 - Real model adapters, CUDA Dockerfile, compose service: wait for

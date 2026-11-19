@@ -19,13 +19,20 @@ Pcm = npt.NDArray[np.float32]
 
 
 class AudioError(RuntimeError):
-    """ffmpeg could not run: not installed, OS error, timeout, unreadable input path.
-    Transient or a setup problem: retry the job."""
+    """ffmpeg could not run or was killed: not installed, OS error, timeout, signal (OOM
+    killer, shutdown), unreadable input path. Transient or a setup problem: retry the job."""
 
 
 class DecodeError(RuntimeError):
     """ffmpeg ran but could not decode the file (broken data, no audio track). Retrying
     won't help: give up on the chunk."""
+
+
+def _killed(returncode: int) -> bool:
+    """ffmpeg didn't fail on the data but was stopped: a POSIX signal (negative code) or a
+    Windows crash status (NTSTATUS 0xC0xxxxxx, e.g. 0xC0000005). ffmpeg's own error exits
+    (negative AVERROR codes, seen as large unsigned values on Windows) lie outside that range."""
+    return returncode < 0 or 0xC0000000 <= returncode <= 0xC0FFFFFF
 
 
 def samples(seconds: float) -> int:
@@ -85,6 +92,8 @@ def decode(path: Path | str, *, ffmpeg: str = "ffmpeg", timeout_s: float = 120.0
         raise AudioError(f"{type(exc).__name__}: {exc}") from exc
     if result.returncode != 0:
         stderr = result.stderr.decode(errors="replace").strip()[-500:]
+        if _killed(result.returncode):
+            raise AudioError(f"ffmpeg was killed (exit status {result.returncode}) {stderr}")
         raise DecodeError(stderr or f"ffmpeg exited with {result.returncode}")
     data = result.stdout[: len(result.stdout) // 4 * 4]
     return np.frombuffer(data, dtype="<f4").astype(np.float32)  # copy: writable, native order

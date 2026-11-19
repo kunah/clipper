@@ -9,6 +9,9 @@ dependencies = [
     "onnxruntime==1.31.1",
 ]
 
+[project.scripts]
+clipper-transcriber = "clipper_transcriber.main:main"
+
 [tool.uv.sources]
 clipper-core = { workspace = true }
 

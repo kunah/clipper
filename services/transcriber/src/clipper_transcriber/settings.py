@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from clipper_core.contracts import CHUNK_JITTER
 from clipper_transcriber.pipeline import PipelineConfig
 from clipper_transcriber.vad import VadParams
 
@@ -45,7 +46,11 @@ class TranscriberSettings(BaseSettings):
     word_speech_tolerance_s: float = Field(default=0.2, ge=0, allow_inf_nan=False)
     tail_margin_s: float = Field(default=0.5, ge=0, allow_inf_nan=False)
     takeover_cap_s: float = Field(default=30.0, gt=0, allow_inf_nan=False)  # max prepended
-    contiguity_tolerance_s: float = Field(default=0.05, ge=0, allow_inf_nan=False)
+    # Neighbouring chunks this close are contiguous (handover): the chunk jitter, as in coverage()
+    # and the recorder's gap tolerance (the window audio zero-pads such a hole).
+    contiguity_tolerance_s: float = Field(
+        default=CHUNK_JITTER.total_seconds(), ge=0, allow_inf_nan=False
+    )
     tagger_context_s: int = Field(default=2, ge=0)
     loudness_floor_db: float = Field(default=-100.0, lt=0, allow_inf_nan=False)
 
