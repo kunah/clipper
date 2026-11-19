@@ -65,5 +65,6 @@ uv was installed with winget; in an old shell it may not be on PATH yet (restart
 - psycopg async needs a selector event loop on Windows (`runtime.run` and conftest handle it).
 - PowerShell 5.1 `Set-Content -Encoding utf8` writes a BOM that breaks TOML. Use the
   Edit/Write tools or bash for file edits.
-- Docker's disk image is on `D:\DockerDesktopWSL`. GPU works in containers (RTX 4060).
+- Docker's disk image is on `E:\DockerDesktopWSL` (moved off the slow D: HDD on 2026-11-19). GPU works
+  in containers (RTX 4060).
 - MinIO is not an option (no community images since Oct 2025); object storage is SeaweedFS.

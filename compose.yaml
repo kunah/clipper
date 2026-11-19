@@ -4,7 +4,7 @@
 #   docker compose up -d            # postgres + object storage + migrate (and services later)
 #   docker compose logs -f migrate
 #
-# Data lives in named volumes inside Docker's disk image (moved to D: on this PC).
+# Data lives in named volumes inside Docker's disk image (on E: on this PC).
 # To put object storage somewhere else, set OBJECTSTORE_DATA to a host path in .env.
 
 name: clipper

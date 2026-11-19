@@ -8,8 +8,10 @@ They are skipped when Postgres isn't reachable.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
+from pathlib import Path
 
 import psycopg
 import pytest
@@ -19,6 +21,8 @@ from sqlalchemy.engine import make_url
 BASE_URL = os.environ.get(
     "CLIPPER_TEST_DATABASE_URL", "postgresql+psycopg://clipper:clipper@127.0.0.1:5433/clipper"
 )
+# Same checkout -> same id; another git worktree -> another id (and other test databases).
+CHECKOUT_ID = hashlib.sha1(str(Path(__file__).resolve().parent).lower().encode()).hexdigest()[:8]
 
 
 def database_url(name: str) -> str:
@@ -49,10 +53,14 @@ def pg_admin_dsn() -> str:
 
 @pytest.fixture(scope="session")
 def fresh_database(pg_admin_dsn):
-    """Factory: create an empty database and return its SQLAlchemy URL. Dropped at session end."""
+    """Factory: create an empty database and return its SQLAlchemy URL. Dropped at session end.
+
+    Names get a suffix per checkout, so test runs in two worktrees never drop each other's database.
+    """
     created: list[str] = []
 
     def make(name: str) -> str:
+        name = f"{name}_{CHECKOUT_ID}"
         with psycopg.connect(pg_admin_dsn, autocommit=True) as conn:
             conn.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
             conn.execute(f"CREATE DATABASE {name}")

@@ -177,7 +177,7 @@ Rules:
 ## 10. Deployment
 
 **Now: everything on the dev PC** (Windows 11, RTX 4060 8 GB, Ryzen 7 5700X3D, 32 GB RAM).
-- Docker Desktop's disk image moved to `D:\DockerDesktopWSL` (C: is small). Named volumes.
+- Docker Desktop's disk image is on `E:\DockerDesktopWSL` (C: is small, D: is a slow HDD). Named volumes.
 - Postgres host port **5433** (5432 belongs to another project's container on this PC).
 - Use **`127.0.0.1`, not `localhost`**: `localhost` tries IPv6 first and stalls.
 - GPU works in containers (Docker Desktop + WSL2, driver 610).
@@ -231,7 +231,13 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    crash), ffmpeg copies audio to `.aac`, upload, then chunk + gap + transcription job (priority
    from `priority_for_range`) in one transaction. Channels claimed via leases. Verified live on
    Twitch (full + audio_only, graceful stop, hard kill + recovery, restart without gaps).
-4. ⬜ transcriber: GPU, word timestamps, hot/cold priority, benchmark the 4060.
+4. ⬜ transcriber: GPU worker for `transcribe` jobs. Words (UTC) → S3 JSON per chunk,
+   sentences → `transcript_segments`, per-second sound classes + loudness → new
+   `audio_metrics_1s` table, all in one transaction + NOTIFY. Chunk boundaries: the last
+   sentence of a chunk that runs into the cut is *provisional* and is re-transcribed and taken
+   over by the next contiguous chunk (no sentence is ever cut, no added latency).
+   Model picked from `tools/asr-bench` (real stream audio, measured on the 4060).
+   Full design: [§16](#16-transcriber-design-step-4).
 5. ⬜ backfill tool: past VODs + chat replay + top clips → detector development offline.
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
@@ -274,3 +280,77 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-18 | Chunks are continuous; a gap row is committed with the chunk that follows it | exact time mapping inside a chunk; gap + chunk are atomic and survive crashes |
 | 2026-11-18 | New gap reason `not_recorded` (no recorder running: joined late, restart) | consumers can tell "nothing was there" (ad) from "we missed it" |
 | 2026-11-18 | fMP4 streams: spool init section + fragments as `.mp4`, remux to `.ts` (ffmpeg copy) when the chunk is finished; a changed init section starts a new chunk | storage and every consumer keep one format (`.ts` + `.aac`); the spool file stays readable after a crash |
+| 2026-11-18 | Transcription is English-only | the channels are English; opens English-specialised models |
+| 2026-11-18 | Chunk boundaries: provisional last sentence, taken over by the next contiguous chunk | independent chunks cut a word every minute (captions, judge context); waiting for the next chunk adds 60 s latency |
+| 2026-11-18 | Sound classification (laughter, screaming, cheering, music...) in the transcriber from the start | strong signal for the detector; the audio is decoded anyway |
+| 2026-11-18 | Pick models by benchmark on real stream audio (`tools/asr-bench`), not by leaderboard | leaderboard sets are clean speech; stream audio has game sound, music, several speakers |
+
+## 16. Transcriber design (step 4)
+
+**Status:** design agreed 2026-11-18. The speech model and the sound classifier are not picked
+yet (`tools/asr-bench` is measuring candidates on real stream audio); everything else below is
+model-independent and can be built first, behind an engine interface with a fake engine in tests.
+
+**Role.** `services/transcriber`, one process per GPU (CUDA image). Claims `transcribe` jobs with
+`jobs.JobRunner` (highest priority first, then oldest). Writer of `chunk_transcripts`,
+`transcript_segments`, `audio_metrics_1s` (new) and the words files in object storage
+(`storage.keys.chunk_words`). English only. A single worker keeps chunks of one stream in order.
+
+**Per job (chunk N):**
+1. Load chunk N. No `audio_key` → nothing to do, job done.
+2. **Window.** If the previous chunk P (same stream, `seq - 1`) is contiguous (`P.end_utc ==
+   N.start_utc` within 50 ms), already transcribed, and has a provisional tail (`tail_from` not
+   null), the window starts at `P.tail_from` (at most 30 s before `N.start_utc`): download P's
+   audio too and prepend its tail. Otherwise the window starts at `N.start_utc`.
+3. **Decode** to 16 kHz mono float32 PCM ourselves (ffmpeg/soundfile), never via an engine's own
+   file reader (faster-whisper's PyAV path broke with current PyAV).
+4. **Speech recognition** through the engine interface → words (text, start, end, confidence)
+   relative to the window start, plus sentence segments if the engine gives them (otherwise split
+   on `.?!` and pauses > 1 s, max ~30 s per sentence). Voice-activity gating in front of the
+   model: non-speech stretches are not sent to it (avoids made-up text, and LLM-decoder models
+   running away on music/silence).
+5. **Provisional tail.** If the last sentence ends within 0.5 s of the window end (speech runs
+   into the cut), its start becomes `tail_from`; its words/sentences are provisional until the
+   next contiguous chunk takes them over (step 2 of that chunk).
+6. **Junk filter.** Drop known phantom phrases ("thanks for watching", ...), repetition loops
+   (a 3-gram repeated ≥ 4 times) and words outside detected speech; keep the quality scores on
+   the segments (`avg_logprob`, `no_speech_prob` or the engine's confidence) so consumers can
+   filter further.
+7. **Audio metrics** for N's own range `[start_utc, end_utc)`, one row per second: loudness
+   (dBFS), speech fraction (from the voice-activity detector), and sound-class scores by group
+   (laughter, screaming, shouting, cheering, gasp, crying, music, singing, speech,
+   gunfire_explosion; each the max over its AudioSet labels, see `tools/asr-bench/run_tagger.py`).
+8. **Words file** for N: `streams/{id}/transcripts/{seq}.json` = `WordsFile` (chunk id, stream id,
+   seq, model, `t0` = UTC of the window start, words with start/end seconds relative to `t0`).
+9. **One transaction:** upsert `chunk_transcripts` (+ `owned_from` = window start, `owned_to` =
+   `N.end_utc`, `tail_from`); delete + insert N's `transcript_segments` (retries are idempotent);
+   if P's tail was taken over: delete P's provisional segments and set `P.owned_to =
+   P.tail_from`, `P.tail_from = NULL`; upsert N's `audio_metrics_1s` rows;
+   `NOTIFY clipper_transcripts, '<stream_id>'` (sent on commit; the judge waits on it).
+
+**Ownership rule.** A chunk's words file is authoritative only for `[owned_from, owned_to)` of its
+`chunk_transcripts` row. Consumers never read words files directly; they call
+`clipper_core.transcripts.words(session, store, stream_id, interval)` (UTC words, ownership
+applied) and `transcripts.coverage(session, stream_id, interval)` (transcribed / gap / pending
+parts, using `stream_gaps`), which the judge uses for "transcripts cover T−90 s … T+30 s".
+
+**Contract changes (libs/core, additive migration 0002):**
+- `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable).
+- `transcript_segments`: + `provisional` (bool, default false).
+- new `audio_metrics_1s` (PK `stream_id, ts`; `loudness_db`, `speech_ratio`, `classes` jsonb).
+  Writer: transcriber; the detector reads it next to `chat_metrics_1s`.
+- `contracts`: `TRANSCRIPTS_NOTIFY_CHANNEL = "clipper_transcripts"`, `WordsFile` / `Word` models.
+- new module `transcripts` with `words()` and `coverage()`.
+
+**Engine interfaces** (in the service): `SpeechEngine.transcribe(pcm) -> words + segments` and
+`SoundTagger.classify(pcm) -> per-second group scores`. Real adapters (and the CUDA Dockerfile)
+are added once the benchmark has picked the models; a fake engine drives the tests.
+
+**Edge cases.** Out-of-order processing (N+1 bumped and done before N): N+1 starts at its own
+start; N then keeps no provisional tail (possible small glitch at that one boundary). Gap or
+stream end after N: the provisional tail stays (best available). Requests in `media_requests`
+are marked fulfilled by whoever asked, not by the transcriber.
+
+**Runtime.** CUDA base image, model weights in a `models` volume (`HF_HOME`), GPU reserved in
+compose. Heartbeat info: models, device, realtime factor, queue depth by priority. Crashed jobs
+are requeued by the controller after 15 min (exists).

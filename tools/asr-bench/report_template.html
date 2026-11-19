@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root {
+  --bg: #fbfbf9; --fg: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc; --card: #ffffff;
+  --accent: #2f6fdb; --hl: #ffe27a; --diff: #d9480f; --speech: #9aa3ad;
+  --laughter: #e8590c; --screaming: #c2255c; --shouting: #9c36b5; --cheering: #2b8a3e; --music: #1971c2;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161615; --fg: #ecebe6; --muted: #9b9a94; --line: #34332f; --card: #1f1f1d;
+    --accent: #6ea0ff; --hl: #6b5a12; --diff: #ff8a50; --speech: #5c6670;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+       font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 80px; }
+h1 { font-size: 22px; margin: 0 0 4px; } h2 { font-size: 17px; margin: 36px 0 8px; }
+p.note { color: var(--muted); margin: 4px 0 12px; max-width: 880px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 13.5px; }
+th, td { border-bottom: 1px solid var(--line); padding: 6px 10px; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 600; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }
+select, button { font: inherit; padding: 4px 8px; background: var(--card); color: var(--fg);
+                 border: 1px solid var(--line); border-radius: 6px; }
+button { cursor: pointer; }
+audio { width: 100%; margin: 6px 0 4px; }
+.strip { display: grid; grid-template-columns: 130px 1fr; align-items: center; gap: 8px;
+         font-size: 12px; color: var(--muted); margin: 2px 0; }
+.cells { display: flex; height: 12px; position: relative; cursor: pointer; }
+.cells i { flex: 1; }
+.cursor { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--fg); }
+.model { border-top: 1px solid var(--line); padding: 10px 0; }
+.model h3 { font-size: 13px; margin: 0 0 4px; color: var(--muted); font-weight: 600; }
+.words span { cursor: pointer; border-radius: 3px; padding: 0 1px; }
+.words span.now { background: var(--hl); }
+.words span.diff { text-decoration: underline wavy var(--diff); text-underline-offset: 3px; }
+.legend { font-size: 12px; color: var(--muted); }
+.moments { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.moments ol { margin: 4px 0 0; padding-left: 20px; font-size: 13px; }
+.moments li button { padding: 0 6px; margin-right: 6px; }
+</style>
+</head>
+<body>
+<main>
+<h1>Speech model benchmark (Twitch stream audio, RTX 4060)</h1>
+<p class="note" id="intro"></p>
+
+<h2>Speed, memory and junk</h2>
+<p class="note">"x realtime": seconds of audio per second of compute, one 60 s chunk at a time
+(how the transcriber works). "GPU-h per day": for 60 h of audio a day. "Outside speech": words
+whose middle is more than 0.5 s away from any speech the voice-activity detector found (made-up
+text, or speech under loud game audio the detector missed). Leaderboard WER is on clean benchmark
+sets, not stream audio.</p>
+<div class="scroll"><table id="summary"></table></div>
+
+<h2>How much the models agree</h2>
+<p class="note">No human transcript exists for this audio, so this is agreement, not accuracy:
+WER of the column model when the row model is taken as the reference. Low numbers between two
+models mean they hear the same words; the odd one out is either the best or the worst, and the
+listening section below tells which.</p>
+<div class="scroll"><table id="wer"></table></div>
+<p class="note">Median difference in word start times on the words both models agree on (caption
+timing). The model whose timing is far from all others is the suspect one.</p>
+<div class="scroll"><table id="timing"></table></div>
+
+<h2>Listen and compare</h2>
+<p class="note">Play a chunk: each model's words highlight as they are spoken (that is the caption
+timing). Click a word to jump there. "Mark differences vs." underlines the words a model has that
+the chosen model doesn't. The strips show speech (VAD) and the sound classifiers' scores per second;
+click a strip to seek.</p>
+<div class="card">
+  <div class="controls">
+    <label>Chunk <select id="chunk"></select></label>
+    <label>Mark differences vs. <select id="ref"><option value="">(nothing)</option></select></label>
+    <button id="prev">◀ prev</button><button id="next">next ▶</button>
+  </div>
+  <audio id="audio" controls preload="auto"></audio>
+  <div id="strips"></div>
+  <div id="models"></div>
+</div>
+
+<h2>Sound classifiers: strongest moments</h2>
+<p class="note">Top seconds per label for each classifier. Play each to check whether it really is
+laughter / screaming / cheering / music.</p>
+<div class="moments" id="moments"></div>
+<p class="legend" id="versions"></p>
+</main>
+<script>
+const D = __DATA__;
+const $ = (id) => document.getElementById(id);
+const pct = (v) => (v * 100).toFixed(1) + "%";
+const names = D.asr.map((m) => m.name);
+const GROUPS = ["laughter", "screaming", "shouting", "cheering", "music"];
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+const totalMin = D.chunks.reduce((s, c) => s + c.seconds, 0) / 60;
+$("intro").textContent = `${D.chunks.length} chunks, ${totalMin.toFixed(1)} min of audio from ` +
+  `${new Set(D.chunks.map((c) => c.channel)).size} English channels (${[...new Set(D.chunks.map((c) => c.channel))].join(", ")}).`;
+
+// ---------------------------------------------------------------- tables
+function table(el, head, rows) {
+  el.innerHTML = "<tr>" + head.map((h) => `<th>${h}</th>`).join("") + "</tr>" +
+    rows.map((r) => "<tr>" + r.map((c) => `<td>${c}</td>`).join("") + "</tr>").join("");
+}
+table($("summary"),
+  ["model", "params", "license", "leaderboard WER", "x realtime", "s / 60 s chunk (median · p95)",
+   "GPU-h per day", "VRAM peak", "load", "words/min", "outside speech", "repetition chunks", "phantom phrases", "GPU busy before"],
+  D.summary.map((s) => [s.name, s.params, s.license, s.public_wer ? s.public_wer + "%" : "?",
+    s.rtfx.toFixed(0) + "x", `${s.median_s.toFixed(2)} · ${s.p95_s.toFixed(2)}`,
+    s.gpu_h_day.toFixed(2), s.vram + " MB", s.load_s.toFixed(0) + " s", s.wpm.toFixed(0),
+    pct(s.outside), s.reps, s.phantoms, s.busy == null ? "?" : s.busy + "%"]));
+function matrix(el, m, fmt) {
+  table(el, ["reference ↓ / compared →", ...names],
+    names.map((a) => [a, ...names.map((b) => a === b ? "–" : fmt(m[a + "|" + b]))]));
+}
+matrix($("wer"), D.wer, (v) => pct(v));
+matrix($("timing"), D.timing, (v) => v == null ? "?" : v.toFixed(0) + " ms");
+$("versions").textContent = "Versions: " + D.summary.map((s) =>
+  s.name + " (" + Object.entries(s.versions).map(([k, v]) => k + " " + v).join(", ") + "; " +
+  Object.entries(s.config).map(([k, v]) => k + "=" + v).join(", ") + ")").join(" · ");
+
+// ---------------------------------------------------------------- listening
+const audio = $("audio");
+let current = null, stopAt = null;
+const tok = (w) => w.toLowerCase().replace(/[^a-z0-9']/g, "");
+
+function unmatched(words, refWords) {
+  const a = words.map((w) => tok(w.w)), b = refWords.map((w) => tok(w.w));
+  const n = a.length, m = b.length, L = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--)
+    L[i][j] = a[i] && a[i] === b[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const miss = new Set();
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] && a[i] === b[j]) { i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) { if (a[i]) miss.add(i); i++; }
+    else j++;
+  }
+  for (; i < n; i++) if (a[i]) miss.add(i);
+  return miss;
+}
+
+function strip(label, values, color) {
+  const row = document.createElement("div");
+  row.className = "strip";
+  row.innerHTML = `<span>${label}</span><div class="cells">${values.map((v) =>
+    `<i style="background:${color};opacity:${Math.max(0.04, v).toFixed(2)}"></i>`).join("")}<span class="cursor"></span></div>`;
+  const cells = row.querySelector(".cells");
+  cells.addEventListener("click", (e) => {
+    const r = cells.getBoundingClientRect();
+    audio.currentTime = ((e.clientX - r.left) / r.width) * values.length;
+    audio.play();
+  });
+  return row;
+}
+
+function show(id) {
+  const c = D.chunks.find((x) => x.id === id);
+  current = c;
+  $("chunk").value = id;
+  audio.src = "audio/" + c.wav;
+  const strips = $("strips");
+  strips.innerHTML = "";
+  const secs = Math.floor(c.seconds);
+  const speech = Array.from({ length: secs }, (_, s) =>
+    D.speech[id].some(([a, b]) => a < s + 1 && b > s) ? 0.8 : 0);
+  strips.appendChild(strip("speech (VAD)", speech, css("--speech")));
+  for (const t of D.tags) {
+    const tc = t.chunks[id];
+    if (!tc) continue;
+    for (const g of GROUPS) if (tc.groups[g]) strips.appendChild(strip(`${t.name} · ${g}`, tc.groups[g], css("--" + g)));
+  }
+  const ref = $("ref").value;
+  const refWords = ref ? D.asr.find((m) => m.name === ref).chunks[id].words : null;
+  const box = $("models");
+  box.innerHTML = "";
+  for (const m of D.asr) {
+    const words = m.chunks[id].words;
+    const miss = refWords && m.name !== ref ? unmatched(words, refWords) : new Set();
+    const div = document.createElement("div");
+    div.className = "model";
+    div.innerHTML = `<h3>${m.name} · ${words.length} words${refWords && m.name !== ref ? ` · ${miss.size} not in ${ref}` : ""}</h3>` +
+      `<div class="words">${words.map((w, i) => `<span data-s="${w.s}" data-e="${w.e}"${miss.has(i) ? ' class="diff"' : ""}>${w.w.replace(/</g, "&lt;")}</span>`).join(" ")}</div>`;
+    div.querySelectorAll("span[data-s]").forEach((sp) => sp.addEventListener("click", () => {
+      audio.currentTime = Math.max(0, +sp.dataset.s - 0.05); audio.play();
+    }));
+    box.appendChild(div);
+  }
+}
+
+function tick() {
+  const t = audio.currentTime;
+  if (stopAt != null && t >= stopAt) { audio.pause(); stopAt = null; }
+  document.querySelectorAll(".words span.now").forEach((s) => s.classList.remove("now"));
+  document.querySelectorAll(".words").forEach((row) => {
+    for (const sp of row.children) if (+sp.dataset.s <= t && t < +sp.dataset.e) { sp.classList.add("now"); break; }
+  });
+  if (current) document.querySelectorAll(".cursor").forEach((c) => c.style.left = (t / Math.floor(current.seconds) * 100) + "%");
+  if (!audio.paused) requestAnimationFrame(tick);
+}
+audio.addEventListener("play", () => requestAnimationFrame(tick));
+audio.addEventListener("seeked", tick);
+
+for (const c of D.chunks) $("chunk").insertAdjacentHTML("beforeend", `<option value="${c.id}">${c.channel} · minute ${+c.id.split("_").pop() + 1}</option>`);
+for (const n of names) $("ref").insertAdjacentHTML("beforeend", `<option>${n}</option>`);
+$("chunk").addEventListener("change", (e) => show(e.target.value));
+$("ref").addEventListener("change", () => show(current.id));
+const step = (d) => { const i = D.chunks.indexOf(current); show(D.chunks[(i + d + D.chunks.length) % D.chunks.length].id); };
+$("prev").addEventListener("click", () => step(-1));
+$("next").addEventListener("click", () => step(1));
+show(D.chunks[0].id);
+
+// ---------------------------------------------------------------- classifier moments
+function playMoment(id, sec) {
+  if (!current || current.id !== id) show(id);
+  const go = () => { audio.currentTime = Math.max(0, sec - 1); stopAt = sec + 3; audio.play(); };
+  if (audio.readyState >= 1) go(); else audio.addEventListener("loadedmetadata", go, { once: true });
+  audio.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+for (const g of GROUPS) for (const t of D.tags) {
+  const all = [];
+  for (const [id, c] of Object.entries(t.chunks)) (c.groups[g] || []).forEach((v, s) => all.push({ id, s, v }));
+  all.sort((a, b) => b.v - a.v);
+  const top = [];
+  for (const m of all) { if (top.length >= 8) break; if (!top.some((x) => x.id === m.id && Math.abs(x.s - m.s) < 4)) top.push(m); }
+  const card = document.createElement("div");
+  card.className = "card";
+  card.innerHTML = `<strong style="color:${css("--" + g)}">${g}</strong> · ${t.name}<ol>${top.map((m) => {
+    const c = D.chunks.find((x) => x.id === m.id);
+    return `<li><button data-id="${m.id}" data-s="${m.s}">▶</button>${c.channel} ${+m.id.split("_").pop() + 1}:${String(m.s).padStart(2, "0")} · ${m.v.toFixed(2)}</li>`;
+  }).join("")}</ol>`;
+  card.querySelectorAll("button").forEach((b) => b.addEventListener("click", () => playMoment(b.dataset.id, +b.dataset.s)));
+  $("moments").appendChild(card);
+}
+</script>
+</body>
+</html>
