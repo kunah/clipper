@@ -51,10 +51,19 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   337 tests. The live recorder/chat-ingest/controller containers still run the old code until
   you rebuild them (no need to hurry; nothing changes for them).
 
+- Step 5b (commit "Twitch VOD access"): Helix `get_videos`/`get_clips`, `clipper_twitch.vod`
+  (streamlink, optional extra `vod`; restricted vs gone told apart), `clipper_twitch.gql` (chat
+  replay: anonymous, ≤ 2 req/s, retries on Twitch's transient errors) with fakes and fixtures.
+  Smoke test (opt-in, `CLIPPER_TWITCH_LIVE_TESTS=1`) ran once on an xqc archive (~24 MB, deleted):
+  VOD segments are 10 s MPEG-TS; **the `audio_only` playlist carries PDT** on every segment
+  (= T0_pdt + offset, T0_pdt = createdAt − 3.2 s); muted = `N-muted.ts`; chat `createdAt` is UTC
+  with ms, `contentOffsetSeconds` whole seconds, no drift over 11.6 h; the chat anchor sits ~4 s
+  after T0_pdt (Twitch's replay compensates latency). Facts in DESIGN §3. 421 tests.
+
 ## In progress
 
-- Step 5b: Twitch VOD access (Helix videos/clips, VOD playlist via streamlink, GQL chat replay
-  behind interfaces + fakes, one small opt-in smoke test against a real VOD).
+- Step 5c: `tools/backfill` CLI, VOD media + time (T0 from the `audio_only` PDT, chat anchor and
+  Helix as cross-checks), resume, dry-run; a small real run on throwaway data.
 
 ## Next
 

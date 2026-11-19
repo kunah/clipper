@@ -37,4 +37,7 @@ addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["libs", "db", "services"]
-markers = ["integration: needs the Postgres from compose.yaml (skipped when unreachable)"]
+markers = [
+    "integration: needs the Postgres from compose.yaml (skipped when unreachable)",
+    "twitch_live: anonymous requests to the real Twitch (skipped unless CLIPPER_TWITCH_LIVE_TESTS=1)",
+]

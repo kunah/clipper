@@ -13,7 +13,9 @@ Only what the recorder needs, following Twitch's format (ad rules as in streamli
 - The playlist only holds the last ~30 s, so it has to be reloaded every couple of seconds.
 
 VOD (archive) playlists are parsed by `parse_vod_playlist`: they are timed by VOD offset (the sum
-of EXTINF), because they probably carry no EXT-X-PROGRAM-DATE-TIME (DESIGN §17).
+of EXTINF). Seen 2026-11-19 (DESIGN §3): only the `audio_only` rendition carries
+EXT-X-PROGRAM-DATE-TIME, and it is exactly `T0 + offset` (an anchor, not a wall clock that shows
+gaps); video renditions have none.
 """
 
 from __future__ import annotations
@@ -188,7 +190,7 @@ class VodSegment:
     muted: bool  # "N-muted.ts": the platform silenced its audio (copyrighted music)
     discontinuity: bool  # EXT-X-DISCONTINUITY before this segment
     init_uri: str | None = None  # EXT-X-MAP in effect: fMP4 fragment, needs this init section
-    program_date_time: datetime | None = None  # UTC, only if the playlist has a PDT for it
+    program_date_time: datetime | None = None  # UTC, if the playlist has a PDT (audio_only does)
 
     @property
     def end_s(self) -> float:

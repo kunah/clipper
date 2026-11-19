@@ -1,0 +1,114 @@
+{
+  "data": [
+    {
+      "id": "2932113307",
+      "stream_id": "321206426716",
+      "user_id": "71092938",
+      "user_login": "alpha",
+      "user_name": "Alpha",
+      "title": "LIVE: still going",
+      "description": "",
+      "created_at": "2026-11-18T06:27:53Z",
+      "published_at": "2026-11-18T06:27:53Z",
+      "url": "https://www.twitch.tv/videos/2932113307",
+      "thumbnail_url": "https://static-cdn.jtvnw.net/cf_vods/d2nvs31859zcd8/abc_alpha_321206426716_1794983267/thumb/thumb0-%{width}x%{height}.jpg",
+      "viewable": "public",
+      "view_count": 51234,
+      "language": "en",
+      "type": "archive",
+      "duration": "23h15m35s",
+      "muted_segments": null
+    },
+    {
+      "id": "2929044358",
+      "stream_id": "321100000001",
+      "user_id": "71092938",
+      "user_login": "alpha",
+      "user_name": "Alpha",
+      "title": "yesterday",
+      "description": "a description",
+      "created_at": "2026-11-14T22:41:46Z",
+      "published_at": null,
+      "url": "https://www.twitch.tv/videos/2929044358",
+      "thumbnail_url": "",
+      "viewable": "public",
+      "view_count": 30001,
+      "language": "en",
+      "type": "archive",
+      "duration": "9h37m18s",
+      "muted_segments": [
+        {
+          "duration": 30,
+          "offset": 120
+        },
+        {
+          "duration": 360,
+          "offset": 7200
+        }
+      ]
+    },
+    {
+      "id": "335921245",
+      "stream_id": null,
+      "user_id": "71092938",
+      "user_login": "alpha",
+      "user_name": "Alpha",
+      "title": "Twitch Developers 101",
+      "description": "Welcome to Twitch development!",
+      "created_at": "2018-11-14T21:30:18Z",
+      "published_at": "2018-11-14T22:04:30Z",
+      "url": "https://www.twitch.tv/videos/335921245",
+      "thumbnail_url": "https://static-cdn.jtvnw.net/cf_vods/d2nvs31859zcd8/twitchdev/335921245/ce0f3a7f-57a3-4152-bc06-0c6610189fb3/thumb/index-0000000000-%{width}x%{height}.jpg",
+      "viewable": "public",
+      "view_count": 1863062,
+      "language": "en",
+      "type": "upload",
+      "duration": "3m21s",
+      "muted_segments": [
+        {
+          "duration": 30,
+          "offset": 120
+        }
+      ]
+    },
+    {
+      "id": "2926188923",
+      "stream_id": "320900000002",
+      "user_id": "71092938",
+      "user_login": "alpha",
+      "user_name": "Alpha",
+      "title": "older",
+      "description": "",
+      "created_at": "2026-11-11T21:55:19Z",
+      "published_at": "2026-11-11T21:55:19Z",
+      "url": "https://www.twitch.tv/videos/2926188923",
+      "thumbnail_url": "",
+      "viewable": "public",
+      "view_count": 20000,
+      "language": "en",
+      "type": "archive",
+      "duration": "9h29m22s",
+      "muted_segments": null
+    },
+    {
+      "id": "2924308181",
+      "stream_id": "320800000003",
+      "user_id": "71092938",
+      "user_login": "alpha",
+      "user_name": "Alpha",
+      "title": "oldest",
+      "description": "",
+      "created_at": "2026-11-09T20:18:30Z",
+      "published_at": "2026-11-09T20:18:30Z",
+      "url": "https://www.twitch.tv/videos/2924308181",
+      "thumbnail_url": "",
+      "viewable": "public",
+      "view_count": 10000,
+      "language": "en",
+      "type": "archive",
+      "duration": "10h46m41s",
+      "muted_segments": null
+    }
+  ],
+  "pagination": {}
+}

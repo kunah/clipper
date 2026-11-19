@@ -1,6 +1,7 @@
 """parse_vod_playlist: VOD (archive) media playlists timed by VOD offset (sum of EXTINF)."""
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -116,3 +117,33 @@ def test_byte_range_playlists_are_refused():
     text = "#EXTM3U\n#EXTINF:10.0,\n#EXT-X-BYTERANGE:1000@0\nall.ts\n"
     with pytest.raises(ValueError, match="EXT-X-BYTERANGE"):
         parse_vod_playlist(text, BASE)
+
+
+# Real playlists (xqc archive, smoke test 2026-11-19), cut to segments 0-3 plus the first muted
+# one (18): segments 4-17 are left out, so the last entry's offset is 40 s, its PDT says 180 s.
+FIXTURES = Path(__file__).parent / "fixtures"
+REAL_BASE = "https://d1m7jfoe9zdc1j.cloudfront.net/0123456789abcdef0123_alpha_42_1794983267/"
+
+
+def test_real_audio_only_playlist_has_pdt_equal_to_t0_plus_offset():
+    text = (FIXTURES / "vod_audio_only.m3u8").read_text()
+    pl = parse_vod_playlist(text, REAL_BASE + "audio_only/index-dvr.m3u8")
+    assert pl.ended and pl.total_secs == 83735.25 and pl.target_duration == 13.0
+    assert [s.uri.rsplit("/", 1)[1] for s in pl.segments] == [
+        "0.ts", "1.ts", "2.ts", "3.ts", "18-muted.ts"
+    ]  # fmt: skip
+    assert [s.muted for s in pl.segments] == [False] * 4 + [True]
+    t0 = datetime(2026, 11, 18, 6, 27, 49, 784000, tzinfo=UTC)
+    assert all(s.program_date_time is not None for s in pl.segments)
+    assert [s.program_date_time - t0 for s in pl.segments[:4]] == [
+        timedelta(seconds=s.offset_s) for s in pl.segments[:4]
+    ]
+    assert pl.segments[4].program_date_time == t0 + timedelta(seconds=18 * 10)
+
+
+def test_real_video_playlist_has_no_pdt():
+    text = (FIXTURES / "vod_1080p60.m3u8").read_text()
+    pl = parse_vod_playlist(text, REAL_BASE + "1080p60/index-dvr.m3u8")
+    assert all(s.program_date_time is None for s in pl.segments)
+    assert pl.segments[0].uri == REAL_BASE + "1080p60/0.ts" and pl.segments[-1].muted
+    assert pl.total_secs == 83735.25 and pl.ended

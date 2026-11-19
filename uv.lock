@@ -452,13 +452,20 @@ dependencies = [
     { name = "websockets" },
 ]
 
+[package.optional-dependencies]
+vod = [
+    { name = "streamlink" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "clipper-core", editable = "libs/core" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic-settings", specifier = ">=2.6" },
+    { name = "streamlink", marker = "extra == 'vod'", specifier = ">=7.0" },
     { name = "websockets", specifier = ">=13.0" },
 ]
+provides-extras = ["vod"]
 
 [[package]]
 name = "colorama"
