@@ -7,7 +7,8 @@ judges, edits and publishes short vertical clips.
 > **Status (2026-11-19):** Phase 1 / steps 1–4 done (workspace, shared core, schema, job queue,
 > unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber). The transcriber
 > is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
-> `transcriber` compose service, profile `gpu`). Next: step 5 (backfill, design §17 proposed).
+> `transcriber` compose service, profile `gpu`). Step 5 (backfill, design §17 proposed) in
+> progress: 5a (contract + shared code) done.
 > Phase 2 designs §18–§22 are proposed, not yet agreed.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
@@ -247,7 +248,9 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    Full design: [§16](#16-transcriber-design-step-4).
 5. ⬜ backfill tool: past VODs + chat replay + top clips → detector development offline.
    Design: [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed
-   2026-11-19, not yet agreed).
+   2026-11-19, not yet agreed). In progress: 5a done (migration 0003 `vods` + `viewer_clips` +
+   `streams` source CHECKs, `GapReason.MUTED`, shared `clipper_core.{chunks,chat,ffmpeg}` used by
+   recorder and chat-ingest, controller guard for backfilled streams, VOD playlist parser).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
@@ -574,7 +577,8 @@ are requeued by the controller after 15 min (exists).
 
 ## 17. Backfill tool (step 5) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal, nothing built; the smoke test (5b) checks every UNVERIFIED fact first.
+**Status:** proposal; only 5a (shared pieces + contract) is built. The smoke test (5b) checks
+every UNVERIFIED fact first.
 
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)
@@ -593,6 +597,9 @@ and viewer clips in the live format, so transcriber, detector and judge need no 
 
 **Idempotency and resume.** `streams` (unique on the archive's `stream_id`) and the new `vods` row
 are created together and found again on a re-run; a lease `backfill:vod:{id}` keeps runs apart.
+The stream row is created as `status = 'ended'` from the start (`ended_at` = T0 + duration): the
+recorder and chat-ingest follow every `live` row, so a DB CHECK (`source = 'live' OR status =
+'ended'`) keeps a backfilled stream from ever being live.
 - Media: the chunk row, its gaps, its `transcribe` job and `vods.media_done_s` (VOD offset reached)
   commit together. The open chunk sits in a temp dir (no spool: the VOD can be fetched again). A
   crash loses only that chunk, and a re-run continues at `media_done_s` with the next `seq`.
@@ -674,6 +681,13 @@ built with lavfi; DB tests are `integration`. Smoke test (`twitch_live`, off unl
 1. **5a Shared pieces + contract:** migration 0003, `GapReason.MUTED`,
    `clipper_core.{ffmpeg,chunks,chat}` (recorder + chat-ingest switched), controller guard,
    `parse_vod_playlist`. *Done when:* old tests pass unchanged and the parser and guard are tested.
+   **Done 2026-11-19** (not deployed: migration 0003 + controller/recorder/chat-ingest rebuild).
+   Deviations: 0003 also adds the two `streams` CHECKs above; `commit_chunk` returns
+   `CommittedChunk(chunk_id, created, priority)` (the recorder logs the priority), takes any gap
+   with `start/end/reason` (`chunks.Gap`), refuses a re-commit with another interval (ValueError)
+   and keeps stored media keys a re-commit leaves None; the controller also never *ends* a
+   backfilled stream; `VodSegment.program_date_time` (raw PDT), `VodPlaylist.media_sequence`/
+   `ended`, `EXT-X-BYTERANGE` refused; chat-ingest keeps `aggregator` as a re-export, `writer` gone.
 2. **5b Twitch VOD access:** Helix `get_videos`/`get_clips`, `VodSource`, `GqlChatReplay` (limiter,
    retries), fakes, fixtures, smoke test. *Done when:* everything is tested offline and §3 holds the
    smoke answers (PDT, container, muted names, rounding, timezone).
@@ -703,9 +717,11 @@ built with lavfi; DB tests are `integration`. Smoke test (`twitch_live`, off unl
 
 ### Contract changes
 
-**Migration `0003_backfill`** (additive: two new tables, nothing else). `stream_gaps.reason` has no
-CHECK, so `muted` needs no DDL. `streams`, `chunks` and `chat_messages` already have `source`. CHECK
-texts are repeated in the models, as in 0002 (`db/tests/test_migrations.py` compares them).
+**Migration `0003_backfill`** (additive: two new tables, and two CHECKs on `streams`:
+`source IN ('live', 'backfill')` and `source = 'live' OR status = 'ended'`; every existing row is
+live). `stream_gaps.reason` has no CHECK, so `muted` needs no DDL. `streams`, `chunks` and
+`chat_messages` already have `source`. CHECK texts are repeated in the models, as in 0002
+(`db/tests/test_migrations.py` compares them).
 
 **`models.py`**
 ```python

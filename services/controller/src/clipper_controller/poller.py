@@ -3,6 +3,9 @@
 Writer of: channels (ids/display names), streams, viewer_snapshots.
 Helix sometimes leaves a live stream out of one response, so a stream is only ended after
 `end_after_misses` consecutive polls without it.
+Only live streams (`streams.source = 'live'`) are touched: a stream the backfill tool wrote
+(`source = 'backfill'`) is never updated, even when Helix reports its stream id live again
+(it would turn live and the recorder would write into it; DESIGN §17).
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ class StreamPoller:
         self.helix = helix
         self.end_after_misses = end_after_misses
         self._misses: dict[int, int] = {}  # stream id -> consecutive polls missing
+        self._backfilled_seen: set[tuple[int, str]] = set()  # logged once per (channel, stream)
 
     async def poll_once(self, now: datetime | None = None) -> PollResult:
         now = now or utc_now()
@@ -94,7 +98,7 @@ class StreamPoller:
                     text(
                         "SELECT s.id, s.channel_id, s.platform_stream_id, c.login "
                         "FROM streams s JOIN channels c ON c.id = s.channel_id "
-                        "WHERE s.status = 'live'"
+                        "WHERE s.status = 'live' AND s.source = 'live'"
                     )
                 )
             ).all()
@@ -103,7 +107,17 @@ class StreamPoller:
                 stream = live.get(user_ids.get(channel.id) or "")
                 if stream is None:
                     continue
-                stream_id, created = await self._upsert_stream(session, channel.id, stream)
+                upserted = await self._upsert_stream(session, channel.id, stream)
+                if upserted is None:  # the row belongs to a backfilled stream: leave it alone
+                    if (channel.id, stream.id) not in self._backfilled_seen:
+                        self._backfilled_seen.add((channel.id, stream.id))
+                        log.warning(
+                            "live stream id belongs to a backfilled stream, not tracking it",
+                            channel=channel.login,
+                            platform_stream_id=stream.id,
+                        )
+                    continue
+                stream_id, created = upserted
                 current[channel.id] = stream_id
                 await session.execute(
                     text(
@@ -144,7 +158,8 @@ class StreamPoller:
     @staticmethod
     async def _upsert_stream(
         session: AsyncSession, channel_id: int, stream: HelixStream
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool] | None:
+        """(stream id, created), or None when the row is a backfilled stream (not updated)."""
         row = (
             await session.execute(
                 text(
@@ -155,6 +170,7 @@ class StreamPoller:
                     ON CONFLICT (channel_id, platform_stream_id) DO UPDATE
                        SET title = EXCLUDED.title, category = EXCLUDED.category,
                            status = 'live', ended_at = NULL
+                     WHERE streams.source = 'live'
                     RETURNING id, (xmax = 0) AS created
                     """
                 ),
@@ -166,5 +182,5 @@ class StreamPoller:
                     "started": stream.started_at,
                 },
             )
-        ).one()
-        return row.id, row.created
+        ).first()
+        return (row.id, row.created) if row else None

@@ -42,19 +42,31 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   compose `profiles: [gpu]` (a bare `docker compose up -d` does NOT start it). A cold start on a
   throwaway volume downloaded ~1.8 GB and worked online. 313 tests.
 
+- Step 5a (commit "Backfill groundwork"): migration 0003 (`vods`, `viewer_clips`; CHECKs on
+  `streams`: source in live/backfill, a backfilled stream is always `ended`, so recorder and
+  chat-ingest can never pick one up), contracts (`GapReason.MUTED`, `T0Method`, VOD statuses,
+  `backfill_lease`), shared `clipper_core.chunks.commit_chunk` / `clipper_core.chat` /
+  `clipper_core.ffmpeg` (recorder + chat-ingest switched; behaviour reviewed line by line as
+  identical), controller never updates/ends a backfilled stream, `hls.parse_vod_playlist`.
+  337 tests. The live recorder/chat-ingest/controller containers still run the old code until
+  you rebuild them (no need to hurry; nothing changes for them).
+
 ## In progress
 
-- Step 5a: backfill shared pieces + contract (DESIGN §17 build plan).
+- Step 5b: Twitch VOD access (Helix videos/clips, VOD playlist via streamlink, GQL chat replay
+  behind interfaces + fakes, one small opt-in smoke test against a real VOD).
 
 ## Next
 
-- Step 5: tools/backfill (build plan in DESIGN §17: 5a shared code + contract, 5b Twitch VOD
-  access, 5c media + time, 5d chat + clips). Then Phase 2 in roadmap order (detector §18 first).
+- Step 5c (media + time, CLI) and 5d (chat + clips). Then Phase 2 in roadmap order (detector
+  §18 first).
 
 ## How to deploy the transcriber (your call, in the morning)
 
-1. `docker compose up --build migrate` — applies migration 0002 to the live `clipper` DB
-   (additive: new columns/table; `chunk_transcripts` is empty so the NOT NULL columns are safe).
+1. `docker compose up --build migrate` — applies migrations 0002 (transcriber) and 0003
+   (backfill tables + `streams` CHECKs) to the live `clipper` DB. Additive: new columns/tables;
+   `chunk_transcripts` is empty so its NOT NULL columns are safe; all existing streams are
+   `source='live'`, so the new CHECKs hold.
 2. `docker compose up -d transcriber` (naming it enables its `gpu` profile) — first start
    downloads ~1.8 GB of weights into the `models` volume (set `HF_TOKEN` to silence the
    unauthenticated-download warning). Queued `transcribe` jobs from the recorder are then

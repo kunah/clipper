@@ -1,5 +1,9 @@
 """Database tables. One writer service per table (noted on each class); anyone may read.
 
+Backfilled streams (`streams.source = 'backfill'`) are the exception: their rows in the live
+tables (the stream, its chunks, gaps, chat messages, chat metrics) are written only by the backfill
+tool, and the live services never touch them (one writer per table *and source*, DESIGN §17).
+
 Migrations are hand-written in db/ and must stay additive (add columns/tables; never rename or
 drop in the same release), because services are updated at different times.
 """
@@ -77,13 +81,20 @@ class Channel(Base):
 
 
 class Stream(Base):
-    """One broadcast. Writer: controller."""
+    """One broadcast. Writer: controller (`source='live'`), backfill tool (`source='backfill'`).
+
+    The controller never updates a backfilled stream (its upsert only touches `source='live'`).
+    A backfilled stream is always `ended` (CHECK `backfill_ended`): the recorder and chat-ingest
+    follow every `status='live'` row, whatever its source.
+    """
 
     __tablename__ = "streams"
     __table_args__ = (
         UniqueConstraint("channel_id", "platform_stream_id"),
         Index(None, "channel_id", "started_at"),
         CheckConstraint("status IN ('live', 'ended')", name="status"),
+        CheckConstraint("source IN ('live', 'backfill')", name="source"),
+        CheckConstraint("source = 'live' OR status = 'ended'", name="backfill_ended"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -115,7 +126,7 @@ class ViewerSnapshot(Base):
 class Chunk(Base):
     """~60 s of recorded media. Storage unit only; everything else uses UTC times.
 
-    Writer: recorder (and backfill tool).
+    Writer: recorder for live streams, backfill tool for backfilled ones (by the stream's source).
     """
 
     __tablename__ = "chunks"
@@ -139,7 +150,10 @@ class Chunk(Base):
 
 
 class StreamGap(Base):
-    """Time ranges with no media (ads, reconnects). Writer: recorder."""
+    """Time ranges with no media (ads, reconnects, muted VOD parts).
+
+    Writer: recorder for live streams, backfill tool for backfilled ones (by the stream's source).
+    """
 
     __tablename__ = "stream_gaps"
     __table_args__ = (Index(None, "stream_id", "start_utc"),)
@@ -158,7 +172,8 @@ class StreamGap(Base):
 class ChatMessage(Base):
     """Raw chat. Partitioned by day on sent_at (see clipper_core.partitions).
 
-    No foreign keys on purpose: this is the highest-volume table. Writer: chat-ingest, backfill.
+    No foreign keys on purpose: this is the highest-volume table. Writer: chat-ingest
+    (`source='live'`), backfill tool (`source='backfill'`, for backfilled streams).
     """
 
     __tablename__ = "chat_messages"
@@ -184,7 +199,10 @@ class ChatMessage(Base):
 
 
 class ChatEvent(Base):
-    """Subs, gifts, raids, bits, clears... Needed by the fake-spike filter. Writer: chat-ingest."""
+    """Subs, gifts, raids, bits, clears... Needed by the fake-spike filter.
+
+    Writer: chat-ingest only (chat replay has no events, so backfilled streams have none).
+    """
 
     __tablename__ = "chat_events"
     __table_args__ = (Index(None, "channel_id", "sent_at"),)
@@ -200,7 +218,11 @@ class ChatEvent(Base):
 
 
 class ChatMetricSecond(Base):
-    """Per-second chat stats; the live detector reads these. Writer: chat-ingest."""
+    """Per-second chat stats; the live detector reads these.
+
+    Writer: chat-ingest for live streams, backfill tool for backfilled ones (by the stream's
+    source). Both compute them with `clipper_core.chat.SecondAggregator`.
+    """
 
     __tablename__ = "chat_metrics_1s"
     __table_args__ = (PrimaryKeyConstraint("channel_id", "ts"), Index(None, "stream_id", "ts"))
@@ -212,6 +234,93 @@ class ChatMetricSecond(Base):
     unique_chatters: Mapped[int] = mapped_column(Integer)
     emote_counts: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
     event_counts: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+
+
+# --------------------------------------------------------------------------- backfill
+
+
+class Vod(Base):
+    """A platform archive we backfilled, and the time anchor of its media. Writer: backfill tool.
+
+    `t0_utc` = UTC of VOD offset 0 (= the stream's `started_at`), frozen on the first run; every
+    backfilled time is `t0_utc + offset` (shifted per part after a timeline step, see flags).
+    - `t0_method`: a `contracts.T0Method`; `t0_candidates` holds every estimate, e.g.
+      `{"helix": iso, "path_epoch": iso, "chat": iso, "chat_spread_s": 1.0, "comments": 812}`.
+    - `media_status` / `chat_status`: `contracts.VodMediaStatus` / `contracts.VodChatStatus`.
+    - `media_done_s`: VOD offset up to which chunks + gaps are committed (resume point).
+    - `chat_done_s`: VOD offset up to which chat messages are committed; `chat_metrics_to`:
+      `chat_metrics_1s` rows of the stream before it are final (both commit together).
+    - `flags`: e.g. `{"t0_conflict": true, "timeline_uncertain_s": 3.2, "steps": [...],
+      "muted_s": 840, "chat_time_fallbacks": 3, "comments_without_user": 12}`.
+    """
+
+    __tablename__ = "vods"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "platform_video_id"),
+        UniqueConstraint("stream_id"),
+        CheckConstraint(
+            "media_status IN ('pending', 'done', 'restricted', 'gone', 'off')", name="media_status"
+        ),
+        CheckConstraint(
+            "chat_status IN ('pending', 'done', 'skipped', 'unavailable', 'off')",
+            name="chat_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    platform_video_id: Mapped[str] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(Text)
+    platform_created_at: Mapped[datetime]  # Helix created_at
+    duration_s: Mapped[float] = mapped_column(Float)
+    t0_utc: Mapped[datetime]
+    t0_method: Mapped[str] = mapped_column(Text)  # contracts.T0Method
+    t0_candidates: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    rendition: Mapped[str | None] = mapped_column(Text)  # audio_only, 720p60, chunked, ...
+    media_status: Mapped[str] = mapped_column(Text, server_default="pending")
+    media_done_s: Mapped[float] = mapped_column(Float, server_default="0")
+    chat_status: Mapped[str] = mapped_column(Text, server_default="pending")
+    chat_done_s: Mapped[int] = mapped_column(Integer, server_default="0")
+    chat_metrics_to: Mapped[datetime | None]
+    flags: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class ViewerClip(Base):
+    """Viewer-made platform clips: ground truth for the detector. Writer: backfill tool.
+
+    `start_utc`/`end_utc` = the VOD's T0 + `vod_offset_s` (+ `duration_s`); the moment lies within
+    ± `slack_s`. NULL while the platform hasn't assigned a VOD offset yet. `platform_created_at` is
+    when the clip was made, not the moment. `stream_id`: our live or backfilled stream (matched by
+    the VOD's platform stream id), NULL when we have none.
+    """
+
+    __tablename__ = "viewer_clips"
+    __table_args__ = (
+        PrimaryKeyConstraint("platform", "clip_id"),
+        Index(None, "stream_id", "start_utc"),
+        Index(None, "channel_id", "platform_created_at"),
+    )
+
+    platform: Mapped[str] = mapped_column(Text, server_default="twitch")
+    clip_id: Mapped[str] = mapped_column(Text)  # Twitch clip slug
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int | None] = mapped_column(ForeignKey("streams.id"))
+    platform_video_id: Mapped[str | None] = mapped_column(Text)  # Helix "" -> NULL
+    vod_offset_s: Mapped[int | None] = mapped_column(Integer)
+    duration_s: Mapped[float] = mapped_column(Float)
+    start_utc: Mapped[datetime | None]
+    end_utc: Mapped[datetime | None]
+    slack_s: Mapped[float | None] = mapped_column(Float)
+    time_source: Mapped[str | None] = mapped_column(Text)  # vod_t0 | helix_created_at
+    title: Mapped[str | None] = mapped_column(Text)
+    creator_login: Mapped[str | None] = mapped_column(Text)
+    view_count: Mapped[int] = mapped_column(Integer)
+    is_featured: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    platform_created_at: Mapped[datetime]
+    fetched_at: Mapped[datetime] = _created_at()  # last refresh
 
 
 # --------------------------------------------------------------------------- transcripts

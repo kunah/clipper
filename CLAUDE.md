@@ -11,7 +11,9 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `contracts` (priorities, job kinds, payloads), `models` (all tables), `jobs` (queue),
   `media` (time-range requests that raise priorities), `leases`, `heartbeat`, `storage`
   (S3 + key layout), `partitions` (daily chat partitions), `logs` (unified structured
-  logging), `runtime` (entry helpers).
+  logging), `runtime` (entry helpers); shared by live services and backfill: `chunks`
+  (`commit_chunk`: chunk + gaps + transcribe job), `chat` (chat rows, `SecondAggregator`,
+  `ChatWriter`), `ffmpeg` (stream copies: audio out, fMP4 -> .ts).
 - `libs/twitch/` (`clipper_twitch`): IRC parser + anonymous chat client, Helix API client,
   third-party emote sets (7TV/BTTV/FFZ), live HLS playlist parser (`hls`), `TwitchSettings`
   (`CLIPPER_TWITCH_*`).

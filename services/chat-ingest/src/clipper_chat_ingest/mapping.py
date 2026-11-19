@@ -1,4 +1,7 @@
-"""IRC messages -> rows for chat_messages / chat_events (pure functions, easy to test)."""
+"""IRC messages -> rows for chat_messages / chat_events (pure functions, easy to test).
+
+The row types live in `clipper_core.chat` (shared with the backfill tool's chat replay).
+"""
 
 from __future__ import annotations
 
@@ -7,8 +10,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from clipper_core.chat import EventRow, MessageRow
 from clipper_core.timeline import from_unix_ms
-from clipper_twitch.irc import IrcMessage, count_tokens, parse_badges, parse_emotes, strip_action
+from clipper_twitch.emotes import message_emotes
+from clipper_twitch.irc import IrcMessage, parse_badges, parse_emotes, strip_action
 
 ROOMSTATE_KEYS = ("emote-only", "followers-only", "r9k", "slow", "subs-only")
 
@@ -20,33 +25,6 @@ class ChannelState:
     twitch_id: str | None = None
     stream_id: int | None = None
     emotes: Mapping[str, str] = field(default_factory=dict)  # third-party name -> provider
-
-
-@dataclass(slots=True)
-class MessageRow:
-    sent_at: datetime
-    msg_id: str
-    channel_id: int
-    stream_id: int | None
-    received_at: datetime
-    user_id: str | None
-    user_login: str | None
-    text: str
-    emotes: list[dict[str, Any]] | None
-    badges: dict[str, str] | None
-    deleted: bool = False
-    source: str = "live"
-
-
-@dataclass(slots=True)
-class EventRow:
-    channel_id: int
-    stream_id: int | None
-    sent_at: datetime
-    type: str
-    msg_id: str | None = None
-    user_login: str | None = None
-    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -62,24 +40,6 @@ def sent_at_of(msg: IrcMessage, received_at: datetime) -> datetime:
     return from_unix_ms(ts) if ts and ts.isdigit() else received_at
 
 
-def message_emotes(
-    text: str,
-    twitch_tag: str | None,
-    third_party: Mapping[str, str],
-    global_emotes: Mapping[str, str],
-) -> list[dict[str, Any]]:
-    emotes = [
-        {"name": name, "count": count, "source": "twitch", "id": emote_id}
-        for emote_id, name, count in parse_emotes(twitch_tag, text)
-    ]
-    twitch_names = {e["name"] for e in emotes}
-    known = {**global_emotes, **third_party}
-    for name, count in count_tokens(text, known).items():
-        if name not in twitch_names:
-            emotes.append({"name": name, "count": count, "source": known[name]})
-    return emotes
-
-
 def map_message(
     msg: IrcMessage,
     received_at: datetime,
@@ -92,7 +52,8 @@ def map_message(
 
     if msg.command == "PRIVMSG":
         text, is_action = strip_action(msg.text or "")
-        emotes = message_emotes(text, tags.get("emotes"), channel.emotes, global_emotes)
+        twitch_emotes = parse_emotes(tags.get("emotes"), text)
+        emotes = message_emotes(text, twitch_emotes, channel.emotes, global_emotes)
         badges = parse_badges(tags.get("badges"))
         row = MessageRow(
             sent_at=sent_at,

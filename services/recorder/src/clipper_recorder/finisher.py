@@ -2,30 +2,23 @@
 
 Runs beside the channel recorders so slow uploads never stall segment downloads. Storage and
 database errors are retried forever (the chunk stays in the spool meanwhile); after a restart the
-spool is finished first. Each chunk is committed in one transaction: chunk row, the gap before it,
-and its transcription job (priority raised by open media requests for that time range).
+spool is finished first. Each chunk is committed in one transaction (`chunks.commit_chunk`):
+chunk row, the gap before it, and its transcription job (priority raised by open media requests
+for that time range). The ffmpeg stream copies are in `clipper_core.ffmpeg`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import subprocess
 from pathlib import Path
 from typing import Protocol
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from clipper_core import jobs, media
-from clipper_core.contracts import (
-    DataSource,
-    JobKind,
-    Priority,
-    RecordingMode,
-    TranscribePayload,
-    dedupe_key,
-)
+from clipper_core import chunks
+from clipper_core import ffmpeg as ffm
+from clipper_core.contracts import DataSource, Priority, RecordingMode
 from clipper_core.logs import get_logger, log_context
 from clipper_core.storage import keys
 from clipper_core.timeline import Interval
@@ -38,32 +31,6 @@ MAX_RETRY_DELAY_S = 60.0
 
 class Store(Protocol):
     def put_file(self, key: str, path: Path | str, content_type: str | None = None) -> None: ...
-
-
-def _ffmpeg_copy(ffmpeg: str, media: Path, out: Path, args: list[str]) -> str | None:
-    """Run ffmpeg without re-encoding. Returns an error message, or None on success."""
-    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(media)]
-    try:
-        result = subprocess.run(
-            [*cmd, *args, "-c", "copy", str(out)], capture_output=True, text=True, timeout=300
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"{type(exc).__name__}: {exc}"
-    if result.returncode != 0:
-        return result.stderr.strip()[-500:] or f"ffmpeg exited with {result.returncode}"
-    if not out.exists() or out.stat().st_size == 0:
-        return "ffmpeg wrote nothing"
-    return None
-
-
-def extract_audio(ffmpeg: str, media: Path, out: Path) -> str | None:
-    """First audio track -> ADTS .aac file."""
-    return _ffmpeg_copy(ffmpeg, media, out, ["-map", "0:a:0", "-f", "adts"])
-
-
-def remux_to_ts(ffmpeg: str, media: Path, out: Path) -> str | None:
-    """Fragmented MP4 (init + fragments) -> MPEG-TS, so storage only ever holds .ts video."""
-    return _ffmpeg_copy(ffmpeg, media, out, ["-map", "0:v:0", "-map", "0:a:0?", "-f", "mpegts"])
 
 
 class Finisher:
@@ -135,7 +102,7 @@ class Finisher:
     async def finish(self, state: ChunkState) -> int:
         """Upload + commit one closed chunk, then delete it from the spool. Returns the chunk id."""
         media_path, audio_path = self.spool.media_path(state), self.spool.audio_path(state)
-        error = await asyncio.to_thread(extract_audio, self.ffmpeg, media_path, audio_path)
+        error = await asyncio.to_thread(ffm.extract_audio, self.ffmpeg, media_path, audio_path)
         if error:
             # Permanent for this chunk (no audio track or broken data): keep the video, if any.
             log.warning("no audio for chunk, it won't be transcribed", error=error)
@@ -147,7 +114,7 @@ class Finisher:
             video_error = None
             if video_path != media_path:  # fMP4: remux to .ts first
                 video_error = await asyncio.to_thread(
-                    remux_to_ts, self.ffmpeg, media_path, video_path
+                    ffm.remux_to_ts, self.ffmpeg, media_path, video_path
                 )
             if video_error:
                 log.error("remux to .ts failed, chunk has no video", error=video_error)
@@ -161,62 +128,21 @@ class Finisher:
             await asyncio.to_thread(self.store.put_file, audio_key, audio_path, "audio/aac")
 
         window = Interval(state.start, state.end)
+        gaps = [state.gap_before] if state.gap_before is not None else []
         async with self.sessions.begin() as session:
-            chunk_id, created = (
-                await session.execute(
-                    text(
-                        """
-                        INSERT INTO chunks (stream_id, seq, start_utc, end_utc, video_key,
-                                            audio_key, video_bytes, audio_bytes, source)
-                        VALUES (:stream_id, :seq, :start, :end, :video_key, :audio_key,
-                                :video_bytes, :audio_bytes, :source)
-                        ON CONFLICT (stream_id, seq) DO UPDATE
-                           SET video_key = EXCLUDED.video_key, audio_key = EXCLUDED.audio_key,
-                               video_bytes = EXCLUDED.video_bytes,
-                               audio_bytes = EXCLUDED.audio_bytes
-                        RETURNING id, (xmax = 0) AS created
-                        """
-                    ),
-                    {
-                        "stream_id": state.stream_id,
-                        "seq": state.seq,
-                        "start": window.start,
-                        "end": window.end,
-                        "video_key": video_key,
-                        "audio_key": audio_key,
-                        "video_bytes": video_bytes,
-                        "audio_bytes": audio_bytes,
-                        "source": DataSource.LIVE.value,
-                    },
-                )
-            ).one()
-            gap = state.gap_before
-            if created and gap is not None:  # a retry after commit must not add it twice
-                await session.execute(
-                    text(
-                        "INSERT INTO stream_gaps (stream_id, start_utc, end_utc, reason) "
-                        "VALUES (:s, :start, :end, :reason)"
-                    ),
-                    {
-                        "s": state.stream_id,
-                        "start": gap.start,
-                        "end": gap.end,
-                        "reason": gap.reason,
-                    },
-                )
-            priority = None
-            if audio_key:
-                priority = await media.priority_for_range(
-                    session, stream_id=state.stream_id, window=window, default=Priority.LIVE
-                )
-                await jobs.enqueue(
-                    session,
-                    JobKind.TRANSCRIBE,
-                    payload=TranscribePayload(chunk_id=chunk_id).model_dump(),
-                    priority=priority,
-                    ref_id=chunk_id,
-                    dedupe_key=dedupe_key(JobKind.TRANSCRIBE, chunk_id),
-                )
+            chunk_id, _, priority = await chunks.commit_chunk(
+                session,
+                stream_id=state.stream_id,
+                seq=state.seq,
+                interval=window,
+                video_key=video_key,
+                audio_key=audio_key,
+                video_bytes=video_bytes,
+                audio_bytes=audio_bytes,
+                source=DataSource.LIVE,
+                gaps_before=gaps,
+                default_priority=Priority.LIVE,
+            )
         self.spool.remove(state)
         self.done += 1
         log.info(

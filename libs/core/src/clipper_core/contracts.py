@@ -65,6 +65,37 @@ class GapReason(StrEnum):
     RECONNECT = "reconnect"  # playlist/network trouble, or the stream was briefly offline
     NOT_RECORDED = "not_recorded"  # no recorder was running (joined late, restart, crash)
     UNKNOWN = "unknown"  # the media timeline jumped without a known cause
+    # VOD audio silenced by the platform (copyrighted music): no usable audio there. Video may
+    # still exist as a video-only chunk. Written by the backfill tool only.
+    MUTED = "muted"
+
+
+class T0Method(StrEnum):
+    """How a backfilled VOD's `vods.t0_utc` (UTC of VOD offset 0) was found."""
+
+    CHAT = "chat"  # median of chat replay `createdAt - contentOffsetSeconds`
+    HELIX = "helix"  # Helix Get Videos `created_at` (fallback)
+    AUDIO = "audio"  # audio correlation with a live recording of the same stream
+
+
+class VodMediaStatus(StrEnum):
+    """`vods.media_status`."""
+
+    PENDING = "pending"  # not (fully) fetched yet; `vods.media_done_s` says how far
+    DONE = "done"
+    RESTRICTED = "restricted"  # sub-only or otherwise not playable for us
+    GONE = "gone"  # the platform deleted the VOD (data we already have is kept)
+    OFF = "off"  # not requested (`--no-media`)
+
+
+class VodChatStatus(StrEnum):
+    """`vods.chat_status`."""
+
+    PENDING = "pending"  # not (fully) fetched yet; `vods.chat_done_s` says how far
+    DONE = "done"
+    SKIPPED = "skipped"  # the channel has live chat in the VOD's range (live data wins)
+    UNAVAILABLE = "unavailable"  # no chat replay for this VOD
+    OFF = "off"  # not requested (`--no-chat`)
 
 
 class SoundGroup(StrEnum):
@@ -152,6 +183,11 @@ class WordsFile(StoredModel):
 def recording_lease(channel_id: int) -> str:
     """Lease a recorder holds while it records a channel (only one recorder per channel)."""
     return f"record:channel:{channel_id}"
+
+
+def backfill_lease(video_id: str) -> str:
+    """Lease a backfill run holds while it works on one platform VOD (keeps runs apart)."""
+    return f"backfill:vod:{video_id}"
 
 
 def dedupe_key(kind: JobKind, ref_id: int) -> str:

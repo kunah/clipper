@@ -19,10 +19,9 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from clipper_chat_ingest.aggregator import SecondAggregator
-from clipper_chat_ingest.mapping import ChannelState, EventRow, MessageRow, map_message
-from clipper_chat_ingest.writer import ChatWriter
+from clipper_chat_ingest.mapping import ChannelState, map_message
 from clipper_core import heartbeat
+from clipper_core.chat import ChatWriter, EventRow, MessageRow, SecondAggregator
 from clipper_core.logs import get_logger
 from clipper_core.timeline import utc_now
 from clipper_twitch.emotes import fetch_channel_emotes, fetch_global_emotes
