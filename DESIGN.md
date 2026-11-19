@@ -284,12 +284,36 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-18 | Chunk boundaries: provisional last sentence, taken over by the next contiguous chunk | independent chunks cut a word every minute (captions, judge context); waiting for the next chunk adds 60 s latency |
 | 2026-11-18 | Sound classification (laughter, screaming, cheering, music...) in the transcriber from the start | strong signal for the detector; the audio is decoded anyway |
 | 2026-11-18 | Pick models by benchmark on real stream audio (`tools/asr-bench`), not by leaderboard | leaderboard sets are clean speech; stream audio has game sound, music, several speakers |
+| 2026-11-19 | Speech model: **Whisper large-v3-turbo** via faster-whisper (float16, beam 5, built-in VAD, word timestamps), "for now" | benchmark (§16): fast enough (49× realtime, ~1.2 GPU-h/day for 60 h audio), least GPU memory (2.3 GB), no made-up text on music/silence, most central transcript of the 5 candidates, word timing close to the others, light runtime (no torch/NeMo); Parakeet is 4× faster but transcribes song lyrics and needs NeMo; Qwen3-ASR too slow on the 4060 |
+| 2026-11-19 | Sound classifier: CED-base (`mispeech/ced-base`), **provisional, not yet confirmed by the user** | 666× realtime, 0.5 GB, works on 2 s windows (per-second resolution); AST needs 10 s windows. Neither could be judged for accuracy: the sample had little laughter/screaming |
 
 ## 16. Transcriber design (step 4)
 
-**Status:** design agreed 2026-11-18. The speech model and the sound classifier are not picked
-yet (`tools/asr-bench` is measuring candidates on real stream audio); everything else below is
-model-independent and can be built first, behind an engine interface with a fake engine in tests.
+**Status:** design agreed 2026-11-18. Models (2026-11-19, see decision log): speech **Whisper
+large-v3-turbo** (faster-whisper) decided; sound classifier **CED-base** provisional until the user
+confirms. Both sit behind the engine interfaces, so either can be swapped later.
+
+**Benchmark** (`tools/asr-bench`, 2026-11-19; 20 × 60 s chunks from 5 English channels, idle
+RTX 4060, each chunk transcribed on its own):
+
+| model | x realtime | s per 60 s chunk (median / p95) | GPU peak | load | non-speech (music, silence) |
+|---|---|---|---|---|---|
+| Parakeet TDT 0.6B v2 (NeMo) | 189× | 0.32 / 0.38 | 5.4 GB | 38 s | transcribes song lyrics |
+| **Whisper large-v3-turbo** (faster-whisper) | 49× | 1.41 / 2.63 | 2.3 GB | 4 s | clean (0 words) |
+| Whisper large-v3 (faster-whisper) | 18× | 3.59 / 7.66 | 4.2 GB | 6 s | clean (0 words) |
+| Qwen3-ASR 0.6B + aligner | 8× | 7.83 / 17.0 | 4.2 GB | 25 s | made-up words |
+| Qwen3-ASR 1.7B + aligner | 4× | 10.2 / 67.8 | 6.4 GB | 32 s | made-up words, runaway generation |
+
+On the 12 minutes with speech, average disagreement with the other models was 6.4–7.4 % of words
+(turbo the most central); word start times agreed within 60–90 ms (large-v3: 130–170 ms).
+Sound classifiers: CED-base 666× realtime, 0.5 GB, 2 s windows; AST 92×, 1.4 GB, needs 10 s windows.
+Implementation notes: pass 16 kHz float32 arrays to faster-whisper (its PyAV file reading breaks
+with current PyAV); `language="en"`, `beam_size=5`, `word_timestamps=True`, `vad_filter=True`,
+`condition_on_previous_text=False`; faster-whisper's Silero VAD
+(`faster_whisper.vad.get_speech_timestamps`) can also give the speech fraction per second. CED's
+Hub model code already applies the sigmoid (its "logits" are probabilities). CUDA base image that
+works with CTranslate2 4.9: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` (see
+`tools/asr-bench/Dockerfile`).
 
 **Role.** `services/transcriber`, one process per GPU (CUDA image). Claims `transcribe` jobs with
 `jobs.JobRunner` (highest priority first, then oldest). Writer of `chunk_transcripts`,
