@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import pytest
 
@@ -15,6 +16,7 @@ from clipper_twitch.vod import (
     VodRenditionMissing,
     VodRestricted,
     classify_failure,
+    parse_vod_path,
     usher_error_codes,
 )
 
@@ -175,3 +177,20 @@ def test_real_streamlink_session_has_requests_hooks():
     streamlink = pytest.importorskip("streamlink")
     session = streamlink.Streamlink()
     assert isinstance(session.http.hooks.get("response"), list)
+
+
+def test_vod_path_names_the_broadcast():
+    storyboard = (
+        "https://d2vi6trrdongqn.cloudfront.net/8173ac3b86530f54c2d4_xqc_321206426716_1794983267"
+        "/storyboards/2932113307-info.json"
+    )
+    path = parse_vod_path(storyboard)
+    assert (path.login, path.stream_id) == ("xqc", "321206426716")
+    assert path.epoch == datetime(2026, 11, 18, 6, 27, 47, tzinfo=UTC)  # GQL createdAt - 6 s
+    playlist = (
+        "https://x.cloudfront.net/abc123_some_user_12_42_1795000000/audio_only/index-dvr.m3u8"
+    )
+    assert (parse_vod_path(playlist).login, parse_vod_path(playlist).stream_id) == (
+        "some_user_12", "42"
+    )  # fmt: skip
+    assert parse_vod_path(USHER) is None and parse_vod_path(None) is None

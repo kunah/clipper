@@ -60,15 +60,27 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   with ms, `contentOffsetSeconds` whole seconds, no drift over 11.6 h; the chat anchor sits ~4 s
   after T0_pdt (Twitch's replay compensates latency). Facts in DESIGN §3. 421 tests.
 
+- Step 5c (commit "Backfill CLI: VOD media + time"): `tools/backfill` (`clipper-backfill vod
+  <id> [--dry-run] [--max-minutes N] [--video [Q]] ...`, `status`, `channel` with Helix
+  credentials). **T0 from the `audio_only` PDT** (`T0Method.PDT`; deviation from the §17 draft,
+  which assumed no PDT: the chat anchor sits ~4 s later because Twitch's replay compensates
+  latency, and using it would cancel the chat delay), chat anchor + GQL/Helix created_at as
+  cross-checks with flags. ~60 s chunks exactly T0 + Σ EXTINF, `muted` gaps, priority-0
+  transcribe jobs, lease + resume from `vods.media_done_s` (same transaction as each chunk),
+  refuses a rendition switch that would overlap committed media. Real run on xqc archive
+  2932113307 (5 min, throwaway DB/bucket, deleted): T0 by PDT (8343 points, 0 deviation), 7
+  chunks, muted gaps, hard kill + resume OK, ~16 MB downloaded. compose `backfill` service
+  (profile `tools`, not built). 503 tests.
+
 ## In progress
 
-- Step 5c: `tools/backfill` CLI, VOD media + time (T0 from the `audio_only` PDT, chat anchor and
-  Helix as cross-checks), resume, dry-run; a small real run on throwaway data.
+- Step 5d: chat replay → chat_messages / chat_metrics_1s (same aggregator as live), viewer clips
+  (needs Helix credentials for Get Clips; built + tested with fakes), `calibrate`.
 
 ## Next
 
-- Step 5c (media + time, CLI) and 5d (chat + clips). Then Phase 2 in roadmap order (detector
-  §18 first).
+- Phase 2 in roadmap order (detector §18 first): the parts that are safe to build before the
+  designs are agreed.
 
 ## How to deploy the transcriber (your call, in the morning)
 
@@ -84,6 +96,14 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 Image: 10.3 GB as Docker counts it, 3.0 GB unique (7.3 GB CUDA base shared with asr-bench).
 New disk use so far ≈ 6.8 GB as Docker counts it (3.0 GB image + 3.8 GB build cache, reclaimable
 with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, volumes) deleted.
+
+## Environment events
+
+- 2026-11-19 ~21:34 local: you stopped the Clipper compose stack to use the PC. It stays
+  stopped; **live recording and chat logging are off until you start it again**
+  (`docker compose up -d postgres objectstore controller chat-ingest recorder`). For tests this
+  session uses a separate throwaway Postgres container `clipper-orch-testpg` on 127.0.0.1:5434
+  (removed at the end of the run). No GPU work or image builds while you use the PC.
 
 ## Status of external gates
 

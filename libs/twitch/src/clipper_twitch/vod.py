@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
@@ -32,6 +34,28 @@ VIDEO_URL = "https://www.twitch.tv/videos/{video_id}"
 USHER_HOST = "usher.ttvnw.net"
 # usher's `error_code` for VODs a viewer may not watch (sub-only, ...): research 2026-11-19
 RESTRICTED_CODES = frozenset({"vod_manifest_restricted", "unauthorized_entitlements"})
+# VOD media and storyboard URLs: `.../<hash>_<login>_<stream id>_<epoch>/<rendition>/...`
+_VOD_PATH = re.compile(
+    r"/(?P<hash>[0-9a-f]+)_(?P<login>\w+?)_(?P<stream_id>\d+)_(?P<epoch>\d{9,11})/"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VodPath:
+    """What a VOD's CDN path tells: the broadcast's stream id, and an epoch (seen 2026-11-19:
+    GQL `createdAt` - 6 s; a T0 hint only)."""
+
+    login: str
+    stream_id: str
+    epoch: datetime
+
+
+def parse_vod_path(url: str | None) -> VodPath | None:
+    """Stream id + epoch from a VOD playlist, segment or storyboard URL (`seekPreviewsURL`)."""
+    m = _VOD_PATH.search(urlsplit(url or "").path)
+    if not m:
+        return None
+    return VodPath(m["login"], m["stream_id"], datetime.fromtimestamp(int(m["epoch"]), UTC))
 
 
 class VodError(RuntimeError):

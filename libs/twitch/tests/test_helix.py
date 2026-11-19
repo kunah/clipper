@@ -127,6 +127,11 @@ class PagedHelix:
             return httpx.Response(200, json={"access_token": "t", "expires_in": 5000000})
         params = request.url.params
         self.requests.append(params)
+        if request.url.path == "/helix/videos" and "id" in params:
+            found = [v for v in self.videos if v["id"] in params.get_list("id")]
+            if not found:
+                return httpx.Response(404, json={"error": "Not Found", "status": 404})
+            return httpx.Response(200, json={"data": found, "pagination": {}})
         if request.url.path == "/helix/videos":
             kind = params["type"]
             items = [v for v in self.videos if kind == "all" or v["type"] == kind]
@@ -252,3 +257,16 @@ async def test_a_repeated_cursor_raises_instead_of_looping():
     assert calls == 2
     with pytest.raises(HelixError, match="cursor repeated"):  # also when resuming from it
         await helix.get_videos("1", after="same")
+
+
+async def test_get_video_by_id(paged_helix, paged):
+    video = await paged_helix.get_video("2932113307")
+    assert video.stream_id == "321206426716" and video.user_login == "alpha"
+    assert paged.requests[-1].get_list("id") == ["2932113307"]
+    assert await paged_helix.get_video("1") is None  # Helix answers 404
+
+
+async def test_other_errors_carry_the_status(helix):
+    with pytest.raises(HelixError) as err:
+        await helix.get("nothing-here", [])
+    assert err.value.status == 404

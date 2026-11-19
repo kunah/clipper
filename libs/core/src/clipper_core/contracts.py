@@ -71,10 +71,15 @@ class GapReason(StrEnum):
 
 
 class T0Method(StrEnum):
-    """How a backfilled VOD's `vods.t0_utc` (UTC of VOD offset 0) was found."""
+    """How a backfilled VOD's `vods.t0_utc` (UTC of VOD offset 0) was found (DESIGN §17)."""
 
-    CHAT = "chat"  # median of chat replay `createdAt - contentOffsetSeconds`
-    HELIX = "helix"  # Helix Get Videos `created_at` (fallback)
+    # `audio_only` playlist EXT-X-PROGRAM-DATE-TIME minus the segment's VOD offset (the default:
+    # the same clock as live media times; the chat anchor sits ~4 s later)
+    PDT = "pdt"
+    CHAT = "chat"  # median of chat replay `createdAt - contentOffsetSeconds` (no PDT)
+    # the platform's `created_at` (Helix Get Videos; GQL `createdAt` without Helix credentials):
+    # fallback without PDT and chat, or when the chat anchor is > 30 s off it
+    HELIX = "helix"
     AUDIO = "audio"  # audio correlation with a live recording of the same stream
 
 

@@ -1,0 +1,285 @@
+"""`clipper-backfill`: past Twitch broadcasts, written in the live format (DESIGN §17).
+
+    uv run clipper-backfill vod 2932113307 --dry-run         # reads only, prints the plan
+    uv run clipper-backfill vod https://www.twitch.tv/videos/2932113307 --max-minutes 5
+    uv run clipper-backfill vod 2932113307 --video 720p60    # video + its audio (default: audio)
+    uv run clipper-backfill channel xqc --since 2026-11-01 --limit 3   # needs Helix credentials
+    uv run clipper-backfill status [VIDEO_ID ...]
+
+In Docker: `docker compose run --rm backfill vod <id> --dry-run` (profile `tools`).
+Idempotent: a re-run resumes where the last one committed (`vods.media_done_s`). Needs ffmpeg on
+PATH (`CLIPPER_BACKFILL_FFMPEG`). Step 5c = media + time; chat replay, viewer clips and
+`calibrate` are step 5d (not yet): `--no-chat`/`--no-clips` are accepted, but chat and clips
+are not fetched either way.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import re
+import shutil
+import sys
+from datetime import UTC, datetime
+
+import httpx
+
+from clipper_backfill import rows
+from clipper_backfill.backfill import Backfiller, UsageError, VodOptions, VodOutcome
+from clipper_backfill.download import DownloadError
+from clipper_backfill.pipeline import LeaseLost, MediaError, remove_stale_workdirs
+from clipper_backfill.settings import BackfillSettings
+from clipper_core.config import Settings
+from clipper_core.db import create_engine, session_factory
+from clipper_core.logs import get_logger, setup_logging
+from clipper_core.runtime import run, stop_event_on_signals
+from clipper_core.storage import ObjectStore
+from clipper_core.timeline import ensure_utc
+from clipper_twitch.gql import GqlBroken, GqlChatReplay, GqlError
+from clipper_twitch.helix import HelixClient, HelixError
+from clipper_twitch.settings import TwitchSettings
+from clipper_twitch.vod import StreamlinkVodSource, VodError
+
+log = get_logger("clipper_backfill")
+
+_HMS = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$")
+
+
+def parse_offset(value: str) -> float:
+    """Seconds: `90`, `1:30`, `1:02:03`, `1h2m3s`."""
+    value = value.strip()
+    try:
+        if ":" in value:
+            parts = [float(p) for p in value.split(":")]
+            if len(parts) > 3 or any(p < 0 for p in parts):
+                raise ValueError
+            seconds = 0.0
+            for p in parts:
+                seconds = seconds * 60 + p
+            return seconds
+        if re.fullmatch(r"\d+(?:\.\d+)?", value):
+            return float(value)
+        m = _HMS.match(value)
+        if not value or not m:
+            raise ValueError
+        h, mi, s = m.groups()
+        return int(h or 0) * 3600 + int(mi or 0) * 60 + float(s or 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an offset: {value!r}") from None
+
+
+def _positive(value: str) -> float:
+    number = float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return number
+
+
+def _day(value: str) -> datetime:
+    """`2026-11-01` (UTC midnight), or a datetime; one with a zone is converted to UTC."""
+    try:
+        day = datetime.fromisoformat(value)
+        return ensure_utc(day if day.tzinfo else day.replace(tzinfo=UTC))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a date (YYYY-MM-DD): {value!r}") from None
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    media = argparse.ArgumentParser(add_help=False)
+    media.add_argument("--dry-run", action="store_true", help="read only, print the plan")
+    media.add_argument("--no-media", action="store_true", help="rows only (media_status=off)")
+    media.add_argument(
+        "--video",
+        nargs="?",
+        const="best",
+        metavar="Q",
+        help="take video too, from rendition Q (default best = source); its audio is used",
+    )
+    media.add_argument(
+        "--max-minutes", type=_positive, metavar="N", help="fetch at most N minutes this run"
+    )
+    media.add_argument(
+        "--start-offset",
+        type=parse_offset,
+        default=0.0,
+        metavar="S",
+        help="start at VOD offset S (90, 1:30, 1h2m3s); the part before is a not_recorded gap",
+    )
+    media.add_argument("--no-transcribe", action="store_true", help="queue no transcribe jobs")
+    media.add_argument("--no-chat", action="store_true", help="chat_status=off (5d: not yet)")
+    media.add_argument("--no-clips", action="store_true", help="(5d: not yet)")
+
+    p = argparse.ArgumentParser(
+        prog="clipper-backfill",
+        description="Past Twitch broadcasts, written in the live format (DESIGN 17).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    v = sub.add_parser("vod", parents=[media], help="backfill archives by id or URL")
+    v.add_argument("refs", nargs="+", metavar="ID_OR_URL")
+    c = sub.add_parser(
+        "channel", parents=[media], help="the newest archives of a channel, oldest first (Helix)"
+    )
+    c.add_argument("login")
+    c.add_argument("--since", type=_day, metavar="YYYY-MM-DD", help="archives created since")
+    c.add_argument("--limit", type=int, default=5, metavar="N", help="newest N archives (5)")
+    s = sub.add_parser("status", help="backfilled VODs and their progress")
+    s.add_argument("video_ids", nargs="*")
+    return p.parse_args(argv)
+
+
+def options(args: argparse.Namespace) -> VodOptions:
+    return VodOptions(
+        dry_run=args.dry_run,
+        media=not args.no_media,
+        video=args.video,
+        max_minutes=args.max_minutes,
+        start_offset_s=args.start_offset,
+        transcribe=not args.no_transcribe,
+        chat=not args.no_chat,
+        clips=not args.no_clips,
+    )
+
+
+def error(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def print_outcome(outcome: VodOutcome) -> None:
+    """The report on stdout; a VOD that failed (or was refused, or is busy) on stderr."""
+    out = sys.stdout if outcome.ok else sys.stderr
+    print(f"[{outcome.status}] {outcome.video_id}: {outcome.message}", file=out)
+    for line in outcome.lines:
+        print(f"  {line}", file=out)
+
+
+def status_lines(found: list) -> list[str]:
+    if not found:
+        return ["no backfilled VODs"]
+    out = [
+        f"{'video':<12} {'channel':<16} {'stream':>6} {'t0 (method)':<36} {'media':<11} "
+        f"{'done':>15} {'chunks':>6} {'gaps':>4} {'muted':>7} {'transcribed':>11}"
+    ]
+    for r in found:
+        pct = 100 * r.media_done_s / r.duration_s if r.duration_s else 100.0
+        out.append(
+            f"{r.video_id:<12} {r.login:<16} {r.stream_id:>6} "
+            f"{r.t0_utc.isoformat(timespec='milliseconds') + ' (' + r.t0_method + ')':<36} "
+            f"{r.media_status:<11} {f'{r.media_done_s:.0f}/{r.duration_s:.0f}s {pct:.0f}%':>15} "
+            f"{r.chunks:>6} {r.gaps:>4} {f'{float(r.muted_s):.0f}s':>7} "
+            f"{f'{r.transcribed}/{r.transcribed + r.transcribe_pending}':>11}"
+        )
+        if r.flags:
+            out.append(f"{'':<12} flags: {r.flags}")
+    return out
+
+
+async def channel_refs(helix: HelixClient, args: argparse.Namespace) -> list[str]:
+    users = await helix.get_users(logins=[args.login])
+    if not users:
+        raise UsageError(f"unknown channel {args.login!r}")
+    page = await helix.get_videos(users[0].id, type="archive", limit=max(1, args.limit))
+    videos = [v for v in page.items if args.since is None or v.created_at >= args.since]
+    return [v.id for v in reversed(videos)]  # oldest first: VODs expire
+
+
+async def amain(argv: list[str]) -> int:
+    args = parse_args(argv)
+    settings = Settings(service_name="backfill")
+    setup_logging(settings, stream=sys.stderr)  # stdout carries only the report
+    engine = create_engine(settings)
+    sessions = session_factory(engine)
+    try:
+        if args.cmd == "status":
+            async with sessions() as s:
+                found = await rows.status_rows(s, args.video_ids)
+            print("\n".join(status_lines(found)))
+            return 0
+        return await _backfill(args, settings, sessions)
+    finally:
+        await engine.dispose()
+
+
+async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> int:
+    bs = BackfillSettings()
+    opts = options(args)
+    if opts.media and not opts.dry_run and shutil.which(bs.ffmpeg) is None:
+        log.error("ffmpeg not found, set CLIPPER_BACKFILL_FFMPEG", ffmpeg=bs.ffmpeg)
+        return 1
+    twitch = TwitchSettings()
+    helix = HelixClient.from_settings(twitch) if twitch.has_credentials else None
+    if args.cmd == "channel" and helix is None:
+        error("`channel` lists archives with Helix: set CLIPPER_TWITCH_CLIENT_ID/_SECRET")
+        error("(or pass video ids: clipper-backfill vod <id> ...)")
+        return 2
+    store = None
+    if not opts.dry_run:
+        stale = remove_stale_workdirs(bs.temp_dir, older_than_s=bs.lease_ttl_s)
+        if stale:
+            log.info("removed temp dirs of killed runs", dirs=[str(p) for p in stale])
+        store = ObjectStore(settings)
+        await asyncio.to_thread(store.ensure_bucket)
+    gql = GqlChatReplay.from_settings(twitch)
+    stop = stop_event_on_signals()
+    failed = 0
+    try:
+        async with httpx.AsyncClient(timeout=bs.http_timeout_s, follow_redirects=True) as http:
+            backfiller = Backfiller(
+                sessions=sessions,
+                store=store,
+                vod_source=StreamlinkVodSource(),
+                gql=gql,
+                http=http,
+                settings=bs,
+                owner=settings.worker_id,
+                helix=helix,
+                stop=stop,
+            )
+            refs = args.refs if args.cmd == "vod" else await channel_refs(helix, args)
+            if not refs:
+                print("no archives found")
+            for ref in refs:
+                if stop.is_set():
+                    break
+                try:
+                    outcome = await backfiller.vod(ref, opts)
+                except UsageError as exc:
+                    error(f"[error] {ref}: {exc}")
+                    failed += 1
+                    continue
+                except GqlBroken:
+                    log.exception("GQL changed or refuses us: stopping", ref=ref)
+                    return 1
+                except (
+                    DownloadError,
+                    MediaError,
+                    LeaseLost,
+                    VodError,
+                    GqlError,
+                    HelixError,
+                    httpx.HTTPError,
+                    ValueError,
+                ) as exc:
+                    log.exception("vod failed, a re-run resumes", ref=ref)
+                    outcome = VodOutcome(ref, "failed", f"{type(exc).__name__}: {exc}"[:300])
+                print_outcome(outcome)
+                failed += not outcome.ok
+    finally:
+        await gql.aclose()
+        if helix is not None:
+            await helix.aclose()
+    return 1 if failed else 0
+
+
+def main() -> None:
+    # VOD titles are full of emoji: a cp1252 console or pipe must not crash the report.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(errors="backslashreplace")
+    # Windows Ctrl+C cancels the run: the chunk in progress is not committed, the lease released.
+    with contextlib.suppress(KeyboardInterrupt):
+        sys.exit(run(lambda: amain(sys.argv[1:])))
+
+
+if __name__ == "__main__":
+    main()

@@ -15,9 +15,10 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   (`commit_chunk`: chunk + gaps + transcribe job), `chat` (chat rows, `SecondAggregator`,
   `ChatWriter`), `ffmpeg` (stream copies: audio out, fMP4 -> .ts).
 - `libs/twitch/` (`clipper_twitch`): IRC parser + anonymous chat client, Helix API client
-  (streams, users, `get_videos`, `get_clips`), third-party emote sets (7TV/BTTV/FFZ), live + VOD
-  HLS playlist parsers (`hls`), VOD playlist URLs via streamlink (`vod`, extra `[vod]`), VOD
-  chat replay over the undocumented GQL API (`gql`), `TwitchSettings` (`CLIPPER_TWITCH_*`).
+  (streams, users, `get_videos`, `get_video`, `get_clips`), third-party emote sets
+  (7TV/BTTV/FFZ), live + VOD HLS playlist parsers (`hls`), VOD playlist URLs via streamlink and
+  the CDN path's stream id (`vod`, extra `[vod]`), VOD chat replay + anonymous video metadata over
+  the undocumented GQL API (`gql`), `TwitchSettings` (`CLIPPER_TWITCH_*`).
   Protocols + fakes for VOD/chat access; `tests/test_live_smoke.py` hits the real Twitch only with
   `CLIPPER_TWITCH_LIVE_TESTS=1` (marker `twitch_live`).
 - `db/` (`clipper_db`): Alembic migrations + `clipper-migrate` one-off container.
@@ -30,7 +31,12 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `CLIPPER_TRANSCRIBER_*`). The real model libraries are optional extras (`whisper`, `ced`) that
   only the CUDA image installs; natively the service needs `CLIPPER_TRANSCRIBER_ENGINE=fake` and
   `CLIPPER_TRANSCRIBER_TAGGER=none` (or `fake`) set explicitly, and tests use the fakes.
-- `tools/`: CLIs like backfill (later).
+- `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
+  (DESIGN §17). 5c done: VOD media + time (T0 estimator, chunk planner, `audio_only` by default,
+  muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`);
+  chat replay, viewer clips and `calibrate` are 5d. Needs ffmpeg on PATH natively
+  (`CLIPPER_BACKFILL_*`); compose service `backfill` (profile `tools`, `docker compose run --rm`).
+  `tools/asr-bench/` is outside the workspace (own Dockerfile).
 - `compose.yaml`: Postgres 18 + pgvector, SeaweedFS (S3), migrate, and services.
 
 ## Commands
@@ -43,6 +49,8 @@ uv run pytest                               # all tests (integration ones need c
 uv run ruff check . --fix && uv run ruff format .
 uv run alembic -c db/alembic.ini revision -m "add x"   # then write the migration by hand
 uv run clipper-channels add xqc --mode audio_only      # list | mode <login> <mode> | enable | disable
+uv run clipper-backfill vod <id|url> --dry-run         # reads only; prints T0 + plan
+uv run clipper-backfill vod <id> --max-minutes 5      # resumable; status | channel <login> (Helix)
 docker compose up -d --build controller chat-ingest recorder
 docker compose up -d --build transcriber    # GPU (profile gpu, enabled by naming it); first start
                                             # downloads ~2 GB of weights into the `models` volume

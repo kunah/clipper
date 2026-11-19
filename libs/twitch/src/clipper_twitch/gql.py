@@ -1,7 +1,9 @@
 """Twitch VOD chat replay via the internal GQL API (anonymous, undocumented, can break).
 
 `ChatReplay` is what the backfill tool depends on; `GqlChatReplay` is the real one and
-`FakeChatReplay` replays fixture pages in tests.
+`FakeChatReplay` replays fixture pages in tests. Both also answer video metadata
+(`VideoInfoSource.video`: a plain query with the web client id, through the same pacing), which
+the backfill tool needs when there are no Helix credentials.
 
 One operation: the persisted query `VideoCommentsByOffsetOrCursor`. The first page is asked for
 by VOD offset (`contentOffsetSeconds`), the next ones by the cursor of the previous page's last
@@ -34,12 +36,17 @@ import httpx
 
 from clipper_core.logs import get_logger
 from clipper_core.timeline import ensure_utc
-from clipper_twitch.settings import TwitchSettings
+from clipper_twitch.settings import DEFAULT_GQL_WEB_CLIENT_ID, TwitchSettings
 
 log = get_logger(__name__)
 
 GQL_URL = "https://gql.twitch.tv/gql"
 OPERATION = "VideoCommentsByOffsetOrCursor"
+# Plain query (not persisted): answered anonymously for the web client id (seen 2026-11-19).
+VIDEO_QUERY = (
+    "query VideoInfo($id: ID!) { video(id: $id) { id title createdAt publishedAt lengthSeconds"
+    " status broadcastType owner { id login displayName } game { name } seekPreviewsURL } }"
+)
 # 200-responses with these error messages are Twitch-side hiccups: retry the same request
 TRANSIENT_MESSAGES = ("context deadline exceeded", "service error", "timeout", "unavailable")
 # ...and these mean the API changed or refuses this client: retrying won't help
@@ -143,6 +150,32 @@ class ChatReplay(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class VideoInfo:
+    """A video's metadata from GQL (anonymous; Helix needs app credentials)."""
+
+    id: str
+    title: str | None
+    created_at: datetime  # UTC (whole seconds); probably Helix's `created_at` (unverified)
+    published_at: datetime | None
+    length_s: int  # grows while the archived stream is still live
+    status: str | None  # RECORDED, or RECORDING while the stream is still live
+    broadcast_type: str | None  # ARCHIVE | HIGHLIGHT | UPLOAD
+    owner_id: str | None
+    owner_login: str | None
+    owner_display_name: str | None
+    game: str | None
+    # storyboard URL; its path names the broadcast (`vod.parse_vod_path`: stream id), also for
+    # VODs whose playlist we may not fetch (sub-only)
+    seek_previews_url: str | None
+
+
+class VideoInfoSource(Protocol):
+    async def video(self, video_id: str) -> VideoInfo | None:
+        """Metadata of one video; None when it doesn't exist (any more) or isn't visible."""
+        ...
+
+
 # --------------------------------------------------------------------------- parsing
 
 
@@ -206,21 +239,12 @@ def _error_for(retry: _Retry, reason: str) -> GqlError:
     return error(reason)
 
 
-def parse_page(body: Any, video_id: str, *, by_cursor: bool = False) -> CommentPage:
-    """A GQL response body (object, or a one-element array) -> CommentPage.
+def _checked_video(body: Any, video_id: str) -> dict[str, Any] | None:
+    """`data.video` of a GQL body (None: `video: null`), after the checks every query shares.
 
-    Raises GqlBroken (unexpected shape or an API-change error), ReplayUnavailable (no such video,
-    or no comments for a first page), GqlUnavailable (a Twitch-side hiccup: worth a retry).
-    `by_cursor`: the body answers a cursor request (missing comments are then a hiccup).
+    `video: null` *with* errors is not "no such video" but a failure we don't know: retried,
+    then GqlBroken (an unknown error must never read as "gone").
     """
-    try:
-        return _parse(body, video_id, by_cursor=by_cursor)
-    except _Retry as retry:
-        raise _error_for(retry, f"video {video_id}: {retry}") from None
-
-
-def _parse(body: Any, video_id: str, *, by_cursor: bool) -> CommentPage:
-    """parse_page, but failures worth a retry raise the internal `_Retry`."""
     if isinstance(body, list):
         if len(body) != 1:
             raise GqlBroken(f"expected one GQL result, got {len(body)}")
@@ -244,7 +268,65 @@ def _parse(body: Any, video_id: str, *, by_cursor: bool) -> CommentPage:
         raise GqlBroken(f"GQL response without data: {str(body)[:200]}")
     if "video" not in data:
         raise GqlBroken(f"GQL data without `video`: {str(data)[:200]}")
-    video = data["video"]
+    if errors:
+        if data["video"] is None:
+            raise _Retry(f"`video: null` with GQL errors: {errors}", kind="unknown")
+        log.warning("gql partial errors", video_id=video_id, errors=errors[:3])
+    return data["video"]
+
+
+def parse_video(body: Any, video_id: str) -> VideoInfo | None:
+    """A `VIDEO_QUERY` response body -> VideoInfo (None: `video: null`, no such video).
+
+    Raises GqlBroken (unexpected shape, API change) or GqlUnavailable (a Twitch-side hiccup).
+    """
+    try:
+        return _parse_video(body, video_id)
+    except _Retry as retry:
+        raise _error_for(retry, f"video {video_id}: {retry}") from None
+
+
+def _parse_video(body: Any, video_id: str) -> VideoInfo | None:
+    video = _checked_video(body, video_id)
+    if video is None:
+        return None
+    try:
+        owner = video.get("owner") or {}
+        published = video.get("publishedAt")
+        return VideoInfo(
+            id=str(video["id"]),
+            title=video.get("title") or None,
+            created_at=ensure_utc(datetime.fromisoformat(video["createdAt"])),
+            published_at=ensure_utc(datetime.fromisoformat(published)) if published else None,
+            length_s=int(video["lengthSeconds"]),
+            status=video.get("status") or None,
+            broadcast_type=video.get("broadcastType") or None,
+            owner_id=owner.get("id") or None,
+            owner_login=owner.get("login") or None,
+            owner_display_name=owner.get("displayName") or None,
+            game=(video.get("game") or {}).get("name") or None,
+            seek_previews_url=video.get("seekPreviewsURL") or None,
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise GqlBroken(f"unexpected video shape: {type(exc).__name__}: {exc}") from exc
+
+
+def parse_page(body: Any, video_id: str, *, by_cursor: bool = False) -> CommentPage:
+    """A GQL response body (object, or a one-element array) -> CommentPage.
+
+    Raises GqlBroken (unexpected shape or an API-change error), ReplayUnavailable (no such video,
+    or no comments for a first page), GqlUnavailable (a Twitch-side hiccup: worth a retry).
+    `by_cursor`: the body answers a cursor request (missing comments are then a hiccup).
+    """
+    try:
+        return _parse(body, video_id, by_cursor=by_cursor)
+    except _Retry as retry:
+        raise _error_for(retry, f"video {video_id}: {retry}") from None
+
+
+def _parse(body: Any, video_id: str, *, by_cursor: bool) -> CommentPage:
+    """parse_page, but failures worth a retry raise the internal `_Retry`."""
+    video = _checked_video(body, video_id)
     if video is None:
         raise ReplayUnavailable(f"video {video_id}: not found (deleted, expired or private)")
     comments = video.get("comments")
@@ -265,8 +347,6 @@ def _parse(body: Any, video_id: str, *, by_cursor: bool) -> CommentPage:
         raise GqlBroken(f"unexpected comment shape: {type(exc).__name__}: {exc}") from exc
     if page.has_next_page and not page.cursor:
         raise GqlBroken(f"video {video_id}: hasNextPage without a cursor")
-    if errors:
-        log.warning("gql partial errors", video_id=video_id, errors=errors[:3])
     return page
 
 
@@ -277,7 +357,8 @@ MIN_INTERVAL_S = 0.5  # <= 2 requests/s (DESIGN §17)
 
 
 class GqlChatReplay:
-    """Anonymous chat replay over gql.twitch.tv (see the module docstring for the rules).
+    """Anonymous chat replay (and video metadata) over gql.twitch.tv (see the module docstring
+    for the rules).
 
     Pacing and the one-request-at-a-time lock live in the instance: share one instance per
     process (several instances would each send up to 2 req/s).
@@ -288,6 +369,7 @@ class GqlChatReplay:
         *,
         client_id: str,
         comments_hash: str,
+        web_client_id: str = DEFAULT_GQL_WEB_CLIENT_ID,
         http: httpx.AsyncClient | None = None,
         url: str = GQL_URL,
         min_interval_s: float = MIN_INTERVAL_S,
@@ -303,6 +385,7 @@ class GqlChatReplay:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         self._client_id = client_id
+        self._web_client_id = web_client_id
         self._hash = comments_hash
         self._http = http or httpx.AsyncClient(timeout=timeout_s)
         self._owns_http = http is None
@@ -321,7 +404,10 @@ class GqlChatReplay:
     @classmethod
     def from_settings(cls, settings: TwitchSettings, **kwargs: Any) -> GqlChatReplay:
         return cls(
-            client_id=settings.gql_client_id, comments_hash=settings.gql_comments_hash, **kwargs
+            client_id=settings.gql_client_id,
+            comments_hash=settings.gql_comments_hash,
+            web_client_id=settings.gql_web_client_id,
+            **kwargs,
         )
 
     async def aclose(self) -> None:
@@ -348,12 +434,42 @@ class GqlChatReplay:
         self, video_id: str, *, offset_s: int | None = None, cursor: str | None = None
     ) -> CommentPage:
         payload = self.body(video_id, offset_s=offset_s, cursor=cursor)
+        return await self._request(
+            payload,
+            lambda body: _parse(body, video_id, by_cursor=cursor is not None),
+            client_id=self._client_id,
+            video_id=video_id,
+            offset_s=offset_s,
+        )
+
+    async def video(self, video_id: str) -> VideoInfo | None:
+        """Video metadata (plain query with the web client id; same pacing and retries)."""
+        if not str(video_id).isdigit():
+            raise ValueError(f"not a Twitch video id: {video_id!r}")
+        payload = {"query": VIDEO_QUERY, "variables": {"id": str(video_id)}}
+        return await self._request(
+            payload,
+            lambda body: _parse_video(body, video_id),
+            client_id=self._web_client_id,
+            video_id=video_id,
+            offset_s=None,
+        )
+
+    async def _request[T](
+        self,
+        payload: dict[str, Any],
+        parse: Callable[[Any], T],
+        *,
+        client_id: str,
+        video_id: str,
+        offset_s: int | None,
+    ) -> T:
         async with self._lock:  # one request at a time, retries included
             failures = 0
             while True:
                 try:
-                    body = await self._post(payload)
-                    return _parse(body, video_id, by_cursor=cursor is not None)
+                    body = await self._post(payload, client_id)
+                    return parse(body)
                 except _Retry as retry:
                     failures += 1
                     if failures >= self._max_attempts:
@@ -374,14 +490,14 @@ class GqlChatReplay:
                     if wait > 0:
                         await self._sleep(wait)
 
-    async def _post(self, payload: dict[str, Any]) -> Any:
+    async def _post(self, payload: dict[str, Any], client_id: str) -> Any:
         await self._pace()
         self.requests += 1
         try:
             resp = await self._http.post(
                 self._url,
                 json=payload,
-                headers={"Client-ID": self._client_id},
+                headers={"Client-ID": client_id},
                 timeout=self._timeout_s,
             )
         except httpx.RequestError as exc:  # timeouts, resets, DNS, broken content encoding
@@ -421,7 +537,8 @@ class FakeChatReplay:
     By offset: from the first comment at or after it (Twitch starts a few seconds earlier, so
     a caller that works here and dedupes by id works there). By cursor: after that comment.
     Build it from parsed comments, or `from_pages` from raw GQL page bodies (fixtures). `errors`
-    maps a call number (0-based) to an exception raised by that call instead.
+    maps a call number (0-based) to an exception raised by that call instead. `videos`: what
+    `video()` answers (unknown ids: None).
     """
 
     def __init__(
@@ -431,6 +548,7 @@ class FakeChatReplay:
         page_size: int = 50,
         creator_id: str | None = None,
         errors: Mapping[int, Exception] | None = None,
+        videos: Mapping[str, VideoInfo] | None = None,
     ) -> None:
         self._comments = {
             vid: sorted(cs, key=lambda c: (c.content_offset_s, c.created_at, c.id))
@@ -439,7 +557,13 @@ class FakeChatReplay:
         self._page_size = page_size
         self._creator_id = creator_id
         self._errors = dict(errors or {})
+        self._videos = dict(videos or {})
         self.calls: list[tuple[str, int | None, str | None]] = []
+        self.video_calls: list[str] = []
+
+    async def video(self, video_id: str) -> VideoInfo | None:
+        self.video_calls.append(video_id)
+        return self._videos.get(video_id)
 
     @classmethod
     def from_pages(cls, video_id: str, pages: Iterable[Any], **kwargs: Any) -> FakeChatReplay:

@@ -25,11 +25,14 @@ from clipper_twitch.gql import (
     GqlRateLimited,
     GqlUnavailable,
     ReplayUnavailable,
+    VideoInfo,
     parse_page,
+    parse_video,
 )
 from clipper_twitch.settings import (
     DEFAULT_GQL_CLIENT_ID,
     DEFAULT_GQL_COMMENTS_HASH,
+    DEFAULT_GQL_WEB_CLIENT_ID,
     TwitchSettings,
 )
 
@@ -442,3 +445,91 @@ async def test_fake_errors_and_unknown_videos():
         await fake.page("404", offset_s=0)
     with pytest.raises(GqlBroken):
         await fake.page(VIDEO, cursor="eyJ-real-cursor")
+
+
+# --------------------------------------------------------------------------- video metadata
+
+# The anonymous answer for the smoke VOD (2026-11-19), title shortened.
+VIDEO_BODY = {
+    "data": {
+        "video": {
+            "id": VIDEO,
+            "title": "LIVE GTA 6",
+            "createdAt": "2026-11-18T06:27:53Z",
+            "publishedAt": "2026-11-18T06:27:53Z",
+            "lengthSeconds": 83735,
+            "status": "RECORDED",
+            "broadcastType": "ARCHIVE",
+            "owner": {"id": "71092938", "login": "xqc", "displayName": "xQc"},
+            "game": {"name": "Just Chatting"},
+            "seekPreviewsURL": "https://d2vi6trrdongqn.cloudfront.net/8173ac3b86530f54c2d4_xqc"
+            "_321206426716_1794983267/storyboards/2932113307-info.json",
+        }
+    },
+    "extensions": {"durationMilliseconds": 45},
+}
+
+
+def test_parse_video():
+    info = parse_video(VIDEO_BODY, VIDEO)
+    assert info == VideoInfo(
+        id=VIDEO,
+        title="LIVE GTA 6",
+        created_at=datetime(2026, 11, 18, 6, 27, 53, tzinfo=UTC),
+        published_at=datetime(2026, 11, 18, 6, 27, 53, tzinfo=UTC),
+        length_s=83735,
+        status="RECORDED",
+        broadcast_type="ARCHIVE",
+        owner_id="71092938",
+        owner_login="xqc",
+        owner_display_name="xQc",
+        game="Just Chatting",
+        seek_previews_url=VIDEO_BODY["data"]["video"]["seekPreviewsURL"],
+    )
+    assert parse_video({"data": {"video": None}}, VIDEO) is None
+    bare = {"data": {"video": {"id": "1", "createdAt": "2026-11-18T06:27:53Z", "lengthSeconds": 5}}}
+    assert parse_video(bare, "1").owner_login is None and parse_video(bare, "1").game is None
+    with pytest.raises(GqlBroken):
+        parse_video({"data": {"video": {"id": "1"}}}, "1")
+    with pytest.raises(GqlBroken):
+        parse_video({"errors": [{"message": "PersistedQueryNotFound"}]}, "1")
+    with pytest.raises(GqlUnavailable):
+        parse_video({"errors": [{"message": "service error"}]}, "1")
+    # `video: null` WITH an unknown error is not "gone" (retried, then broken)
+    with pytest.raises(GqlBroken):
+        parse_video({"data": {"video": None}, "errors": [{"message": "forbidden"}]}, "1")
+
+
+async def test_null_video_with_errors_is_retried_not_read_as_gone():
+    odd = httpx.Response(200, json={"data": {"video": None}, "errors": [{"message": "odd"}]})
+    gql, t = FakeGql(odd, httpx.Response(200, json=VIDEO_BODY)), FakeTime()
+    assert (await client(gql, t).video(VIDEO)).id == VIDEO
+    gql, t = FakeGql(default=odd), FakeTime()
+    with pytest.raises(GqlBroken):
+        await client(gql, t, max_attempts=2).video(VIDEO)
+    gql, t = FakeGql(default=odd), FakeTime()
+    with pytest.raises(GqlBroken):  # the same for chat pages: not ReplayUnavailable
+        await client(gql, t, max_attempts=2).page(VIDEO, offset_s=0)
+
+
+async def test_video_uses_a_plain_query_with_the_web_client_and_shares_pacing():
+    gql, t = FakeGql(deadline(), httpx.Response(200, json=VIDEO_BODY)), FakeTime()
+    replay = client(gql, t)
+    info = await replay.video(VIDEO)
+    assert info.owner_login == "xqc" and replay.requests == 2  # the deadline was retried
+    body = gql.bodies()[0]
+    assert body["variables"] == {"id": VIDEO} and "video(id: $id)" in body["query"]
+    assert "seekPreviewsURL" in body["query"] and "extensions" not in body
+    assert gql.requests[0].headers["Client-ID"] == DEFAULT_GQL_WEB_CLIENT_ID
+    await replay.page(VIDEO, offset_s=0)  # same pacer: waits like any other request
+    assert gql.requests[-1].headers["Client-ID"] == DEFAULT_GQL_CLIENT_ID
+    assert t.sleeps.count(0.5) >= 1
+    with pytest.raises(ValueError):
+        await replay.video("../1")
+
+
+async def test_fake_video():
+    fake = FakeChatReplay({}, videos={VIDEO: parse_video(VIDEO_BODY, VIDEO)})
+    assert (await fake.video(VIDEO)).owner_id == "71092938"
+    assert await fake.video("404") is None
+    assert fake.video_calls == [VIDEO, "404"]

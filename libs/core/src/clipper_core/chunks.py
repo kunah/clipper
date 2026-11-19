@@ -52,7 +52,7 @@ class Gap:
 class CommittedChunk(NamedTuple):
     chunk_id: int
     created: bool  # False: the chunk existed already (nothing but its media keys changed)
-    priority: int | None  # of the transcription job; None when this commit had no audio
+    priority: int | None  # of the transcription job; None when this commit enqueued none
 
 
 async def commit_chunk(
@@ -68,11 +68,13 @@ async def commit_chunk(
     source: str,
     gaps_before: Sequence[GapLike] = (),
     default_priority: int,
+    transcribe: bool = True,
 ) -> CommittedChunk:
     """Upsert the chunk, insert `gaps_before` only when the chunk is new, and enqueue its
     `transcribe` job when this commit has audio, at `media.priority_for_range(default=
     default_priority)` (open media requests overlapping the chunk raise it). `source`: a
-    `contracts.DataSource`. Raises ValueError when `(stream_id, seq)` exists with another
+    `contracts.DataSource`. `transcribe=False` enqueues no job (backfill `--no-transcribe`;
+    `priority` is then None). Raises ValueError when `(stream_id, seq)` exists with another
     interval (the caller's numbering is off; its transaction should roll back)."""
     row = (
         await session.execute(
@@ -135,7 +137,7 @@ async def commit_chunk(
             ],
         )
     priority = None
-    if audio_key:
+    if audio_key and transcribe:
         priority = await media.priority_for_range(
             session, stream_id=stream_id, window=interval, default=default_priority
         )

@@ -3,7 +3,7 @@
 # Add new services to `members` as they are created.
 
 [tool.uv.workspace]
-members = ["libs/*", "db", "services/*"]
+members = ["libs/*", "db", "services/*", "tools/backfill"]  # not tools/*: asr-bench stays out
 
 [dependency-groups]
 dev = [
@@ -30,13 +30,14 @@ known-first-party = [
     "clipper_controller",
     "clipper_recorder",
     "clipper_transcriber",
+    "clipper_backfill",
 ]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-testpaths = ["libs", "db", "services"]
+testpaths = ["libs", "db", "services", "tools/backfill"]
 markers = [
     "integration: needs the Postgres from compose.yaml (skipped when unreachable)",
     "twitch_live: anonymous requests to the real Twitch (skipped unless CLIPPER_TWITCH_LIVE_TESTS=1)",

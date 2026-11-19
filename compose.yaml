@@ -3,6 +3,7 @@
 #
 #   docker compose up -d            # postgres + object storage + migrate + CPU services
 #   docker compose up -d transcriber   # the GPU worker (profile `gpu`; naming it enables it)
+#   docker compose run --rm backfill vod <id> --dry-run   # one-off tool (profile `tools`)
 #   docker compose logs -f migrate
 #
 # Data lives in named volumes inside Docker's disk image (on E: on this PC).
@@ -145,6 +146,28 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     stop_grace_period: 30s
+
+  # Backfill tool (one-off, profile `tools`): past VODs in the live format (DESIGN §17).
+  #   docker compose run --rm backfill vod 2932113307 --dry-run
+  #   docker compose run --rm backfill vod 2932113307 --max-minutes 30
+  #   docker compose run --rm backfill status
+  # Twitch access is anonymous; Helix credentials (for `channel`) are optional.
+  backfill:
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: tools/backfill/Dockerfile
+    image: clipper/backfill:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: backfill
+      CLIPPER_TWITCH_CLIENT_ID: ${CLIPPER_TWITCH_CLIENT_ID:-}
+      CLIPPER_TWITCH_CLIENT_SECRET: ${CLIPPER_TWITCH_CLIENT_SECRET:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    stop_grace_period: 30s   # SIGTERM finishes the chunk in progress
 
 volumes:
   pgdata:

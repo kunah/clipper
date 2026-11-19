@@ -8,7 +8,8 @@ judges, edits and publishes short vertical clips.
 > unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber). The transcriber
 > is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
 > `transcriber` compose service, profile `gpu`). Step 5 (backfill, design §17 proposed) in
-> progress: 5a (contract + shared code) and 5b (Twitch VOD access + smoke test) done.
+> progress: 5a (contract + shared code), 5b (Twitch VOD access + smoke test) and 5c (`clipper-backfill`:
+> VOD media + time, tested on a real VOD) done; 5d (chat replay, clips, calibrate) next.
 > Phase 2 designs §18–§22 are proposed, not yet agreed.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
@@ -75,8 +76,8 @@ may contain copyrighted music (Content ID).
 | TikTok posting API | Posts are private-only until the app passes an audit. |
 | Twitch chat | IRC (anonymous read-only) can join many channels. Tags give `tmi-sent-ts`, emotes, badges, USERNOTICE (subs/raids), CLEARMSG. |
 | Twitch status | Helix Get Streams: up to 100 channels per request, includes viewer count. |
-| Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. Seen 2026-11-19 (smoke test, xqc archive, anonymous GQL `VideoCommentsByOffsetOrCursor` with the old mobile client id, no integrity error): pages of 53–56 comments; a page asked by offset starts a few s **before** it (41867 → 41864); `contentOffsetSeconds` is a JSON int; `createdAt` is UTC (`Z`, ms, trailing zeros dropped), no whole-hour shift in 216 comments; `createdAt − offset` stays in one 1 s band from the start to 11.6 h in (no drift): Twitch's chat T0 ≈ the video's GQL `createdAt` + 0.7 s if offsets are truncated (+ 1.2 s if rounded; not decidable from replay alone). The smoke test compared against GQL `createdAt`; Helix `created_at` was not fetched (no credentials). A resub showed up as a plain comment carrying the system text; 7TV/BTTV emotes are plain text; badges with empty set id/version occur. |
-| Twitch VOD HLS | Seen 2026-11-19 (smoke test, xqc archive 2932113307, 23 h, via streamlink): renditions `audio_only`, 160p30–1080p60 (`best` = source 1080p60). Media playlists `index-dvr.m3u8`: `PLAYLIST-TYPE:EVENT` + `ENDLIST`, segments `N.ts`, **MPEG-TS** (audio_only: AAC 48 kHz stereo + timed ID3, ~274 KB per 10 s; 1080p60: H.264 + AAC + ID3, ~10.5 MB per 10 s), EXTINF mostly 10.000 with some longer (TARGETDURATION 13), segment timestamps don't start at 0. **Only `audio_only` has `EXT-X-PROGRAM-DATE-TIME`** (every segment, ms), and it is exactly T0 + ΣEXTINF (zero deviation over 23 h, so it shows no gaps) with T0 = the video's GQL `createdAt` − 3.2 s (Helix not checked: no credentials); video renditions have none. `EXT-X-TWITCH-TOTAL-SECS` = ΣEXTINF (83735.25; `lengthSeconds` 83735). `#ID3-EQUIV-TDTG` (no zone) ≈ the VOD's *end* (+ 6 s), not its start. Path `<hash>_<login>_<stream_id>_<epoch>`: epoch = GQL `createdAt` − 6 s. Muted parts: `N-muted.ts`; `audio_only` and 1080p60 were compared: same count (1280 of 8343) and same first names (18–20-muted), full index sets not compared; a muted segment still has its AAC track. No `-unmuted` names, no discontinuities. fMP4 VODs not seen yet (xqc is TS live too). Unknown VOD id: no playback token (streamlink returns no streams); GQL `video: null`. |
+| Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. Seen 2026-11-19 (smoke test, xqc archive, anonymous GQL `VideoCommentsByOffsetOrCursor` with the old mobile client id, no integrity error): pages of 53–56 comments; a page asked by offset starts a few s **before** it (41867 → 41864); `contentOffsetSeconds` is a JSON int; `createdAt` is UTC (`Z`, ms, trailing zeros dropped), no whole-hour shift in 216 comments; `createdAt − offset` stays in one 1 s band from the start to 11.6 h in (no drift): Twitch's chat T0 ≈ the video's GQL `createdAt` + 0.7 s if offsets are truncated (+ 1.2 s if rounded; not decidable from replay alone). 5c run: 338 comments from 6 pages spread over the 23 h: one band of 0.99 s, chat anchor (truncated) = `T0_pdt` + 3.916 s. The smoke test compared against GQL `createdAt`; Helix `created_at` was not fetched (no credentials). A resub showed up as a plain comment carrying the system text; 7TV/BTTV emotes are plain text; badges with empty set id/version occur. |
+| Twitch VOD HLS | Seen 2026-11-19 (smoke test, xqc archive 2932113307, 23 h, via streamlink): renditions `audio_only`, 160p30–1080p60 (`best` = source 1080p60). Media playlists `index-dvr.m3u8`: `PLAYLIST-TYPE:EVENT` + `ENDLIST`, segments `N.ts`, **MPEG-TS** (audio_only: AAC 48 kHz stereo + timed ID3, ~274 KB per 10 s; 1080p60: H.264 + AAC + ID3, ~10.5 MB per 10 s), EXTINF mostly 10.000 with some longer (TARGETDURATION 13), segment timestamps don't start at 0. **Only `audio_only` has `EXT-X-PROGRAM-DATE-TIME`** (every segment, ms), and it is exactly T0 + ΣEXTINF (zero deviation over 23 h, so it shows no gaps) with T0 = the video's GQL `createdAt` − 3.2 s (Helix not checked: no credentials); video renditions have none. `EXT-X-TWITCH-TOTAL-SECS` = ΣEXTINF (83735.25; `lengthSeconds` 83735). `#ID3-EQUIV-TDTG` (no zone) ≈ the VOD's *end* (+ 6 s), not its start. Path `<hash>_<login>_<stream_id>_<epoch>`: epoch = GQL `createdAt` − 6 s. Muted parts: `N-muted.ts`; `audio_only` and 1080p60 were compared: same count (1280 of 8343) and same first names (18–20-muted), full index sets not compared; a muted segment still has its AAC track. No `-unmuted` names, no discontinuities. fMP4 VODs not seen yet (xqc is TS live too). Unknown VOD id: no playback token (streamlink returns no streams); GQL `video: null`. 5c run (2026-11-19, same VOD, first 10 min): segments 18–35 muted, the stored `.aac` (ADTS copy of the TS audio) is ~1.27 MB per 60 s; anonymous GQL metadata (plain query, web client id) gives `createdAt`, `lengthSeconds`, `status`, `broadcastType`, owner, game and `seekPreviewsURL`, whose path `<hash>_<login>_<stream_id>_<epoch>` names the broadcast without a playlist (also for sub-only VODs, presumably). |
 | Twitch clips | Get Clips returns top viewer-made clips with `vod_offset` → free ground truth for testing the detector. |
 | Twitch HLS | 2 s segments, each with `EXT-X-PROGRAM-DATE-TIME`, in one of two containers depending on the channel (seen 2026-11-18): MPEG-TS (H.264 + AAC 48 kHz + timed ID3; e.g. xqc) or fragmented MP4 (`EXT-X-MAP` init section + `.mp4` fragments, all renditions incl. audio_only; e.g. ohnepixel), even when only H.264 is requested; the live playlist holds only ~30 s, so a recorder restarted within ~30 s loses nothing. Source 1080p60 ≈ 8.4 Mbps (~63 MB/min); audio ≈ 165 kbps (~1.2 MB/min). Ads are inserted for our recorder (a viewer): segments titled "Amazon…" or inside a `twitch-stitched-ad` DATERANGE; filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
 | MinIO | Community Docker images stopped Oct 2025 → we use **SeaweedFS** (`weed mini`). |
@@ -160,7 +161,7 @@ Services talk only through Postgres and object storage.
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Telegram bot | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
-| tools/backfill | past VODs + chat replay + top clips, written in the live format | chunks, chat_* | — |
+| tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c); chat_*, viewer_clips (5d) | slim + ffmpeg (profile `tools`) |
 
 Rules:
 - **One writer per table**, anyone reads.
@@ -253,7 +254,10 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    `streams` source CHECKs, `GapReason.MUTED`, shared `clipper_core.{chunks,chat,ffmpeg}` used by
    recorder and chat-ingest, controller guard for backfilled streams, VOD playlist parser); 5b
    done (Helix `get_videos`/`get_clips`, `clipper_twitch.vod` (streamlink) and `clipper_twitch.gql`
-   (chat replay) with fakes, `twitch_live` smoke test run once: VOD facts in §3).
+   (chat replay) with fakes, `twitch_live` smoke test run once: VOD facts in §3); 5c done
+   (`tools/backfill`, `clipper-backfill vod|channel|status`: T0 from the `audio_only` PDT (chat
+   anchor + created_at as cross-checks), chunk planner, downloads ≤ 4 at a time, one transaction per
+   chunk with `vods.media_done_s`, resume after a crash, `--dry-run`; real run on 10 min of a VOD).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
@@ -580,9 +584,10 @@ are requeued by the controller after 15 min (exists).
 
 ## 17. Backfill tool (step 5) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal; 5a (shared pieces + contract) and 5b (Twitch VOD access) are built. The 5b
-smoke test (2026-11-19, one xqc archive) answered the playlist and chat questions: see §3 (rows
-"Twitch VOD chat", "Twitch VOD HLS"); the time model below is updated with it.
+**Status:** proposal; 5a (shared pieces + contract), 5b (Twitch VOD access) and 5c (media + time:
+`tools/backfill`) are built. The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
+and chat questions: see §3 (rows "Twitch VOD chat", "Twitch VOD HLS"); the time model below is
+updated with it (5c: T0 from PDT, see "Time model").
 
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)
@@ -621,31 +626,38 @@ the column exists, else by their stream. Neither side writes the other's. Derive
 - Guard 2: a live `chat_metrics_1s` row of the channel in the VOD range → chat `skipped` (the PK
   can't hold both). Missing channels are inserted inactive (`off`), never changed.
 
-**Time model.** Offset `t` (ΣEXTINF) maps to `UTC = T0 + t`. The `audio_only` playlist does carry
-PDT (2026-11-19), but only as `T0_pdt + t` on every segment: one more T0 candidate (ms), not a
-clock that shows gaps. Video renditions have none. T0 is frozen on the first run in `vods.t0_utc`
-(= `streams.started_at`).
-- **Chat anchor (default):** `x = createdAt − contentOffsetSeconds` over ~15 sampled pages,
-  whole-hour outliers (timezone bug) fixed first. Offsets are whole seconds (verified), so T0 =
-  median(x) − 0.5 s if truncated (median if rounded); which one is still open (`calibrate`).
-  Error ±0.5 s + Twitch's anchor; chat↔media = its replay. No timezone shift and no drift seen.
-- **PDT (`audio_only`), measured, not yet decided:** `T0_pdt` = GQL `createdAt` − 3.2 s (Helix
-  `created_at` not checked), while the
-  chat anchor is `T0_pdt` + 3.9 s (truncated) or + 4.4 s (rounded), constant over 11.6 h. So the
-  two anchors disagree by ~4 s. If `calibrate` shows that `T0_pdt` matches the live PDT of the
-  same stream, T0 should come from PDT (the live clock) and the chat anchor becomes a cross-check
-  (and the fix for old-VOD offset bugs); that needs `T0Method.PDT` in the contract.
-- **Helix `created_at`** (1 s, a few s off) is fallback below 20 comments. > 30 s off the chat
-  anchor = old-VOD offset bug → Helix + flag `t0_conflict`. Path `<epoch>` (= GQL `createdAt` − 6 s on
-  the smoke VOD) and TDTG (the VOD's *end*, not its start): logged only.
+**Time model** (decided for 5c, 2026-11-19; replaces the chat-anchor default of this draft).
+Offset `t` (ΣEXTINF) maps to `UTC = T0 + t`. The `audio_only` playlist carries PDT on every segment
+(2026-11-19), but only as `T0_pdt + t`: an anchor (ms), not a clock that shows gaps. Video
+renditions have none. T0 is frozen on the first run in `vods.t0_utc` (= `streams.started_at`), with
+every candidate in `vods.t0_candidates` (pure estimator `clipper_backfill.t0`).
+- **PDT (`T0Method.PDT`, default):** T0 = the `audio_only` playlist's first PDT − its offset.
+  Live media times come from PDT, so VOD media follows the same clock. The chat anchor sits ~4 s
+  later (3.9 s on the smoke VOD, 3.916 s in the 5c run) because Twitch's replay compensates stream
+  latency; taking it for VOD media would silently cancel the chat delay (`video ≈ chat − delay`).
+  Video renditions (`--video`) use the same T0: their segments line up with `audio_only`'s (the
+  first run fetches the `audio_only` playlist for it).
+- **Chat anchor (`T0Method.CHAT`, no PDT):** `x = createdAt − contentOffsetSeconds` over the
+  comments of `t0_chat_pages` (6) pages spread over the VOD, whole-hour outliers (timezone bug)
+  shifted back first, others > 30 s from the median dropped; offsets are whole seconds (verified),
+  assumed truncated: T0 = median(x) − 0.5 s (rounded would be the median; still open:
+  `calibrate`). Needs ≥ 20 comments. Always sampled on a first run as a cross-check.
+- **created_at (`T0Method.HELIX`):** Helix `created_at`, or GQL `createdAt` without Helix
+  credentials (`t0_candidates.gql_created_at`); fallback without PDT and chat, and when the chat
+  anchor is > 30 s off it (old-VOD offset bug, flag `t0_conflict`). Path `<epoch>` (= GQL
+  `createdAt` − 6 s): candidate `path_epoch`, logged only. TDTG (the VOD's *end*): ignored.
+- **Flags** (`vods.flags`): `t0_chat_pdt` when |chat − pdt − 3.9 s| > 3 s; `t0_conflict` when
+  created_at is > 30 s from T0; `pdt_steps` when the PDT jumps ≥ 1 s against `T0 + offset`
+  (recorded, not applied: UTC stays `T0 + offset`); `chat_hour_fixed`, `chat_outliers`.
 - **Audio** (`calibrate`, ±20 ms, needs a live recording) measures both methods' bias once.
 - **Chat time:** `sent_at = createdAt` (ms, the `tmi-sent-ts` clock). Replay shows comments late by
   latency + reaction, like live, so `video_time ≈ chat_time − channel_delay` keeps the live delay.
   Missing or > 2 s off → `T0 + offset + 0.5 s`. ~1 s suffices (per-second features).
-- **Gaps:** VODs have no ads. Each `EXT-X-DISCONTINUITY` starts a chunk and a *part*. T0 is
-  re-checked per part; a step ≥ 1 s becomes a gap (`unknown`) that shifts the rest.
-  TOTAL-SECS − ΣEXTINF > 1 s with no step → flag `timeline_uncertain` (equal on the smoke VOD,
-  which had no discontinuity; PDT can't reveal gaps, it is T0 + ΣEXTINF).
+- **Gaps:** VODs have no ads. Each `EXT-X-DISCONTINUITY` starts a chunk (5c). Planned, not built:
+  a *part* per discontinuity with T0 re-checked per part, a step ≥ 1 s becoming an `unknown` gap
+  that shifts the rest (5c only flags PDT steps and counts `discontinuities`).
+  TOTAL-SECS − ΣEXTINF > 1 s → flag `timeline_uncertain_s` (equal on the smoke VOD, which had no
+  discontinuity; PDT can't reveal gaps, it is T0 + ΣEXTINF).
 - **Muted** (`N-muted.ts`, verified; `audio_only` and 1080p60 had the same count and first
   names) → gap reason **`muted`**,
   not a chunk flag. Silence isn't
@@ -735,6 +747,74 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
 3. **5c Media + time:** the CLI with `--dry-run`, a pure T0 estimator and chunk planner,
    `commit_chunk`. *Done when:* a mock VOD gives contiguous chunks, `muted` gaps and priority-0
    jobs; a crash plus a re-run gives identical rows; and a dry run writes nothing.
+   **Done 2026-11-19** (not deployed: the `backfill` compose service is defined, not built).
+   `tools/backfill` (`clipper-backfill vod <id|url>... [--dry-run] [--no-media] [--video [Q]]
+   [--max-minutes N] [--start-offset S] [--no-transcribe] [--no-chat] [--no-clips]`, `channel
+   <login> [--since D] [--limit N]` (Helix credentials, else exit 2), `status [ids]`):
+   - **T0** from PDT (see "Time model": a deviation from this draft, which had the chat anchor
+     first): `T0Method.PDT` added to the contract.
+   - **Planner** (`planner.plan_units`, pure): units = one chunk (≤ `chunk_seconds`, closed before
+     a discontinuity, another init section, a muted or lost segment, the end or `--max-minutes`)
+     with the gaps before it, or trailing gaps alone (a muted end); `UTC = T0 + offset` on the
+     µs grid (neighbours share boundaries exactly). Muted runs → `muted` gap (with `--video`: a
+     video-only chunk + its own `muted` gap); a segment still 404 after 2 tries → `not_recorded`
+     gap (re-planned on the fly, `flags.lost_segments`); `--start-offset` → `not_recorded` gap
+     before it; resume = plan again from `media_done_s` with the next seq.
+   - **Pipeline:** `Downloader` (≤ 4 in flight, backoff 1 s doubling to 30 s, 6 tries, Retry-After;
+     404/410 = lost; 403 and the rest stop the run, a re-run resolves again); concatenated TS (or
+     init + fMP4 fragments, remuxed when video is kept) → `ffmpeg.extract_audio` → upload →
+     one transaction: lease check + `commit_chunk(source=backfill, gaps_before, default_priority=
+     BACKFILL, transcribe=...)` + `vods.media_done_s`/`media_status`/`flags`. Temp dir per run.
+     An audio-only chunk whose audio can't be extracted stops the run (`MediaError`) instead of
+     committing an empty chunk. `media_done_s` must be a segment boundary of the playlist used
+     (`planner.check_aligned`): another rendition cut elsewhere (e.g. `--video` after an audio run)
+     is refused (`refused`, nothing written) instead of producing overlapping chunks. Nothing
+     left to plan and `media_done_s` at the end → `done` (a VOD restricted on its first run and
+     playable later becomes `done`; `done` is never turned into `restricted`). `vods.flags` are
+     only ever merged in SQL (`flags || ...`; `lost_segments` is incremented with the unit that
+     commits the gap), never overwritten from a copy read at the start of the run.
+     `chunk_seconds` ≤ 120 (a chunk's segments are held in memory). Temp dir per run
+     (`clipper-backfill-*`, cleanup errors ignored); lease renewals touch it, and a run removes
+     such dirs older than the lease TTL (left by killed runs). Logs go to stderr, the report and
+     plan to stdout (errors and failed VODs to stderr).
+   - **Rows:** stream (`backfill`, `ended`, `started_at = T0`, `ended_at = T0 + ΣEXTINF`) + vods
+     created together under the lease; channel inserted inactive (`off`, `active = false`) when
+     missing; stream id from Helix > the playlist's CDN path > GQL `seekPreviewsURL`'s path
+     (`video:<id>` + flag `stream_id_unknown` if none); a broadcast recorded live → skipped, nothing
+     written; highlights/uploads and archives still recording → skipped; sub-only → `restricted`
+     + `not_recorded` gap over the rest (`media_done_s = duration`); `VodGone` with a row → `gone`.
+   - **Lease** `backfill:vod:{id}`, owner `CLIPPER_WORKER_ID` (host-pid), TTL 120 s renewed every
+     40 s in the background and checked in every commit; a holder that isn't us → `busy` before
+     any download. A hard-killed run leaves its lease and temp dir: the next run waits for the TTL.
+   - **Contract/libs (additive):** `commit_chunk(transcribe=True)`; `clipper_twitch`: GQL video
+     metadata (`GqlChatReplay.video()`, plain query with the web client id
+     `CLIPPER_TWITCH_GQL_WEB_CLIENT_ID`, same pacer; `VideoInfo`; fake), `vod.parse_vod_path()`,
+     `HelixClient.get_video()`, `HelixError.status`. `--no-transcribe` chunks get their jobs on the
+     next run without the flag. `--yes`/`--max-gb`/`--video-range` not built yet.
+   - **Tests:** 75 in `tools/backfill` (lavfi TS segments on a mock CDN + fakes: contiguous chunks,
+     `muted` gap, priority-0 jobs, crash after a commit and before one + re-run = rows identical to
+     a clean run, dry run writes nothing, restricted (also after `done`, and playable later),
+     recorded-live skip, lease busy/expired/lost between commits, stop between units, `MediaError`,
+     a rendition cut elsewhere refused, flags merged, lost segment, `--video` with a video-only
+     muted chunk, `--max-minutes`/`--start-offset`/`--no-transcribe`/`--no-media`, gone; T0 cases
+     incl. the real smoke fixtures; planner edges; metadata/broadcast from GQL + Helix; stale temp
+     dirs). GQL `video: null` *with* errors is retried and then `GqlBroken`, never "gone".
+   - **Coverage of pending VODs (note, no code yet):** a backfilled stream is `ended` from the
+     start, so `transcripts.coverage()` reports the part not fetched yet, `[T0 + media_done_s,
+     T0 + duration)`, as `gap` (after the last chunk of an ended stream), not as `unrecorded`.
+     Consumers of backfilled streams (detector, judge, evaluation) must check
+     `vods.media_status`/`media_done_s` (or `streams.source = 'backfill'` + the vods row) before
+     reading "gap" as "nothing there". Proposal for later: `coverage()` reads `vods.media_done_s`
+     for backfilled streams and reports the rest as `unrecorded` while `media_status = 'pending'`.
+   - **Real run** (2026-11-19, xqc archive 2932113307, throwaway DB + bucket, dropped afterwards):
+     T0 = `T0_pdt` 06:27:49.784 (8343 PDT points, max deviation 0), chat anchor + 3.916 s (338
+     comments, spread 0.99 s), GQL `createdAt` + 3.216 s, path epoch − 2.784 s; run 1
+     (`--max-minutes 5`, ~15 s): chunks [0, 180) + `muted` [180, 300); run 2 hard-killed after 2
+     chunks ([360, 480), `muted` [300, 360)); run 3 right away → `busy`; after the 30 s test TTL it
+     resumed with seq 5 ([480, 600)); `--dry-run` then planned seq 7..11 from 600 s. 7 chunks, all
+     contiguous with the gaps, `.aac` 1.25–1.29 MB per 60 s (8.9 MB), 7 jobs at priority 0. ~16 MB
+     downloaded in all (each run: ~0.6 MB playlist + streamlink's resolution). Adjacent muted gaps
+     split at run boundaries stay two rows.
 4. **5d Chat + clips (+ calibrate):** mapping, watermark resume, the live-chat skip, `clips`,
    DESIGN.md updates. *Done when:* fixture pages give the live aggregator's metrics, a resume adds
    no duplicates, and clips map to `T0 + vod_offset`.
@@ -746,7 +826,7 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
 | 2026-11-19 | One writer per table **and source**: everything belonging to a backfilled stream (`streams.source = 'backfill'`: the stream row, its chunks, gaps, chat messages, chat metrics) is written only by the backfill tool, and live services never touch it; derived tables (transcripts, audio metrics) keep one writer for all sources | backfill must write the live tables in the live format; two writers on the same rows would race |
 | 2026-11-19 | The controller never updates a stream with `source = 'backfill'` (upsert `WHERE streams.source = 'live'`) | a stream id that shows up live again would flip it to live, and the recorder would write into it |
 | 2026-11-19 | Backfill skips VODs of streams recorded live (clips only), and writes chat only where the channel has no live chat | live data is better (ms chat times, events, PDT); the `chat_metrics_1s` PK `(channel_id, ts)` can't hold both |
-| 2026-11-19 | VOD time: `UTC = T0 + offset`. T0 from the chat anchor (median of `createdAt − contentOffsetSeconds`, ±0.5 s); Helix `created_at` as fallback and cross-check (> 30 s apart → Helix + flag); frozen per VOD in `vods.t0_utc` | VOD video playlists have no PDT, and the `audio_only` PDT is only `T0_pdt + offset` (smoke test 2026-11-19); the chat anchor reproduces Twitch's own replay sync. Open: the chat anchor is ~4 s later than `T0_pdt`; `calibrate` against a live recording decides which one media time follows (PDT would need `T0Method.PDT`) |
+| 2026-11-19 | VOD time: `UTC = T0 + offset`, T0 frozen per VOD in `vods.t0_utc`. T0 = the `audio_only` playlist's PDT (`T0Method.PDT`; video renditions use the same T0); without PDT the chat anchor (median of `createdAt − contentOffsetSeconds` − 0.5 s), then Helix/GQL `created_at` (also when the chat anchor is > 30 s off it); all candidates in `vods.t0_candidates`, disagreements (chat − pdt not ≈ 3.9 s ± 3 s, created_at > 30 s off, PDT steps) in `vods.flags` | live media times come from PDT; the chat anchor sits ~4 s after `T0_pdt` (Twitch's replay compensates latency: 3.9 s smoke test, 3.916 s 5c run), so using it for media would silently cancel the chat delay (`video ≈ chat − delay`). `calibrate` (5d) still checks `T0_pdt` against a live recording |
 | 2026-11-19 | VOD chat `sent_at = createdAt` (fallback `T0 + offset + 0.5 s`) | the same server clock as `tmi-sent-ts`, at ms resolution; `video ≈ chat − delay` holds with the delay learned live |
 | 2026-11-19 | Muted VOD segments become a gap with reason `muted`; their audio is not stored or transcribed | silence would read as a quiet moment; `coverage()` and the detector already understand gaps |
 | 2026-11-19 | Backfill takes audio_only by default; video only on request (full, or ranges added to existing chunks) | ~1.2 MB/min vs ~63 MB/min; detector development needs audio + chat |
@@ -846,7 +926,8 @@ for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-inge
 **`contracts.py`**
 - `GapReason.MUTED = "muted"`: VOD audio silenced by the platform (copyrighted music), so there is
   no usable audio. Video may exist as a video-only chunk.
-- `class T0Method(StrEnum)`: `CHAT = "chat"`, `HELIX = "helix"`, `AUDIO = "audio"`.
+- `class T0Method(StrEnum)`: `PDT = "pdt"` (added in 5c, the default), `CHAT = "chat"`,
+  `HELIX = "helix"`, `AUDIO = "audio"`.
 - `class VodMediaStatus(StrEnum)`: `pending`, `done`, `restricted`, `gone`, `off`.
   `class VodChatStatus(StrEnum)`: `pending`, `done`, `skipped`, `unavailable`, `off`.
 - `def backfill_lease(video_id: str) -> str: return f"backfill:vod:{video_id}"`.
@@ -855,7 +936,8 @@ for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-inge
 
 **New `libs/core` modules (moved code, no behaviour change)**
 - `clipper_core.chunks.commit_chunk(session, *, stream_id, seq, interval, video_key, audio_key,
-  video_bytes, audio_bytes, source, gaps_before, default_priority) -> tuple[int, bool]`. It does the
+  video_bytes, audio_bytes, source, gaps_before, default_priority, transcribe=True) ->
+  CommittedChunk` (`transcribe=False`: no job, for `--no-transcribe`; added in 5c). It does the
   chunk upsert, inserts the gap rows only when the chunk is new, and enqueues the transcribe job
   with `priority_for_range` when the chunk has audio. It comes from `recorder.finisher.finish`,
   generalised from one gap to a list. The caller owns the transaction, so backfill can add its
@@ -869,11 +951,12 @@ for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-inge
 - `clipper_twitch`:
   - `hls.parse_vod_playlist()`: `VodSegment(index, uri, offset_s, duration, muted, discontinuity,
     init_uri)` + `total_secs`.
-  - `helix.get_videos()`, `get_clips()`, `parse_duration()`.
+  - `helix.get_videos()`, `get_video()` (5c), `get_clips()`, `parse_duration()`.
   - `gql` (the `ChatReplay` Protocol, `GqlChatReplay`, `CommentPage`, `GqlBroken`) and
     `vod.VodSource` (streamlink).
   - `emotes.message_emotes()`.
-  - `TwitchSettings` gets `gql_client_id` and `gql_comments_hash`.
+  - `TwitchSettings` gets `gql_client_id` and `gql_comments_hash` (+ `gql_web_client_id` in 5c
+    for the anonymous video metadata query `GqlChatReplay.video()`); `vod.parse_vod_path()` (5c).
 - Controller `poller._upsert_stream`: `... DO UPDATE ... WHERE streams.source = 'live'`, with
   `.first()` instead of `.one()`, and a log line when the row belongs to a backfilled stream.
 - Root `pyproject.toml`: add `tools/backfill` to `members` (not `tools/*`: asr-bench stays outside),

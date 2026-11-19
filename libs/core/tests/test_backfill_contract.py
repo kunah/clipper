@@ -33,7 +33,7 @@ def test_vod_status_enums_match_the_check_constraints():
 
 def test_backfill_contract_values():
     assert GapReason.MUTED == "muted"
-    assert {m.value for m in T0Method} == {"chat", "helix", "audio"}
+    assert {m.value for m in T0Method} == {"pdt", "chat", "helix", "audio"}
     assert backfill_lease("2346188660") == "backfill:vod:2346188660"
     assert backfill_lease("1") != recording_lease(1)
     assert ViewerClip.__table__.primary_key.columns.keys() == ["platform", "clip_id"]

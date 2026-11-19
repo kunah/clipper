@@ -40,7 +40,9 @@ async def rows(sessions, sql):
         return (await s.execute(text(sql))).all()
 
 
-async def commit(sessions, stream_id, *, seq=2, gaps=(), audio=True, default=Priority.BACKFILL):
+async def commit(
+    sessions, stream_id, *, seq=2, gaps=(), audio=True, default=Priority.BACKFILL, transcribe=True
+):
     async with sessions.begin() as s:
         return await commit_chunk(
             s,
@@ -54,6 +56,7 @@ async def commit(sessions, stream_id, *, seq=2, gaps=(), audio=True, default=Pri
             source=DataSource.BACKFILL,
             gaps_before=gaps,
             default_priority=default,
+            transcribe=transcribe,
         )
 
 
@@ -99,6 +102,15 @@ async def test_chunk_without_audio_gets_no_job(sessions):
     stream_id = await make_stream(sessions)
     result = await commit(sessions, stream_id, audio=False)
     assert result.created and result.priority is None
+    assert await rows(sessions, "SELECT * FROM jobs") == []
+
+
+async def test_no_job_when_transcription_is_off(sessions):
+    stream_id = await make_stream(sessions)
+    result = await commit(sessions, stream_id, transcribe=False)
+    assert result.created and result.priority is None
+    (chunk,) = await rows(sessions, "SELECT audio_key FROM chunks")
+    assert chunk.audio_key  # the audio is stored, only the job is left out
     assert await rows(sessions, "SELECT * FROM jobs") == []
 
 

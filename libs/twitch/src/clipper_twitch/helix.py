@@ -30,7 +30,9 @@ _DURATION = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
 
 
 class HelixError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status  # HTTP status of the failed request, if there was one
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +259,9 @@ class HelixClient:
                 )
                 await asyncio.sleep(min(wait, 30.0))
                 continue
-            raise HelixError(f"GET {path} failed: {resp.status_code} {resp.text[:200]}")
+            raise HelixError(
+                f"GET {path} failed: {resp.status_code} {resp.text[:200]}", resp.status_code
+            )
         raise HelixError(f"GET {path} failed after retries")
 
     async def get_users(
@@ -315,6 +319,17 @@ class HelixClient:
         """
         params = [("user_id", user_id), ("type", type), ("sort", "time")]
         return await self._pages("videos", params, _video, first=first, after=after, limit=limit)
+
+    async def get_video(self, video_id: str) -> HelixVideo | None:
+        """One video by id (any type); None when Helix doesn't know it (deleted, expired)."""
+        try:
+            body = await self.get("videos", [("id", video_id)])
+        except HelixError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        data = body.get("data") or []
+        return _video(data[0]) if data else None
 
     async def get_clips(
         self,
