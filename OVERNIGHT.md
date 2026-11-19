@@ -44,7 +44,7 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 
 ## In progress
 
-- Add proposed §19–§22 (judge, renderer, review, publisher; drafted and reconciled) to DESIGN.md.
+- Step 5a: backfill shared pieces + contract (DESIGN §17 build plan).
 
 ## Next
 
@@ -76,7 +76,7 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 ## Open questions for the user
 
 Designs written overnight and marked "proposed, not yet agreed" in DESIGN.md: §17 backfill,
-§18 detector (and §19–§22 once added). Their decision rows sit under each section, not in the
+§18 detector, §19 judge, §20 renderer, §21 review, §22 publisher. Their decision rows sit under each section, not in the
 decision log, until you agree.
 
 - **Transcriber:** confirm CED-base. On CPU it is the slowest stage (24× realtime on 2 threads;

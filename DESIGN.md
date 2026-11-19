@@ -4,8 +4,11 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-18):** Phase 1 / steps 1–3 done (workspace, shared core, schema, job queue,
-> unified logging, Twitch lib, controller, chat-ingest, recorder). Next: step 4 (transcriber).
+> **Status (2026-11-19):** Phase 1 / steps 1–4 done (workspace, shared core, schema, job queue,
+> unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber). The transcriber
+> is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
+> `transcriber` compose service, profile `gpu`). Next: step 5 (backfill, design §17 proposed).
+> Phase 2 designs §18–§22 are proposed, not yet agreed.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -232,12 +235,15 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    crash), ffmpeg copies audio to `.aac`, upload, then chunk + gap + transcription job (priority
    from `priority_for_range`) in one transaction. Channels claimed via leases. Verified live on
    Twitch (full + audio_only, graceful stop, hard kill + recovery, restart without gaps).
-4. ⬜ transcriber: GPU worker for `transcribe` jobs. Words (UTC) → S3 JSON per chunk,
+4. ✅ transcriber: GPU worker for `transcribe` jobs. Words (UTC) → S3 JSON per chunk,
    sentences → `transcript_segments`, per-second sound classes + loudness → new
    `audio_metrics_1s` table, all in one transaction + NOTIFY. Chunk boundaries: the last
    sentence of a chunk that runs into the cut is *provisional* and is re-transcribed and taken
    over by the next contiguous chunk (no sentence is ever cut, no added latency).
-   Model picked from `tools/asr-bench` (real stream audio, measured on the 4060).
+   Models from `tools/asr-bench`: Whisper large-v3-turbo (faster-whisper), CED-base
+   (provisional). Silero VAD gate (onnxruntime), CUDA image, compose service (profile `gpu`).
+   `clipper_core.transcripts.words()/coverage()` for consumers. E2e on 20 real chunks: 13×
+   realtime (CED on CPU is the slowest stage), 2.35 GB GPU. 313 tests.
    Full design: [§16](#16-transcriber-design-step-4).
 5. ⬜ backfill tool: past VODs + chat replay + top clips → detector development offline.
    Design: [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed
@@ -245,9 +251,12 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
-analytics loop. Then Kick/YouTube. Detector design:
-[§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not yet
-agreed).
+analytics loop. Then Kick/YouTube. Designs (all proposed 2026-11-19, not yet agreed):
+detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
+[§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
+[§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
+[§21](#21-review-phase-2--proposed-2026-11-19-not-yet-agreed), publisher
+[§22](#22-publisher-phase-2--proposed-2026-11-19-not-yet-agreed).
 
 **Open items**: Twitch app registered and in `.env` (2026-11-18); first channel ohnepixel
 (`full`); pick the rest of the real channels (`clipper-channels add ...`).
@@ -1067,3 +1076,1099 @@ def detect_lease(channel_id: int) -> str:
 Outside core: controller `maintenance.STALE_AFTER` += `JUDGE: 10 min`, `DETECT_OFFLINE: 30 min`;
 the detector uses `clipper_twitch.helix.get_clips` (added by §17) with `TwitchSettings`.
 No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
+
+## 19. Judge (phase 2) — proposed 2026-11-19, not yet agreed
+
+**Status:** proposal, nothing built. Contracts, input builder, plan repair and the service can be
+built now with a deterministic fake model; provider and model are the **user's decision** (cost),
+made with the eval harness (6d). Prompt, thresholds and clip lengths get tuned on real candidates.
+
+**Ownership (§19–§22; replaces §8's "later" rows once agreed).** One writer per table; `jobs` is
+shared (anyone enqueues). §7's state is never stored: one helper, `clipper_core.lifecycle`, derives it.
+
+| Service | Writes (migration) | Enqueues | Runs |
+|---|---|---|---|
+| detector §18 | `candidates`, `chat_delay_estimates`, own `media_requests` (0004) | `judge`, `detect_offline` | `detect_offline` |
+| judge §19 | `clips`, `clip_plans`, `judge_calls`, own `media_requests` (0005); `clips/{id}/judge/` | `judge` (rounds), `render`, `notify` | `judge`, `revise_plan` |
+| renderer §20 | `renders` (0006); `clips/{id}/pinned/`, `clips/{id}/renders/` | `review`, `notify` | `render` |
+| review §21 | `clip_reviews`, `review_events` (0007) | `revise_plan`, `render` (re-render), `publish`, `publication_action` | `review`, `notify` |
+| publisher §22 | `platform_accounts`, `publish_routes`, `publications`, `publication_stats` (0008) | `sync_publication`, `notify` | `publish`, `sync_publication`, `publication_action` |
+
+**Role.** `services/judge` (slim): N `jobs.JobRunner`s on `judge` (ref = candidate) and `revise_plan`
+(ref = review event, §21) + a waiter loop. `clips.status`: `waiting_for_media → judging → rejected |
+planned` + `failed`; the rest of §7 comes from §20–§22's tables, and §7 gains the side states
+`failed` and `unrenderable`. `candidate` = an emitted candidate with no clip row yet.
+
+**A judge job = "advance this clip"** (idempotent; never blocks a worker while media is missing):
+1. Upsert the clip by `candidate_id`: context = the candidate's window, `anchor_utc` = T, round 0.
+   No video over `[moment_from − 30 s, moment_to + 30 s]` (audio_only) and `judge_audio_only` off →
+   `rejected`/`no_video` without an LLM call (§20 can't render it).
+2. `coverage(context)` complete → step 4 now; else the clip stays `waiting_for_media`, job done.
+3. **Waiter** (each judge process; clips claimed `FOR UPDATE SKIP LOCKED`): LISTEN
+   `clipper_transcripts` + a 30 s sweep. Ready → enqueue `judge` with `dedupe_key(JUDGE, cand,
+   f"r{round}")` at the clip's priority (the detector's first job is `judge:{cand}`, §18). Ready =
+   coverage complete; or past the **soft deadline** (`max(waiting_since, context_to) + 4 min`, wall
+   clock) with nothing pending in the core `[moment_from − 5 s, moment_to + 5 s]` (flag
+   `partial_context`); or past the **hard deadline** (+30 min) with any of the core transcribed
+   (else `rejected`/`no_media`). Stream end: `coverage()` makes time after the last chunk a gap.
+4. Compare-and-set `waiting_for_media → judging` (same round), commit; input, cost guard, cache, call,
+   resolve + repair; then **one transaction**: `clip_plans` row, clip status, `mark_fulfilled` of the
+   clip's media requests and, for `clip`, the `render` job (`dedupe_key(RENDER, plan_id)`; off with
+   `CLIPPER_JUDGE_RENDER_JOBS=0`). Provider errors retry; the job's last attempt marks it `failed`.
+
+**Context extension.** Answer `need_context` (`before_s`, `after_s`, why) → context = union, clamped
+to `[T − 10 min, T + 2 min]` and the stream; round + 1; `request_media(..., Priority.JUDGE_CONTEXT,
+requested_by="judge", clip_id)`; back to `waiting_for_media`: one transaction. Max 2 rounds; the last
+round's schema has no `need_context`. Each round is a `clip_plans` row (analytics see the asks).
+
+**Revisions** (`revise_plan` from review, §21, at `JUDGE_CONTEXT`: a human waits). Refused if
+`base_plan_id` isn't the clip's latest plan or the video is gone (chunk video and the render's ±30 s
+pins). A `PlanPatch` goes through the resolver (`author = operator`; a time with no word nearby stays,
+repair `unsnapped`); an `instruction` is one model call on the plan + the same input (`author =
+judge`; counted by the cost guard, never blocked). One transaction: `clip_plans` v+1 (`parent_id`,
+`review_event_id`, `instruction`), `clips.plan_version`, the `render` job; or `notify(REVISION_REFUSED)`.
+
+**LLM input** (stable order, no wall-clock values: cacheable, golden-file tested; seconds relative to
+T; **no speaker labels**: streamer, guests, game, TTS, lyrics mixed):
+- Meta: channel, stream title + category, moment type, detector score/trigger, explicit signals.
+- Transcript, one line per sentence: `S14 [-12.4→-8.1] so I went in there and he just`;
+  low-confidence words marked `?`; holes as `[-40→-25 no audio: ad]`.
+- Chat on video time (shifted by `chat_delay_s`), per 5 s: messages, uniques, top 3 emotes, top 3
+  normalised messages (the detector's filters, `clipper_core.chat`), clip mentions. Audio: notable
+  seconds (a sound group ≥ 0.5, loudness ≥ +6 dB over the window median); music ≥ 0.6 = Content ID risk.
+- Chat and transcript are **untrusted** (injection via chat or TTS): fenced as data; schema +
+  validator bound the output; nothing publishes without review. **Text only in v1**; keyframes
+  (~4 × 0.5k tokens) when the eval shows misses.
+
+**Answer vs plan.** The model fills a judge-internal `JudgeAnswer` (verdict, `in_s`/`out_s`, hook,
+title, hashtags, caption style, emphasis as `(sentence id, word)`, zooms, SFX tags, music mood, layout
+hint, reasons, confidence); code resolves it into the **`EditPlan`** (libs/core, versioned, UTC) that
+renderer, review and publisher read. **Resolve + repair** (pure; each change a code in `plan.repairs`):
+- Times → UTC, clamped to context and video: a cut across a gap (ad) is split into segments or
+  shrunk to the side holding T; holes ≤ `CHUNK_JITTER` bridged.
+- Snap: in → sentence start within 1.5 s, else word start, − 0.15 s (not before the previous word's
+  end); out → sentence end within 1.5 s, else word end, + 0.3 s. Never inside a word.
+- Duration into `[min_s, max_s]` (default 10–60 s; contract 3–180 s): extend to sentence edges around
+  T, or trim the side farther from T.
+- Emphasis resolved to real words (≤ 1 per 3 words); zooms clipped and merged, ≤ 1.5×; SFX tags must
+  exist in the asset manifest (§20), ≥ 2 s apart, ≤ 6; title ≤ 100 chars, blocklist → `sensitive`.
+- Invalid JSON or an unrepairable plan: one retry with the error stated, then `failed`.
+
+**`JudgeModel` Protocol**: `name`; `async judge(JudgeRequest) -> JudgeResponse` (system prompt, user
+content, JSON schema, max tokens → JSON text, usage in/cached/out, latency, request id). Adapters:
+Anthropic (`output_config.format`), OpenAI (strict Structured Outputs), Ollama (`format` = schema),
+each stripping keywords its provider rejects. Fakes: `FakeJudgeModel` (rules), `ScriptedJudgeModel`.
+
+**Provider options** (user's pick; per clip at ~4k uncached + 3k cached input, 1–3k output incl.
+reasoning; list prices 2026-11-19, verify; a context round adds ~50 %):
+
+| option | $/1M in / out (cached in) | ~$ per clip | ~latency | notes |
+|---|---|---|---|---|
+| Claude Opus 5.5 | 4 / 20 (0.20) | 0.05–0.08 | 10–40 s | effort knob trades depth for time |
+| Claude Sonnet 5.5 | 2 / 10 (0.10) | 0.02–0.04 | 8–25 s | |
+| Claude Haiku 5.5 | 0.10 / 0.50 | < 0.002 | 2–8 s | screening, or everything |
+| OpenAI flagship (gpt-6.2-astra) / gpt-5.4-mini / -nano | 8 / 40 (0.40); 0.75 / 4.50; 0.20 / 1.25 | 0.10–0.15 / 0.01–0.02 / ~0.003 | 3–40 s | gpt-5 family reportedly retired Dec 2026 |
+| Local via Ollama (container exists on this PC) | 0 | 0 (power) | 8B ~30–60 s, 3–4B ~15–30 s | beside the transcriber (~2.8 GB) + NVENC only 3–4B Q4 fits; 8B stalls transcription; quality unmeasured |
+
+~200 calls/day (60 stream-hours × ~3) ≈ $12/day Opus, $6 Sonnet, < $1 Haiku/nano (§18's caps: ≤ ~5×).
+Batch APIs (−50 %, hours) suit only backfill; a cascade (small screens, large plans) is to be measured.
+
+**Cache, idempotency, cost.**
+- **`judge_calls`** row per call: `request_hash` = sha256(model, prompt version, schema version,
+  rendered request), usage, `cost_usd` (price table in settings), latency, answer or error; full I/O
+  in S3. Committed **alone, right after the call**: a crash or retry reuses the paid answer. Unique:
+  clip per candidate, plan version per clip, render job per plan, waiter job per round.
+- **Cost guard** on top of §18's candidate budget: estimated cost per call vs
+  `budget_usd_per_stream_hour` (rolling 60 min) and `daily_usd`; over the stream budget only candidates
+  above that hour's median score proceed, over the daily cap `rejected`/`budget` + heartbeat warning.
+- **Prompt versions** `v{N}-{sha8}` (`clipper_judge/prompts/v{N}/`, schema from `JudgeAnswer`; in the
+  hash, every plan, the heartbeat; stable text first). **Shadow runs** (`CLIPPER_JUDGE_SHADOW`): extra
+  model/prompt pairs on the same input, `shadow = true`, never rendered, inside the cost guard.
+
+**Analytics later.** Plans + calls join `review_events` and `publication_stats` by `clip_id`: approval
+rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + `viewer_clips` + labels.
+
+**Build plan.**
+1. **6a Contracts + 0005 + `clipper_core.lifecycle`.** *Done:* `test_migrations` passes; `EditPlan`
+   rejects naive times, unordered segments, bad durations/versions; lifecycle table-tested.
+2. **6b Input builder + resolver (pure).** *Done:* byte-stable input for a fixture candidate (golden
+   file); ≥ 20 repair cases (snap, gap split, durations, no mid-word cut, unknown SFX dropped).
+3. **6c Service with the fake.** *Done (integration):* partial transcripts → waiting; transcript +
+   NOTIFY → `planned` + render job in one transaction; `need_context` → `request_media(100)` bumps
+   queued transcribe jobs, round 2 must decide; crash between call and commit → no second call;
+   soft/hard deadlines; budget → `rejected`/`budget`; a patch → v+1 + render job, a stale base refused.
+4. **6d Real adapters + `clipper-judge eval`** (user's choice, keys, spend). *Done:* ≥ 50 labelled
+   candidates through 2–3 models (agreement, repairs/clip, p50/p95 latency, $/clip); the user picks.
+
+### Proposed decision-log rows
+
+| Date | Decision | Why |
+|---|---|---|
+| 2026-11-19 | The judge writes `clips` (statuses up to `planned`/`rejected`/`failed`), `clip_plans` and `judge_calls`; later §7 states come from `renders`, `clip_reviews` and `publications`, combined by one helper, `clipper_core.lifecycle.lifecycle_state()` | one writer per table; §7 stays one readable state |
+| 2026-11-19 | A judge job only advances a clip; waiting clips are re-checked on `clipper_transcripts` NOTIFY + a 30 s sweep, and a ready clip gets a new judge job per round (`judge:{cand}:r{n}`) | no worker blocks while media is missing; durable, prioritised, deduped wake-ups |
+| 2026-11-19 | Deadlines: soft 4 min after the context end (judge with what exists if the core moment is covered), hard 30 min; stream end handled by `coverage()` | campaigns reward speed; a busy GPU must not hold clips forever |
+| 2026-11-19 | Context extension: ≤ T − 10 min / T + 2 min, ≤ 2 rounds, the last round's schema can't ask again; `request_media(JUDGE_CONTEXT)` in the round's transaction | bounded cost and latency; §6 priorities do the rest |
+| 2026-11-19 | The model answers in a judge-internal `JudgeAnswer` (seconds relative to T, sentence ids); deterministic code resolves it into the versioned `EditPlan` (UTC, snapped to words, clamped to video) in libs/core | prompts change often, the renderer contract rarely; LLM times are never trusted raw |
+| 2026-11-19 | LLM behind a `JudgeModel` Protocol (Anthropic, OpenAI, Ollama adapters, deterministic fake); provider and model chosen by the user from `clipper-judge eval` numbers | cost is the user's call; the service and tests don't depend on a provider |
+| 2026-11-19 | Every call is logged in `judge_calls` with a request hash and committed right after the call; retries reuse it | crash-safe, never pay twice; cost and latency data for analytics |
+| 2026-11-19 | Cost guard in USD per stream-hour and per day, on top of §18's candidate budget; operator revisions are counted but never blocked | token counts vary with context rounds; a candidate cap alone doesn't bound spend; a human is waiting |
+| 2026-11-19 | Judge input is text only in v1 (transcript, chat per 5 s, audio events, meta); frames deferred | cheap, works with every provider; add frames when the eval shows misses |
+| 2026-11-19 | Clips without video (audio_only) are rejected as `no_video` without an LLM call unless `judge_audio_only` | they can't be rendered (§20); spend only where output is possible |
+| 2026-11-19 | The judge enqueues the `render` job in the plan's transaction (first plans and revisions) | jobs are enqueued with their data (rule); no extra wake-up channel |
+
+### Contract changes
+
+Hand-written migration **`0005_judge`** (after `0004_detector`): three new tables and one FK on an
+existing nullable column (`media_requests.clip_id`, all NULL so far); nothing else changes. CHECK
+texts are repeated in the models, as in 0002. Uses §18's `dedupe_key(kind, ref_id, *parts)`. The
+revision handler uses §21's code-only contract (`REVISE_PLAN`, `NOTIFY`, `PlanPatch`, payloads).
+
+**`contracts.py`**
+
+```python
+UtcDatetime = Annotated[datetime, AfterValidator(ensure_utc)]  # naive datetimes rejected
+
+class JobKind(StrEnum):
+    ...  # TRANSCRIBE, JUDGE, DETECT_OFFLINE (§18)
+    RENDER = "render"  # ref_id = clip_plans.id; judge (plans), review (re-render, §21)
+
+class ClipStatus(StrEnum):  # clips.status (writer: judge)
+    WAITING_FOR_MEDIA = "waiting_for_media"
+    JUDGING = "judging"
+    REJECTED = "rejected"  # see ClipRejectReason
+    PLANNED = "planned"
+    FAILED = "failed"  # model/validation kept failing; clips.error
+
+class ClipRejectReason(StrEnum):  # clips.reject_reason (review's labels: ReviewLabel, §21)
+    MODEL = "model"  # the model said no
+    NO_VIDEO = "no_video"  # nothing renderable; no LLM call
+    NO_MEDIA = "no_media"  # hard deadline passed without a transcribed core
+    BUDGET = "budget"  # cost guard
+
+class Verdict(StrEnum):
+    CLIP = "clip"
+    REJECT = "reject"
+    NEED_CONTEXT = "need_context"
+
+class PlanAuthor(StrEnum):  # clip_plans.author
+    JUDGE = "judge"  # the model (first plans, instructed revisions)
+    OPERATOR = "operator"  # a review PlanPatch, resolved
+
+class LifecycleState(StrEnum):  # §7, derived by clipper_core.lifecycle.lifecycle_state()
+    CANDIDATE = "candidate"
+    WAITING_FOR_MEDIA = "waiting_for_media"
+    JUDGING = "judging"
+    REJECTED = "rejected"
+    PLANNED = "planned"
+    RENDERING = "rendering"
+    IN_REVIEW = "in_review"
+    APPROVED = "approved"
+    DISCARDED = "discarded"  # review rejected, expired or withdrawn
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    FAILED = "failed"  # judge or renderer gave up
+    UNRENDERABLE = "unrenderable"  # §20: no video / video expired
+
+class LayoutKind(StrEnum):
+    AUTO = "auto"  # renderer decides from the channel's layout config
+    FACECAM_GAMEPLAY = "facecam_gameplay"
+    FULL_CROP = "full_crop"
+    BLURRED_FIT = "blurred_fit"
+
+class CaptionStyle(StrEnum):  # presets defined in the renderer
+    BOLD_POP = "bold_pop"
+    CLEAN = "clean"
+    KARAOKE = "karaoke"
+
+class MusicMood(StrEnum):
+    HYPE = "hype"
+    FUNNY = "funny"
+    CHILL = "chill"
+    SUSPENSE = "suspense"
+    SAD = "sad"
+    EPIC = "epic"
+    WHOLESOME = "wholesome"
+
+class HookMode(StrEnum):
+    NONE = "none"  # the in-point itself is the hook
+    TEXT = "text"  # overlay text over the first seconds
+    TEASER = "teaser"  # the hook range (1-3 s, inside the clip) plays first, then the clip
+
+class RenderPayload(Payload):
+    plan_id: int
+    profile: str = "short_1080x1920"
+
+# --- edit plan (clip_plans.plan; StoredModel: unknown fields ignored, `version` gates breaks)
+
+class PlanSegment(StoredModel):
+    start_utc: UtcDatetime
+    end_utc: UtcDatetime  # > start_utc
+
+class Hook(StoredModel):
+    mode: HookMode = HookMode.NONE
+    start_utc: UtcDatetime | None = None  # TEASER only
+    end_utc: UtcDatetime | None = None
+    text: str | None = Field(default=None, max_length=40)  # TEXT only
+
+class EmphasisWord(StoredModel):
+    start_utc: UtcDatetime  # start of the word as transcripts.words() returns it
+    text: str
+    kind: Literal["highlight", "big"] = "highlight"
+
+class WordFix(StoredModel):  # caption text fix (review editor); the renderer shows `text`
+    start_utc: UtcDatetime  # the word's start as transcripts.words() returns it
+    text: str = Field(min_length=1, max_length=40)
+
+class Zoom(StoredModel):
+    start_utc: UtcDatetime
+    end_utc: UtcDatetime
+    scale: float = Field(ge=1.0, le=1.6)
+    target: Literal["face", "gameplay", "center"] = "center"
+
+class SfxCue(StoredModel):
+    at_utc: UtcDatetime
+    tag: str  # a tag of the asset manifest (clipper_core.assets, §20)
+    gain_db: float = Field(default=0.0, ge=-30, le=6)
+
+class MusicPlan(StoredModel):
+    mood: MusicMood
+    gain_db: float = Field(default=-20.0, ge=-40, le=-6)
+    duck: bool = True  # duck under the stream audio
+
+class LayoutHint(StoredModel):
+    kind: LayoutKind = LayoutKind.AUTO
+    focus_x: float | None = Field(default=None, ge=0, le=1)  # full_crop centre, 0 = left
+
+EDIT_PLAN_VERSION = 1
+CLIP_MIN = timedelta(seconds=3)
+CLIP_MAX = timedelta(seconds=180)
+
+class EditPlan(StoredModel):
+    """What to render. Written by the judge (resolved, snapped to words, clamped to video); read
+    by the renderer, review and publisher. All times are UTC video time; the renderer maps them to
+    output time. Validators: segments sorted, disjoint, total length within CLIP_MIN..CLIP_MAX;
+    emphasis, word fixes, zooms, sfx, thumbnail and a teaser hook (<= 3 s) lie inside the
+    segments; zooms disjoint."""
+
+    version: Literal[1] = EDIT_PLAN_VERSION
+    clip_id: int
+    stream_id: int
+    anchor_utc: UtcDatetime  # T, the candidate's peak
+    segments: list[PlanSegment] = Field(min_length=1)  # v1 judge writes one; jump cuts later
+    hook: Hook = Field(default_factory=Hook)
+    title: str = Field(min_length=1, max_length=100)  # title band + default post title (§22)
+    hashtags: list[str] = Field(default_factory=list, max_length=5)  # without '#'; §22 merges
+    caption_style: CaptionStyle = CaptionStyle.BOLD_POP
+    emphasis: list[EmphasisWord] = Field(default_factory=list)
+    word_fixes: list[WordFix] = Field(default_factory=list)
+    zooms: list[Zoom] = Field(default_factory=list)
+    sfx: list[SfxCue] = Field(default_factory=list)
+    music: MusicPlan | None = None
+    layout: LayoutHint = Field(default_factory=LayoutHint)
+    thumbnail_utc: UtcDatetime | None = None
+    moment_type: MomentType = MomentType.UNKNOWN
+    confidence: float = Field(ge=0, le=1)
+    reasons: list[str] = Field(default_factory=list)  # reasons[0] = the one-liner review shows
+    flags: list[str] = Field(default_factory=list)  # partial_context, copyright_music_risk, sensitive
+    repairs: list[str] = Field(default_factory=list)  # resolver changes: snap_in, split_gap, ...
+    model: str
+    prompt_version: str
+
+    # properties: in_utc (segments[0].start_utc), out_utc (segments[-1].end_utc), duration
+```
+
+**`models.py`** (and the same in the migration):
+- **`Clip`** (`clips`), writer: judge. `id` bigint PK; `candidate_id` FK candidates UNIQUE;
+  `stream_id` FK streams; `channel_id` FK channels; `status` text default 'waiting_for_media' CHECK
+  IN ('waiting_for_media','judging','rejected','planned','failed'); `reject_reason` text null
+  (CHECK `(status = 'rejected') = (reject_reason IS NOT NULL)`); `round` int default 0 (CHECK ≥ 0);
+  `anchor_utc` timestamptz; `context_from`, `context_to` timestamptz (CHECK `context_to >
+  context_from`); `priority` int (of its judge/render jobs); `waiting_since` timestamptz (wall clock,
+  deadlines); `plan_version` int null (latest non-shadow `clip` plan, revisions included); `flags`
+  jsonb default '{}'; `error` text null; `judged_at` null; `created_at`, `updated_at`. INDEX
+  (`stream_id`, `anchor_utc`); partial INDEX `ix_clips_waiting` (`stream_id`) WHERE `status =
+  'waiting_for_media'`. Score and moment type are read from the candidate.
+- **`ClipPlan`** (`clip_plans`), writer: judge, rows immutable. `id` bigint PK; `clip_id` FK clips;
+  `version` int; `round` int; `verdict` text CHECK IN ('clip','reject','need_context'); `plan` jsonb
+  null (`EditPlan`; CHECK `(verdict = 'clip') = (plan IS NOT NULL)`); `context_request` jsonb null
+  (`{"before_s", "after_s", "why"}`); `confidence` float null; `reasons`, `repairs` jsonb default
+  '[]'; `model`, `prompt_version` text; `shadow` bool default false; `judge_call_id` FK judge_calls
+  null; `author` text default 'judge' CHECK IN ('judge','operator'); `parent_id` FK clip_plans null
+  (the plan a revision changed); `review_event_id` bigint null (FK added by 0007, §21);
+  `instruction` text null; `created_at`. UNIQUE (`clip_id`, `version`).
+- **`JudgeCall`** (`judge_calls`), writer: judge. `id` bigint PK; `clip_id` FK clips null;
+  `stream_id` FK streams; `model`, `prompt_version`, `request_hash` text; `input_tokens`,
+  `cached_input_tokens`, `output_tokens` int; `cost_usd`, `latency_s` float; `answer` jsonb null;
+  `error` text null; `io_key` text null; `provider_request_id` text null; `shadow` bool default
+  false; `created_at`. INDEX (`request_hash`); INDEX (`stream_id`, `created_at`); INDEX
+  (`created_at`).
+- `MediaRequest.clip_id`: `ForeignKey("clips.id")` (migration: `create_foreign_key`, the "FK added
+  when clips table exists" of 0001). Docstring: detector rows link from `candidates`, judge rows
+  carry `clip_id`.
+
+**New `clipper_core.lifecycle`** (the one §7 helper; §20–§22 read it, nobody stores the result):
+`lifecycle_state(clip_status, render_status=None, review_status=None, publication_statuses=())
+-> LifecycleState` (pure) and `async lifecycle_states(session, clip_ids) -> dict[int,
+LifecycleState]` (one query). First match wins: any publication `live` → `published`; any
+`scheduled|uploading|processing|unknown` → `publishing`; review `approved` → `approved`,
+`rejected|expired|withdrawn` → `discarded`, `pending|revising` → `in_review`; the clip's latest
+render `rendering` → `rendering`, `done` → `in_review` (review job queued), `failed` → `failed`,
+`unrenderable` → `unrenderable`; else `clips.status` (no clip row → `candidate`). 6a reads `clips` +
+`renders`; 21a adds the review argument, 22a the publications.
+
+**`storage.keys`**: `judge_io(clip_id, call_id)` → `clips/{clip_id}/judge/{call_id:08d}.json`
+(request + raw response; kept for evals and prompt work).
+
+**Outside core.** `services/judge` (`CLIPPER_JUDGE_*`: provider, model, api key `SecretStr`, prices
+per 1M, `budget_usd_per_stream_hour`, `daily_usd`, `soft_wait_s` 240, `hard_wait_s` 1800,
+`max_rounds` 2, `max_before_s` 600, `max_after_s` 120, `min_clip_s` 10, `max_clip_s` 60,
+`judge_audio_only` false, `render_jobs` true, `shadow`, `concurrency` 4); compose service (assets
+volume read-only, for the SFX tag list); controller `STALE_AFTER[JUDGE] = 10 min` (§18),
+`STALE_AFTER[REVISE_PLAN] = 10 min`. The judge reads chat through §17's `clipper_core.chat` and the
+detector's filter helpers (bots, commands, dup normalisation), moved there so both read chat alike.
+
+---
+
+## 20. Renderer (phase 2) — proposed 2026-11-19, not yet agreed
+
+**Status:** proposal, nothing built. Time mapping, layouts, captions, the filter graph and the render
+loop can be built and tested now with libx264 on synthetic chunks. NVENC inside Docker Desktop/WSL2
+is **UNVERIFIED** (smoke test 7c; x264 keeps everything working without it). Per-channel layouts,
+caption taste and the SFX/music library need the user.
+
+**Role.** `services/renderer`, one process per GPU, one `render` job at a time (ref = `clip_plans.id`,
+from the judge or review's re-render). Writer of `renders` (new) and `clips/{id}/pinned/`, `/renders/`;
+enqueues `review`, `notify` (§21). Reads `clip_plans`, chunks, stream_gaps, `words()`, layouts,
+assets. Image: slim Debian + a **pinned static ffmpeg with `--enable-nvenc --enable-libass`** (BtbN
+or jellyfin-ffmpeg; URL + sha256) + bundled OFL fonts; compose reserves the GPU with
+`NVIDIA_DRIVER_CAPABILITIES=compute,video,utility` (NVENC comes from the driver, no CUDA toolkit).
+
+**Per job (plan P):**
+1. Load P's `EditPlan`. A segment without video (`video_key` null: audio_only) → `renders` row
+   `unrenderable`/`no_video`, job done (the judge normally doesn't enqueue these). Video object gone
+   (48 h retention, never pinned) → `unrenderable`/`video_expired`.
+2. **Pin**: S3 server-side copy of each chunk video overlapping `[in − 30 s, out + 30 s]` to
+   `clips/{clip_id}/pinned/{seq}.ts` (existing ones skipped). The chunk owner's 48 h sweep stays
+   clip-agnostic, and review can still move a cut by up to 30 s and re-render days later (§21).
+3. **Time map** (pure `timemap.build(segments, chunks)`): per segment and overlapping chunk, trim
+   `[a − chunk.start_utc, b − chunk.start_utc)` (exact inside a chunk, §5) with accurate seeking
+   (`-ss` before `-i` while transcoding, then `trim`/`atrim` + `setpts`). Jitter holes ≤
+   `CHUNK_JITTER` between contiguous chunks are filled (last frame held + silence) and overlaps cut
+   from the later chunk, so inside a segment **output time = UTC − segment start + offset**. A gap
+   inside a segment (the judge splits, so it shouldn't happen) → hard cut + warning. Segments join
+   with hard cuts. The same map converts every plan time (captions, zooms, SFX, hook).
+4. **Layout** to 1080×1920, then **captions** as an ASS file burned in with the `ass` filter
+   (`fontsdir` = bundled fonts only, no system fallback), **zooms**, hook (teaser range first, or
+   overlay text) and a title band (`plan.title`; post texts are separate, §22).
+5. **Audio**: the stream audio from the chunk `.ts` (sample-aligned with its video), SFX + music,
+   two-pass `loudnorm` to **−14 LUFS, −1 dBTP** (measure, then `linear=true` with the measured values).
+6. **Encode**, one ffmpeg run, two outputs: `clip.mp4` 1080×1920 at source fps (≤ 60), H.264 High,
+   `h264_nvenc` (p5, VBR ~8 Mbps / max 12, 2 s GOP) or `libx264` (`medium`, CRF 20) by
+   `CLIPPER_RENDERER_ENCODER=auto|nvenc|x264` (`auto` falls back when NVENC init fails);
+   `preview.mp4` 540×960, ~1.5 Mbps capped so the file stays ≤ 20 MB (Telegram bots upload ≤ 50 MB);
+   AAC 48 kHz 192 kbps, `+faststart`. Then `thumb.jpg` (at `plan.thumbnail_utc`, else the hook
+   start), `captions.ass`, `render.json` (`RenderManifest`).
+7. Upload to `storage.keys.render_file(clip_id, render_id, name)`; **one transaction**: the `renders`
+   row `done` + keys + `video_sha256` + measured duration/loudness + the `review` job
+   (`dedupe_key(REVIEW, render_id)`, §21). One render row per job (`job_id` unique): a retry resumes
+   it; the job's last failed attempt → `failed` + `notify(RENDER_FAILED)` in one transaction.
+
+**Layouts** (normalised source rects, so 720p and 1080p sources share one config):
+- `facecam_gameplay`: facecam rect → top panel 1080×760 (cropped to that aspect); gameplay → bottom
+  1080×1160 (centre crop at its focus); split ratio configurable.
+- `full_crop`: a 9:16 crop at `focus_x` → 1080×1920 (1.78× upscale from 1080p): Just Chatting, cam.
+- `blurred_fit`: the whole frame at 1080×608 over a cover-scaled, blurred, darkened copy; title
+  above, captions below. Used when nothing is configured.
+- **Facecam: manual config first.** `layouts.toml` on a mounted volume (edits need no redeploy; its
+  sha256 goes into each render): `[channels.<login>] facecam = {x, y, w, h}`, `default =
+  "facecam_gameplay"`, `[channels.<login>.categories."Just Chatting"] layout = "full_crop"`,
+  `focus_x = 0.5`. The plan's hint wins where the config allows it; `auto` → facecam_gameplay if a
+  rect exists, else blurred_fit. `clipper-renderer layout-preview <login> --at <utc>` draws the rects
+  on a frame. **Detection deferred** (ONNX face detector on keyframes) until configs go stale.
+
+**Captions** (pure `captions.build_ass(words, plan, style, timemap)`, golden-file tested). Words from
+`transcripts.words(stream, [in, out))` with the plan's `word_fixes` applied (review's text fixes),
+mapped to output time (words across a cut dropped). Pages of 1–3 words (≤ 16 chars, break at
+punctuation or pauses > 0.35 s, ≥ 0.4 s on screen); one Dialogue event per word slice with the active
+word coloured and scaled (`\c`, `\fscx/\fscy`, an 80 ms `\t` pop), not `\k` (fill sweeps only);
+emphasis words larger in the accent colour. `PlayResX/Y` = 1080×1920; text kept in the platform safe
+zone (about x 80–1000, y 1150–1450: Shorts/TikTok UI covers the bottom and the right). `CaptionStyle`
+presets (font, size, outline, colours, position) live in the renderer. Profanity masking deferred.
+
+**Punch-ins.** v1 = hard punch-ins (the short-form look): a static zoomed crop of the panel (1.1–1.5×
+on face/gameplay/centre) switched in with `overlay=enable='between(t,a,b)'`. Smooth zooms deferred.
+
+**Assets** (the user supplies files; nothing ships in git). `assets/` volume + `manifest.toml`, per
+asset: `id`, `file`, `sha256`, `kind` (sfx|music), `tags` (vine_boom, whoosh, record_scratch, …) or
+`moods` (`MusicMood`), `duration_s`, licence `{name, source_url, licensee, proof, platforms,
+attribution, expires}`. `clipper-renderer assets check` verifies hashes, measures loudness and
+rejects entries without a licence, expired, or missing a target platform; only checked assets are
+used. Choice is deterministic: matching assets sorted by id, index = hash(clip_id, cue) mod n. Mix:
+SFX by `adelay` at output times (plan gain, per-asset peak normalisation); a music bed at −20 dB,
+ducked by `sidechaincompress` keyed on the stream audio, 1 s fade-out; **no music** when the plan
+flags `copyright_music_risk`. The judge reads the tag/mood list from the same manifest.
+
+**Reproducibility.** `graph_hash` = sha256 of the plan JSON, filter script, ASS, inputs (chunk ids,
+pinned keys, trims), layout config, asset and font hashes, renderer version and `ffmpeg -version`.
+Same inputs → same graph; libx264 output is byte-identical, NVENC only visually (driver-dependent).
+
+**GPU sharing** (RTX 4060, 8 GB). NVENC is a separate encoder block (~0.2–0.4 GB beside the
+transcriber's ~2.8 GB); decode and the filter graph run on the 8 CPU cores, the expected bottleneck;
+a local LLM (§19) is the real conflict. OBS/ShadowPlay also use NVENC (`auto` falls back to x264).
+Heartbeat: encoder, renders done, p50 render time, queue.
+
+**Retention.** Pinned copies and outputs belong to the renderer; a daily sweep reads
+`lifecycle.lifecycle_states()` (§19): rejected/discarded/failed/unrenderable > 7 days → delete
+pinned + outputs (review can reopen until then); published → keep outputs, pinned 30 days (user
+decision). §9 becomes "video ~48 h; a clip pins the chunks it uses (`clips/{id}/pinned/`)".
+
+**Audio-only channels.** Not rendered in v1 (`unrenderable`/`no_video`; the judge skips them by
+default). User options: switch the channel to `full`, or a later audio-only format (waveform + captions).
+
+**Interfaces + fakes.** `MediaSource` (chunk/pinned video; fake = temp dir), `AssetLibrary`,
+`LayoutConfig`, `Ffmpeg` runner (real ffmpeg in tests; already on PATH for the recorder's). Synthetic
+chunks from lavfi: frame index encoded as luma (`geq`), a 1 kHz beep at known UTC seconds, two
+contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultrafast.
+
+**Build plan.**
+1. **7a Contracts + 0006 + pure parts** (timemap, layout geometry, ASS builder, graph builder, asset
+   manifest + picker). *Done:* golden tests; generated ASS renders through ffmpeg's `ass` filter
+   without warnings; `test_migrations` passes.
+2. **7b Render loop, libx264, synthetic chunks.** *Done:* frames at a chunk boundary and at segment
+   cuts match the time map ±1 frame (luma index); the beep lands within ±1 frame; −14 ± 1 LUFS,
+   TP ≤ −1 dB; the same plan twice → the same `graph_hash` and identical bytes; audio_only →
+   `unrenderable` without running ffmpeg; a crash + retry reuses the row; done → `review` job in the
+   same transaction; S3 CopyObject works on SeaweedFS.
+3. **7c GPU + real stream** (smoke on this PC). *Done:* NVENC works in the container (else x264-only
+   is documented); a 30 s 1080p60 clip renders in ≤ 30 s p50 while the transcriber runs and its
+   realtime factor drops < 10 % (numbers in §20); ohnepixel's layout fitted with `layout-preview`
+   and approved by the user.
+4. **7d Assets + polish** (needs the user's licensed library). *Done:* `assets check` rejects a
+   missing licence and a hash mismatch; a clip with 2 SFX + music meets the loudness targets; the
+   user signs off 5 real renders (captions, layout, hook).
+
+### Proposed decision-log rows
+
+| Date | Decision | Why |
+|---|---|---|
+| 2026-11-19 | Renderer image = slim + pinned static ffmpeg (NVENC + libass) with GPU video capability; `h264_nvenc` by default, libx264 fallback (`auto`) | NVENC is separate silicon and fast; x264 keeps rendering alive when NVENC is busy or unavailable (WSL2 unverified) |
+| 2026-11-19 | Renders map UTC exactly: per-chunk accurate trims, jitter holes padded (held frame + silence), gaps become hard cuts; one time map drives captions, zooms and SFX | §5's chunk model; captions stay in sync across chunk boundaries |
+| 2026-11-19 | A render pins the chunk video it uses (S3 copy to `clips/{id}/pinned/`, ±30 s); chunk video retention stays a blind 48 h rule | no cross-service holds; re-renders after review still work |
+| 2026-11-19 | A finished render enqueues the `review` job (ref = render) in its own transaction; a render that gives up sends `notify(RENDER_FAILED)`; no `clipper_renders` NOTIFY channel | durable, deduped wake-up even while review is down; jobs are enqueued with their data |
+| 2026-11-19 | Layouts from a per-channel `layouts.toml` (normalised rects, per-category overrides) on a volume; facecam detection deferred | correct from day one for a handful of channels; detection needs real data |
+| 2026-11-19 | Captions = ASS generated by pure code from `words()` + the plan's `word_fixes`, one event per word slice, bundled OFL fonts via `fontsdir` | deterministic, golden-testable, full control over highlight, emphasis and fixes |
+| 2026-11-19 | v1 punch-ins are hard static zooms; smooth zooms later | simple and deterministic; it's the common short-form look |
+| 2026-11-19 | SFX/music only from a user-supplied local library with a manifest (sha256 + licence + platforms), checked by `assets check`; deterministic choice by hash | §2: licensed audio only, provable per render |
+| 2026-11-19 | Loudness: two-pass `loudnorm`, −14 LUFS, −1 dBTP | platform normalisation targets for shorts; two-pass is deterministic |
+| 2026-11-19 | Reproducibility = `graph_hash` over plan, inputs, layout config, assets, fonts and versions; byte-identical only with x264 | NVENC output may differ across drivers; the graph is what we control |
+| 2026-11-19 | Each render writes final 1080×1920 (+ sha256), a 540×960 preview ≤ 20 MB, thumbnail, ASS and a manifest | the phone review needs a small file; the publisher checks the upload; the manifest makes renders auditable |
+| 2026-11-19 | audio_only channels are not rendered in v1 | no video; an audio-only format is a later product decision |
+
+### Contract changes
+
+Hand-written migration **`0006_renderer`** (after `0005_judge`): one new table; nothing else changes.
+`JobKind.RENDER` and `RenderPayload` come with 0005 (§19); `JobKind.REVIEW`/`NOTIFY`,
+`ReviewPayload`, `NotifyPayload` and `NoticeKind` are §21's code-only contract (the renderer enqueues).
+
+**`contracts.py`**
+
+```python
+class RenderStatus(StrEnum):  # renders.status (writer: renderer)
+    RENDERING = "rendering"
+    DONE = "done"
+    FAILED = "failed"
+    UNRENDERABLE = "unrenderable"  # see UnrenderableReason; job done, no retry
+
+class UnrenderableReason(StrEnum):
+    NO_VIDEO = "no_video"  # audio_only chunks (or no chunk) under a segment
+    VIDEO_EXPIRED = "video_expired"  # retention deleted the video before it was pinned
+
+RENDER_MANIFEST_VERSION = 1
+
+class RenderSource(StoredModel):
+    chunk_id: int
+    seq: int
+    key: str  # pinned copy that was read
+    start_utc: UtcDatetime  # chunk start (time map origin)
+    trim_from_s: float  # offsets inside the chunk
+    trim_to_s: float
+    out_at_s: float  # where it lands in the output
+    pad_after_s: float = 0.0  # jitter fill after it
+
+class RenderAsset(StoredModel):
+    id: str
+    kind: Literal["sfx", "music", "font"]
+    sha256: str
+    licence: str | None = None
+    at_s: float | None = None  # output time (sfx)
+
+class RenderManifest(StoredModel):
+    """`render.json` next to each render: everything needed to re-run it."""
+
+    version: Literal[1] = RENDER_MANIFEST_VERSION
+    render_id: int
+    clip_id: int
+    plan_id: int
+    profile: str
+    renderer_version: str
+    ffmpeg_version: str
+    encoder: str  # h264_nvenc | libx264
+    graph_hash: str
+    layout: dict[str, Any]  # resolved kind + pixel rects
+    layout_config_sha256: str | None
+    sources: list[RenderSource]
+    assets: list[RenderAsset] = Field(default_factory=list)
+    width: int
+    height: int
+    fps: float
+    duration_s: float
+    loudness_lufs: float
+    true_peak_db: float
+    video_sha256: str
+    warnings: list[str] = Field(default_factory=list)
+```
+
+**`models.py`**: **`Render`** (`renders`), writer: renderer. `id` bigint PK; `job_id` bigint UNIQUE
+(no FK: one row per render job, a retry resumes it); `clip_id` FK clips; `plan_id` FK clip_plans;
+`profile` text; `status` text default 'rendering' CHECK IN ('rendering','done','failed',
+'unrenderable'); `unrenderable_reason` text null (CHECK `(status = 'unrenderable') =
+(unrenderable_reason IS NOT NULL)`); `layout`, `encoder`, `renderer_version`, `ffmpeg_version`,
+`graph_hash` text null; `pinned_keys` jsonb default '[]'; `video_key`, `preview_key`, `thumb_key`,
+`captions_key`, `manifest_key` text null; `video_sha256` text null; `duration_s`, `fps`,
+`loudness_lufs`, `render_s` float null; `width`, `height` int null; `bytes`, `preview_bytes` bigint
+null; `warnings` jsonb default '[]'; `error` text null; `created_at`; `finished_at` null. INDEX
+(`clip_id`, `created_at`); INDEX (`plan_id`).
+
+**`storage`**
+- `keys.clip_pinned_video(clip_id, seq)` → `clips/{clip_id}/pinned/{seq:06d}.ts`.
+- `keys.render_file(clip_id, render_id, name)` → `clips/{clip_id}/renders/{render_id}/{name}`
+  (`clip.mp4`, `preview.mp4`, `thumb.jpg`, `captions.ass`, `render.json`).
+- `ObjectStore.copy(src_key, dst_key)` (S3 CopyObject, server side; for pinning).
+
+**New `clipper_core.assets`** (shared by judge and renderer): `AssetEntry`/`AssetManifest` pydantic
+models of `manifest.toml` (licence fields required), `load_manifest(path)`, `tags()`, `moods()`;
+`pick(entries, tag, clip_id, cue_index)` (deterministic). No DB table: the library is files.
+
+**`clipper_core.lifecycle`**: the render mapping is part of §19's helper (6a).
+
+**Outside core.** `services/renderer` (`CLIPPER_RENDERER_*`: encoder, layouts path, assets path,
+fonts dir, temp dir, `pin_margin_s` 30); compose service with the GPU reservation, `assets` and
+`layouts.toml` volumes read-only; controller `STALE_AFTER[RENDER] = 20 min`. §9 wording: "video ~48 h;
+a clip pins the chunks it uses (`clips/{id}/pinned/`)".
+
+---
+
+## 21. Review (phase 2) — proposed 2026-11-19, not yet agreed
+
+**Status:** proposal, nothing built. All of it can be built and tested with fakes, no credentials;
+the real bot needs the user's bot token and Telegram user id, remote web access needs Tailscale.
+Depends on the *contracts* of §19 and §20 (0005/0006), not on their services.
+
+**Role.** `services/review` (slim), one process: Telegram bot (long polling), web UI (FastAPI on
+127.0.0.1:8080), `jobs.JobRunner` for `review` (from the renderer) and `notify` (from anyone) jobs,
+a 30 s sweep (deadlines, reminders). Writer of `clip_reviews`, `review_events` (new); enqueues
+`revise_plan`, `render` (re-render), `publish`, `publication_action`; never writes `clips`,
+`clip_plans`, `renders`, `publications`. The only service that talks to Telegram.
+**Reads:** `clips` (+ the candidate's score and moment type), the shown render's plan (`EditPlan`:
+title, hashtags, `reasons[0]`), `renders` (`preview_key`, `thumb_key`, `duration_s`,
+`preview_bytes`), `audio_metrics_1s` (music share), `words()`, and §22's `publish_routes`,
+`publications`, `publication_stats`. §7's state comes from `lifecycle.lifecycle_state()` (§19).
+
+**Review state.** `clip_reviews`, one row per clip (made by its first `review` job): `status`
+`pending | revising | approved | rejected | expired | withdrawn`, the render shown, `deadline`,
+metadata overrides, labels, Telegram message ids. `review_events`, append-only audit: who
+(`telegram:<user id>`, `web:<name>`, `system`), when, what (action, labels, note, the render the
+actor saw; `details`: patch, instruction, metadata before → after, targets). An action is one
+transaction: lock the row, check the transition and that the actor saw the current render (stale
+buttons are refused), insert the event, update the row, enqueue jobs. `external_id` (Telegram
+callback/message id, web form token) is unique: redeliveries and double taps do nothing.
+
+**Actions.**
+- **Approve** (`pending`): one `publish` job per selected route (§22; pre-selected: routes with
+  `auto_select`), `dedupe_key(PUBLISH, clip_id, account_id)`, same transaction. A channel without a
+  route gets no Approve button (default deny, §2). Until §22 exists, `CLIPPER_REVIEW_PUBLISH_JOBS=0`:
+  approve records the decision only.
+- **Reject**: one or more `ReviewLabel`s (one tap each) + optional note.
+- **Edit metadata** (post title, description, hashtags): overrides in `clip_reviews.post_metadata`;
+  no plan, no render (§22 merges plan → overrides → route template). The burned-in title band
+  changes only by Revise.
+- **Revise** (in/out, title band, overlay text, caption text, layout, music). Review never writes
+  plans: the event holds `details.patch` (`PlanPatch`) or `details.instruction` (free text: "start
+  3 s earlier, punchier hook"); status `revising`; a `revise_plan` job (ref = event, dedupe
+  `revise_plan:{event}`, priority `JUDGE_CONTEXT`: a human waits). The judge (§19) writes
+  `clip_plans` v+1 + the `render` job; the new render's `review` job makes the clip `pending` again
+  (Telegram replaces the message's media). `notify(REVISION_REFUSED | RENDER_FAILED)` → `pending`
+  on the previous render, with the reason.
+- **Re-render** (same plan, glitch): a `render` job, `dedupe_key(RENDER, plan_id, f"e{event_id}")`.
+  **Withdraw** (after approve): `publication_action(delete)` per live post; publish jobs not started
+  yet cancel themselves (§22). **Reopen** (expired/rejected → `pending`, +30 min; ≤ 7 days, while
+  §20 keeps the files). **Submitted** (campaign link sent, §22).
+
+**Deadlines.** `deadline = render ready + review window`: the smallest `RouteRules.review_window_s`
+of the clip's routes (campaign speed; default 2 h, also without routes), capped at `clips.anchor_utc
++ max_age` (12 h). A revision keeps it but leaves ≥ 10 min after the new preview. A reminder reply
+15 min before (edits don't ring); at the deadline the sweep writes `expire` (actor `system`) and
+removes the buttons. Quiet hours are UTC (`CLIPPER_REVIEW_QUIET_UTC=23:00-07:00`), mute only.
+
+**Telegram bot.** Own minimal Bot API client on httpx (~10 methods, like our IRC/Helix clients). Long
+polling (`getUpdates`, 50 s), no webhook: no public endpoint on the home PC. One poller (lease
+`review:telegram`). Updates left unconfirmed by a crash come again and are dropped by `external_id`.
+- **Auth**: only `CLIPPER_REVIEW_TELEGRAM_USER_IDS` (numeric) are served; others are logged with their
+  id (the user finds theirs by sending `/start`). Messages go to `CLIPPER_REVIEW_TELEGRAM_CHAT_ID`.
+- **Clip message**: `sendVideo` (the render's `preview.mp4`, ≤ 20 MB, `supports_streaming`, `file_id`
+  kept) + caption ≤ 1024 chars: channel, moment type, length, score, title, the judge's one-line
+  reason, music share (Content ID risk), deadline, web link. Buttons ✅ Approve · ❌ Reject · ✏️ Title
+  · 🔁 Change · 🌐 Web; callback data (≤ 64 bytes) = action + render id (`ap:5812`). Reject opens the
+  labels; Title/Change ask via `ForceReply` (Change also offers ±3 s start/end buttons as patches);
+  TikTok targets add its privacy choice + consent (§22).
+- `/queue`, `/login` (web magic link), `/mute 2h`. After a decision all the clip's messages are edited
+  ("✅ by web 12:03", buttons gone). ≤ 1 message/s per chat; 429 `retry_after` honoured.
+
+**Web UI.** FastAPI + Jinja2 + htmx (vendored, no build step), calling the bot's action functions.
+- **Pages**: queue (by deadline); clip (player, thumbnail, plan, metadata, history, publications and
+  views from §22); labels per week by detector/judge/renderer; health (heartbeats, queue depths).
+- **In/out editor**: the transcript (`transcripts.words()`) within ± 30 s of the current cut (§20's
+  pin margin, so re-renders work for days) as clickable words (cut before/after a word), ± 0.5 s
+  nudges, caption text fixes (`word_fixes`). Later: an hls.js scrubber over the pinned `.ts` files.
+- **Media** is streamed by the service with HTTP Range (SeaweedFS on 127.0.0.1 isn't reachable from
+  the phone); presigned URLs once storage is R2 (`CLIPPER_REVIEW_MEDIA=proxy|presigned`).
+- **Auth**: 127.0.0.1 only, remote via **Tailscale Serve** (tailnet-only HTTPS, never Funnel).
+  Password (argon2id hash in env) or a one-time `/login` link (5 min). Signed session cookie
+  (HttpOnly, Secure, SameSite=Strict, 14 days) + a CSRF token on POSTs. A `reviewers` table later.
+
+**Feedback labels** (`contracts.ReviewLabel`; no DB CHECK, it grows): detector `not_a_moment`,
+`fake_spike`, `duplicate`; judge `weak_moment`, `bad_start`, `bad_end`, `missing_context`,
+`too_long`, `bad_title`; renderer `bad_layout`, `bad_captions`, `bad_audio`; risk `copyright_music`,
+`sensitive`, `no_rights`; `too_late`, `other`; `great` on approve. Operator edits are signal too
+(`clip_plans` with `author = 'operator'` vs the judge's first plan).
+
+**Interfaces and tests.** `TelegramApi` Protocol: real httpx client; `FakeTelegram` records sends,
+injects updates, simulates 429 and "message is not modified". `MediaSource` (S3 ranges; fake dict),
+injected clock, fixture rows for judge/renderer output, FastAPI TestClient. No test sends a message.
+
+**Risks.** A leaked bot token lets someone pose as the bot but not act (allowlist): rotate it in
+BotFather. Previews sit on Telegram's servers (private chat). Telegram down → the web UI still works.
+
+**Build plan.**
+1. **21a Contracts + 0007 + lifecycle (review part).** *Done:* `test_migrations` passes; state
+   mapping and transitions tested.
+2. **21b Core**: actions, `review`/`notify` handlers, sweep. *Done:* approve → one `publish` job per
+   route in the same transaction; concurrent approve/reject → one wins; stale render refused; revise →
+   event + `revise_plan`; refused revision → `pending`; expiry and reopen.
+3. **21c Telegram**: client, poller + lease, messages, callbacks, ForceReply. *Done:* a FakeTelegram
+   test per flow; foreign user ignored; redelivered update → no second event; 429 obeyed.
+4. **21d Web UI**: login, queue, clip page, word picker, edits, Range proxy. *Done:* TestClient: no
+   session → login, no CSRF → 403, edit → event + job, Range → 206; checked by hand on a phone.
+
+### Proposed decision-log rows
+
+| Date | Decision | Why |
+|---|---|---|
+| 2026-11-19 | Review state in review-owned `clip_reviews` (one row per clip) + append-only `review_events` (who/when/what); §7's later states are derived by §19's `lifecycle.lifecycle_state()` | one writer per table; the audit trail is complete and never rewritten |
+| 2026-11-19 | Review never writes plans: a change is stored as an event (`PlanPatch` or free-text instruction) and sent as a `revise_plan` job; the judge resolves it, writes the new `clip_plans` version (`author`, `parent_id`) and the render job, or refuses via `notify` | one writer for plans; validation (word snapping, video) and the LLM live in one place |
+| 2026-11-19 | Post title/description/hashtag edits are review overrides (`clip_reviews.post_metadata`), no new plan or render; the burned-in title band changes only by a revision | metadata isn't in the video; a re-render would cost a minute for nothing |
+| 2026-11-19 | Only review talks to Telegram; the other services send `notify` jobs (`dedupe_key(NOTIFY, ref_id, kind)`) | one place holds the bot token; durable, deduped notices |
+| 2026-11-19 | Telegram: own minimal Bot API client (httpx), long polling, one instance (lease), user-id allowlist, buttons carry the render id, updates deduped by id | no public endpoint on the home PC; stale buttons and redeliveries are harmless; fakeable |
+| 2026-11-19 | Web UI: FastAPI + Jinja2 + htmx, bound to 127.0.0.1, remote via Tailscale Serve only; password or bot magic link, signed cookie, CSRF | no build step; never on the public internet; one operator now |
+| 2026-11-19 | In/out edits by clicking transcript words (`transcripts.words()`) within the render's ±30 s pin margin | sentence-accurate cuts on a phone; re-renders work after chunk video expires |
+| 2026-11-19 | Review deadline per clip from the routes' `review_window_s` (default 2 h), capped at moment + 12 h; expired = discarded, reopenable for 7 days; quiet hours (UTC) only mute | campaigns reward speed; a stale clip should not block the queue |
+| 2026-11-19 | Fixed, attributed `ReviewLabel`s (detector/judge/renderer/risk) + note | feedback for tuning is queryable without parsing text |
+| 2026-11-19 | Approve enqueues one `publish` job per route in the same transaction; a channel without a route can't be approved | default deny on rights (§2); nothing gets lost between approval and upload |
+
+### Contract changes
+
+Migration **`0007_review`** (after `0006_renderer`; additive: two new tables, FKs to `clips` (0005)
+and `renders` (0006), and the FK `clip_plans.review_event_id → review_events` that 0005 left out).
+The enums and payloads below are code only (no DDL): whichever of 6a, 7a, 21a is built first adds
+them, since the judge and renderer enqueue these jobs before review exists.
+
+**`contracts.py`**
+```python
+class JobKind(StrEnum):
+    ...
+    REVIEW = "review"            # ref_id = renders.id; the renderer enqueues it with the render
+    REVISE_PLAN = "revise_plan"  # ref_id = review_events.id; review enqueues, the judge runs it
+    NOTIFY = "notify"            # ref_id = what the notice is about; anyone enqueues, review runs it
+
+class ReviewStatus(StrEnum):  # clip_reviews.status
+    PENDING = "pending"; REVISING = "revising"; APPROVED = "approved"
+    REJECTED = "rejected"; EXPIRED = "expired"; WITHDRAWN = "withdrawn"
+
+class ReviewAction(StrEnum):  # review_events.action
+    RENDER_READY = "render_ready"; APPROVE = "approve"; REJECT = "reject"
+    EDIT_METADATA = "edit_metadata"; REVISE = "revise"; RERENDER = "rerender"; EXPIRE = "expire"
+    REOPEN = "reopen"; WITHDRAW = "withdraw"; SUBMITTED = "submitted"; NOTE = "note"
+
+class ReviewLabel(StrEnum):  # review_events.labels; grows (no DB CHECK)
+    NOT_A_MOMENT = "not_a_moment"; FAKE_SPIKE = "fake_spike"; DUPLICATE = "duplicate"     # detector
+    WEAK_MOMENT = "weak_moment"; BAD_START = "bad_start"; BAD_END = "bad_end"             # judge
+    MISSING_CONTEXT = "missing_context"; TOO_LONG = "too_long"; BAD_TITLE = "bad_title"   # judge
+    BAD_LAYOUT = "bad_layout"; BAD_CAPTIONS = "bad_captions"; BAD_AUDIO = "bad_audio"     # renderer
+    COPYRIGHT_MUSIC = "copyright_music"; SENSITIVE = "sensitive"; NO_RIGHTS = "no_rights"  # risk
+    TOO_LATE = "too_late"; OTHER = "other"; GREAT = "great"  # GREAT: positive, on approve
+
+class NoticeKind(StrEnum):
+    REVISION_REFUSED = "revision_refused"  # judge; ref = review event
+    RENDER_FAILED = "render_failed"  # renderer; ref = render
+    # §22 adds PUBLISH_FAILED, PUBLICATION_UNKNOWN, TAKEDOWN, NEEDS_REAUTH,
+    # SUBMIT_TO_CAMPAIGN, PUBLISH_CANCELLED
+
+class PostMetadata(StoredModel):  # jsonb; review overrides (None = keep) and publisher's final
+    title: str | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
+
+class PlanPatch(StoredModel):  # review_events.details.patch; None = keep, lists replace whole
+    in_utc: UtcDatetime | None = None  # moves segments[0].start_utc
+    out_utc: UtcDatetime | None = None  # moves segments[-1].end_utc
+    hook: Hook | None = None
+    title: str | None = None  # the burned-in title band (post texts: PostMetadata)
+    caption_style: CaptionStyle | None = None
+    word_fixes: list[WordFix] | None = None
+    layout: LayoutHint | None = None
+    music: MusicPlan | None = None
+    no_music: bool = False
+
+class ReviewPayload(Payload):
+    render_id: int
+
+class RevisePlanPayload(Payload):
+    review_event_id: int
+    clip_id: int
+    base_plan_id: int  # the plan of the render the reviewer saw
+
+class NotifyPayload(Payload):
+    kind: NoticeKind
+    text: str
+    clip_id: int | None = None
+    publication_id: int | None = None
+    severity: Literal["info", "warning", "error"] = "info"
+
+REVIEW_TELEGRAM_LEASE = "review:telegram"  # the single getUpdates poller
+```
+Dedupe: `review:{render}`, `revise_plan:{event}`, `dedupe_key(NOTIFY, ref_id, kind)` (ref = the
+render, review event, publication or account; account notices add the UTC date as a part).
+
+**`models.py`** (CHECK texts repeated in the migration, as in 0002)
+- **`ClipReview`** (`clip_reviews`), writer: review. `clip_id` bigint PK FK clips; `status` text
+  default 'pending' CHECK IN ('pending','revising','approved','rejected','expired','withdrawn');
+  `render_id` FK renders null (the render shown); `deadline` timestamptz null; `first_shown_at`,
+  `decided_at` timestamptz null; `decided_by` text null; `post_metadata` jsonb default '{}'
+  (`PostMetadata` overrides; not `metadata`, which SQLAlchemy reserves); `labels` jsonb default '[]';
+  `telegram` jsonb default '{}' (`chat_id`, `message_ids`, `file_id`, open `ForceReply` prompts);
+  `created_at`, `updated_at`. INDEX (`status`, `deadline`).
+- **`ReviewEvent`** (`review_events`), writer: review, append-only. `id` bigint PK; `clip_id` FK
+  clips; `action` text (no CHECK: `ReviewAction` grows); `actor` text; `render_id` FK renders null;
+  `labels` jsonb default '[]'; `note` text null; `details` jsonb default '{}'; `external_id` text
+  UNIQUE null; `created_at`. INDEX (`clip_id`, `created_at`); INDEX (`action`, `created_at`).
+- `ClipPlan.review_event_id`: `ForeignKey("review_events.id")` (migration: `create_foreign_key`).
+
+**`clipper_core.lifecycle`**: `lifecycle_state()` gains `review_status` (mapping in §19).
+
+**Outside core**: controller `STALE_AFTER` += `REVIEW: 5 min`, `NOTIFY: 5 min` (`REVISE_PLAN` with
+§19); `services/review` (pyproject, Dockerfile, workspace member), compose `review` with
+`127.0.0.1:8080:8080`; `.env.example`: `CLIPPER_REVIEW_TELEGRAM_BOT_TOKEN`, `_TELEGRAM_USER_IDS`,
+`_TELEGRAM_CHAT_ID`, `_WEB_PASSWORD_HASH`, `_SESSION_SECRET`, `_PUBLIC_URL`, `_QUIET_UTC`, `_MEDIA`,
+`_PUBLISH_JOBS`.
+
+---
+
+## 22. Publisher (phase 2) — proposed 2026-11-19, not yet agreed
+
+**Status:** proposal. Pipeline, scheduler, token crypto and a fake platform can be built now. Real
+adapters wait for the user's §2 decision (platforms, accounts) and app credentials; TikTok and
+Instagram also for an approval. Platform facts re-checked 2026-11-19 (table): **§3 update proposed**.
+
+**Role.** `services/publisher` (slim), `jobs.JobRunner` for `publish`, `sync_publication`,
+`publication_action` (the first and last from review, §21), plus a daily token sweep. Writer of
+`platform_accounts`, `publish_routes`, `publications`, `publication_stats` (new). CLI
+`clipper-publisher` (part of the service, like `clipper-channels`): `connect <platform>`, `accounts`,
+`route add|list|disable`, `pause|resume`, `gen-key`, `rotate-key`, `smoke`. Reaches the operator only
+through `notify` jobs (§21). Reads `clip_reviews`, the approved render (`video_key`, `video_sha256`)
+and its plan.
+
+| Platform | Facts (official docs, 2026-11-19) |
+|---|---|
+| YouTube | `videos.insert` costs 1 unit of its own Video Uploads bucket: 100 calls/day per project; `videos.list` 1, `videos.delete` 50 units; quotas reset at midnight PT. The page now says "Videos uploaded from unverified API projects are not restricted to private viewing mode" (§3's private-lock note is outdated). OAuth consent screen in "Testing" → refresh tokens expire after 7 days. Resumable upload, ≤ 256 GB. |
+| TikTok | Direct Post `POST /v2/post/publish/video/init/` (`video.publish`): FILE_UPLOAD (chunked PUT; upload URL valid 1 h) or PULL_FROM_URL (verified domain). `privacy_level` must be one of the `creator_info` options. 6 requests/min per user token; a daily cap per creator (reportedly ~15, shared across clients). Unaudited clients: private viewing only, and only private accounts can post. Status `PROCESSING_UPLOAD/DOWNLOAD → PUBLISH_COMPLETE` or `FAILED`. Flags `brand_content_toggle`, `is_aigc`. No delete endpoint found. |
+| Instagram | Professional account; `media_type=REELS` container → `media_publish`; container `IN_PROGRESS/FINISHED/PUBLISHED/ERROR/EXPIRED` (24 h), check once a minute ≤ 5 min. 100 API posts per rolling 24 h (the same docs say 50 elsewhere: read `content_publishing_limit`); 400 containers/24 h. Instagram Login (`instagram_business_content_publish`) needs a public `video_url`; resumable upload of a local file only with Facebook Login for Business (Page token). A delete-media endpoint was announced 2025-12 (UNVERIFIED). |
+| Whop | Content Rewards: clippers post on their own accounts and submit the link in Whop ("Submit Video"); views verified via linked accounts (OAuth or a bio code); the owner approves in the dashboard; pay per 1,000 views until the budget ends. No Content Rewards API found; Whop's API has bounty submissions (needs a user credential) — whether campaigns use it is UNVERIFIED. |
+
+**Interfaces.** One `Publisher` per platform (in the service; `httpx`, no Google/Meta SDKs):
+```python
+class Publisher(Protocol):
+    platform: Platform
+    limits: PlatformLimits  # text lengths, max duration/size, default caps
+    async def start(self, auth: AccountAuth, video: VideoFile, meta: PostMetadata) -> Handle
+    async def upload(self, auth: AccountAuth, handle: Handle, video: VideoFile) -> Handle  # resumes
+    async def finish(self, auth: AccountAuth, handle: Handle) -> PostRef | Pending
+    async def recover(self, auth: AccountAuth, handle: Handle) -> Recovery  # Posted|InProgress|NotPosted|Unknown
+    async def status(self, auth: AccountAuth, ref: PostRef) -> PostStatus  # + visibility, reason
+    async def stats(self, auth: AccountAuth, refs: Sequence[PostRef]) -> dict[str, PostStats]
+    async def delete(self, auth: AccountAuth, ref: PostRef) -> bool  # False: no API, by hand
+    async def refresh(self, auth: AccountAuth) -> TokenSet
+```
+Errors: `Transient` (job retry, backoff), `RateLimited(until)`/`QuotaExceeded(until)` →
+`jobs.DeferJob`, `AuthExpired` (refresh once, then `needs_reauth`), `Refused(reason)` (permanent).
+`FakePlatform` (in memory; faults at every step: error before/after the post exists, crash between
+steps, 429, quota, slow processing, later removal) + **one contract test suite** every adapter passes
+(the fake directly, real ones on `httpx.MockTransport` with documented response shapes). `Submitter`:
+`ManualSubmitter` now (a `notify` "submit this link"); an API one only if Whop exposes campaigns.
+
+**Publish job** (ref = clip; one per account, `publish:{clip}:{account}`, enqueued by review's approve):
+1. Get or create the `publications` row (`scheduled`). Cancel (+ `notify(PUBLISH_CANCELLED)`) if
+   `clip_reviews.status` is no longer `approved` or the slot would be after `max_publish_delay_s`.
+2. **Slot** (below) in the future → `scheduled_for` + `DeferJob(slot)` (no attempt used).
+3. Lease `publish:publication:{id}` (renewed while uploading: a stale-requeued job can't run in
+   parallel); download the render's `clip.mp4`, check `renders.video_sha256`.
+4. `start()` → **the handle is stored (encrypted) and committed before the first byte** (YouTube
+   resumable session URI, TikTok `publish_id` + upload URL, Instagram container id); `uploading`.
+5. `upload()`, `finish()` → `platform_post_id`, `post_url`, `posted_at`, `processing` (Instagram: the
+   container is polled via `DeferJob(60 s)`, ≤ 5 min, then `media_publish`); enqueue `sync_publication`.
+6. **A retry with a handle** asks `recover()`: posted → store ids; in progress → continue; not posted
+   → new `start()`; **unknown** (handle expired, platform can't tell) → `unknown` +
+   `notify(PUBLICATION_UNKNOWN)`: the operator checks and answers in review ("posted: <url>" / "not
+   posted"), sent back as `publication_action`. Never a blind re-upload.
+
+**Never double-post** = unique `(clip_id, platform_account_id)` over rows not `failed`/`cancelled`/
+`deleted` + handle first + lease + `unknown`. `failed` = surely not posted; a retry makes a new row.
+
+**Scheduling** (ours; TikTok has no API scheduling, so one rule for all): the earliest time with the
+account `active`; < `daily_cap` posts in the last 24 h (defaults under platform caps: YouTube 10,
+TikTok 5, Instagram 10 per account); ≥ `min_gap_s` since its last post (default 20 min); inside its
+posting windows (UTC); YouTube: < 100 inserts by all accounts of the project since the last midnight
+PT (zoneinfo, stored UTC). Oldest approval first; one account per platform per clip by default.
+
+**Metadata.** `PostMetadata` = the plan's `title` + `hashtags` (§19) → review overrides
+(`clip_reviews.post_metadata`, §21) → route template, clamped per platform (YouTube title ≤ 100
+chars without `<>`, description ≤ 5000 bytes, tags ≤ 500 chars, `categoryId` 20,
+`selfDeclaredMadeForKids=false`; TikTok/Instagram caption ≤ 2200, IG ≤ 30 hashtags). **Credit is
+mandatory**: a template must contain `{channel_url}` ("🎮 {streamer} live on Twitch:
+https://twitch.tv/{login}"), checked when the route is added. Route rules add required hashtags/
+mentions and disclosure (TikTok `brand_content_toggle`; YouTube's paid-promotion flag via API:
+UNVERIFIED). `containsSyntheticMedia`/`is_aigc` false (real footage). What was sent is stored.
+
+**Status, stats, takedowns.** One `sync_publication` job per publication defers itself: every 30 s
+while `processing` (≤ 30 min, then `unknown`), then +15 min, 1 h, 3 h, 6 h, 12 h, 24 h, 48 h, daily to
+30 days, weekly to 90 days, then done. Each run stores visibility and a `publication_stats` row (views,
+likes, comments, shares; extras jsonb). **Rejected/removed** (YouTube `uploadStatus=rejected` +
+`rejectionReason`, a vanished post, TikTok `FAILED`) → status + reason, `notify(TAKEDOWN)` (review
+labels the clip), and the **account paused** until the operator resumes it (3 YouTube strikes end a
+channel). Content ID claims aren't in the Data API for non-partners (UNVERIFIED): reported in review.
+**Deletion** (`publication_action(delete)`, from withdraw): YouTube `videos.delete` (`youtube` scope);
+Instagram if its endpoint works; TikTok: a notice, the operator deletes by hand and confirms.
+
+**Tokens.** **AES-256-GCM** (`cryptography`) in `platform_accounts`, AAD = `platform_accounts:{id}:
+{field}` (no moving a ciphertext to another row), key-id prefix for rotation; keys in
+`CLIPPER_PUBLISHER_TOKEN_KEYS` (`.env` now, later a Docker secret file or the server's secret
+manager: only the key moves; Vault-style infra isn't worth it for one operator). Only the publisher
+decrypts; backups hold ciphertext; never logged. **Refresh** when < 5 min are left, under `SELECT …
+FOR UPDATE` (TikTok/Instagram rotate tokens; the new ones commit before use); a daily sweep for
+expiry < 7 days (IG 60 d, TikTok refresh 365 d: UNVERIFIED); `invalid_grant` → `needs_reauth` +
+`notify(NEEDS_REAUTH)`, posts defer. **Connect**: YouTube via loopback redirect
+(`http://127.0.0.1:<port>`); TikTok/Meta need a registered HTTPS redirect (the Tailscale HTTPS name,
+or paste the URL back).
+
+**Legal / ToS (brief).** Rights first (§2): **no route, no post**; each route records its basis
+(`streamer_account`, `campaign` + URL, `written_permission`); backfilled clips only if the user says
+so (§17). YouTube: one API project (extra projects to bypass quota break the ToS), more quota via the
+audit form; spam/repetitive content, "reused content" demonetisation. TikTok: the audit checks the
+posting UX (preview, privacy choice, consent, music confirmation, disclosure); unaudited = private
+only. Instagram: Platform Terms, app review for others' accounts. Campaigns: own accounts, no view
+botting; paid clips may need an ad disclosure (FTC/ASA). Stream music → Content ID.
+
+**Build plan.**
+1. **22a Contracts + migration 0008 + `jobs.DeferJob` + crypto + CLI** (fake platform). *Done:*
+   `test_migrations` passes; wrong AAD/key fails, rotation works; a deferred job keeps its attempts;
+   lifecycle maps publications (§19).
+2. **22b Pipeline on `FakePlatform`**: publish job, scheduler, recovery, sync + stats, actions, circuit
+   breaker, notices. *Done:* random fault sequences (crash/error at every step, then retries) never
+   give two posts; quota/429 defer; removal pauses the account; withdraw deletes.
+3. **22c YouTube adapter** (the user's Google project only for the smoke). *Done:* contract suite on
+   MockTransport; the user runs `clipper-publisher smoke` (one test clip, `private`, then deleted).
+4. **22d TikTok + Instagram + manual campaign submission** (after §2 and app approvals). *Done:*
+   contract suite passes for both; a live post → "submit" notice → `submitted` event in review.
+
+### Proposed decision-log rows
+
+| Date | Decision | Why |
+|---|---|---|
+| 2026-11-19 | One `Publisher` Protocol per platform (httpx, no SDKs), a `FakePlatform` with fault injection and one contract test suite for all adapters; YouTube first | platforms are the user's decision (§2); everything else is testable now |
+| 2026-11-19 | Never double-post: partial unique `(clip, account)`, the row before the upload, the platform handle committed before the first byte, a lease while uploading, `recover()` on retry, `unknown` goes to the operator | a crash between "posted" and "stored" must not cause a second post |
+| 2026-11-19 | OAuth tokens AES-256-GCM-encrypted in Postgres (AAD = row + field, key ids), key from env/secret file, only the publisher decrypts | backups and other services never see usable tokens; no extra infra for one operator |
+| 2026-11-19 | Accounts and routes are written only by the publisher (its CLI does OAuth connect and route setup) | one writer per table, like `clipper-channels` for the controller |
+| 2026-11-19 | Rights default deny: a channel is publishable only through a `publish_routes` row with a rights basis; credit to the streamer is mandatory in every template | §2: DMCA/strikes; campaigns require attribution |
+| 2026-11-19 | The publisher schedules itself (per-account caps, min gap, UTC windows, YouTube project quota until midnight PT) and waits with a generic `jobs.DeferJob` | TikTok has no API scheduling; waiting for a slot or quota must not burn retry attempts |
+| 2026-11-19 | Post text = plan title/hashtags → review overrides → route template, clamped per platform; what was sent is stored | one merge order; the judge suggests, the operator decides, the route enforces credit and rules |
+| 2026-11-19 | Status and stats from one self-deferring `sync_publication` job per publication on a decaying schedule; `publication_stats` from day one | one durable timer per post; views feed the analytics loop early |
+| 2026-11-19 | A platform rejection/removal pauses the account and labels the clip | repeated copyright hits end a channel (3 YouTube strikes) |
+| 2026-11-19 | Campaign submission is manual (Telegram task + `submitted` event) until Whop exposes Content Rewards via API | no submission API found |
+| 2026-11-19 | §3 update proposed: YouTube unverified projects no longer private-locked (videos.insert page, re-checked 2026-11-19); insert = 1 unit of a 100/day bucket; Instagram 100 (or 50) per 24 h via `content_publishing_limit`; TikTok 6 req/min per token, unaudited = private viewing and private accounts only | official docs re-checked 2026-11-19; §3 itself changes only when this is agreed |
+
+### Contract changes
+
+Migration **`0008_publisher`** (after `0007_review`; additive: four new tables; FKs to `channels`,
+`clips`, `renders`, `review_events`).
+
+**`contracts.py`**
+```python
+class JobKind(StrEnum):
+    ...
+    PUBLISH = "publish"  # ref_id = clips.id, dedupe part = account id; review enqueues on approve
+    SYNC_PUBLICATION = "sync_publication"  # ref_id = publications.id; publisher, self-deferring
+    PUBLICATION_ACTION = "publication_action"  # ref_id = publications.id; review enqueues
+
+class Platform(StrEnum):
+    YOUTUBE = "youtube"; TIKTOK = "tiktok"; INSTAGRAM = "instagram"
+    FAKE = "fake"  # tests only; the service enables it only when set explicitly
+
+class AccountStatus(StrEnum):
+    ACTIVE = "active"; PAUSED = "paused"; NEEDS_REAUTH = "needs_reauth"; DISABLED = "disabled"
+
+class PublicationStatus(StrEnum):
+    SCHEDULED = "scheduled"; UPLOADING = "uploading"; PROCESSING = "processing"; LIVE = "live"
+    UNKNOWN = "unknown"  # may or may not exist on the platform: the operator decides
+    FAILED = "failed"  # surely not posted
+    CANCELLED = "cancelled"; REJECTED = "rejected"; REMOVED = "removed"; DELETED = "deleted"
+
+class Visibility(StrEnum):
+    PUBLIC = "public"; UNLISTED = "unlisted"; LIMITED = "limited"; PRIVATE = "private"
+
+class RightsBasis(StrEnum):
+    STREAMER_ACCOUNT = "streamer_account"; CAMPAIGN = "campaign"
+    WRITTEN_PERMISSION = "written_permission"
+
+class PublicationActionKind(StrEnum):
+    DELETE = "delete"; MARK_POSTED = "mark_posted"; MARK_NOT_POSTED = "mark_not_posted"
+    RETRY = "retry"; CANCEL = "cancel"
+
+class NoticeKind(StrEnum):  # added to §21's enum
+    PUBLISH_FAILED = "publish_failed"; PUBLICATION_UNKNOWN = "publication_unknown"
+    TAKEDOWN = "takedown"; NEEDS_REAUTH = "needs_reauth"
+    SUBMIT_TO_CAMPAIGN = "submit_to_campaign"; PUBLISH_CANCELLED = "publish_cancelled"
+
+class RouteRules(StoredModel):  # publish_routes.rules; review reads review_window_s, max_age_s
+    review_window_s: int = 7200
+    max_age_s: int = 43200
+    max_publish_delay_s: int = 21600
+    required_hashtags: list[str] = []
+    required_mentions: list[str] = []
+    disclosure: Literal["none", "paid_partnership"] = "none"
+    submission: Literal["none", "manual"] = "none"
+    max_duration_s: float | None = None
+
+class PostTemplate(StoredModel):  # publish_routes.template; must contain {channel_url}
+    title: str = "{title}"
+    description: str = "{title}\n\n🎮 {streamer} live on Twitch: {channel_url}\n{hashtags}"
+    hashtags: list[str] = ["{login}", "twitch"]
+
+class PublishPayload(Payload):
+    clip_id: int
+    render_id: int  # clip_reviews.render_id at approve
+    platform_account_id: int
+    route_id: int
+    review_event_id: int
+    tiktok_privacy: str | None = None  # chosen by the operator at approve (TikTok audit UX)
+
+class SyncPublicationPayload(Payload):
+    publication_id: int
+
+class PublicationActionPayload(Payload):
+    publication_id: int
+    action: PublicationActionKind
+    review_event_id: int
+    post_url: str | None = None  # MARK_POSTED
+
+def publication_lease(publication_id: int) -> str:
+    return f"publish:publication:{publication_id}"
+```
+`publish` dedupe: `dedupe_key(PUBLISH, clip_id, account_id)`; a retry from review adds a part
+(`retry{n}`), since a `done` job with the same key never runs again.
+
+**`jobs.py`** (generic; any handler may use it)
+```python
+class DeferJob(Exception):
+    """Raised by a handler that must wait (a slot, a rate limit, a quota reset): the job goes back
+    to `queued` with `run_after = until` (UTC) and the attempt is not counted."""
+    def __init__(self, until: datetime, reason: str) -> None: ...
+
+async def defer(session: AsyncSession, job: ClaimedJob, until: datetime, reason: str) -> None:
+    """UPDATE jobs SET status='queued', run_after=:until, attempts=attempts-1, locked_by=NULL,
+    last_error=:reason, updated_at=now() WHERE id=:id"""
+```
+`JobRunner.run_once` catches `DeferJob` before `PermanentJobError` and logs "job deferred" with
+`until` and `reason`. The handler owns the overall limit (`max_publish_delay_s`).
+
+**`models.py`**
+- **`PlatformAccount`** (`platform_accounts`), writer: publisher. `id` bigint PK; `platform` text
+  (no CHECK: platforms grow); `external_id` text (channel id / open_id / IG user id); `handle` text;
+  `status` text default 'active' CHECK IN ('active','paused','needs_reauth','disabled');
+  `status_reason` text null; `scopes` jsonb default '[]'; `key_id` text null; `access_token_enc`,
+  `refresh_token_enc` bytea null; `access_expires_at`, `refresh_expires_at`, `refreshed_at`
+  timestamptz null; `capabilities` jsonb default '{}' (audited, privacy options, max duration);
+  `policy` jsonb default '{}' (`daily_cap`, `min_gap_s`, `windows_utc`); `created_at`, `updated_at`.
+  UNIQUE (`platform`, `external_id`).
+- **`PublishRoute`** (`publish_routes`), writer: publisher. `id` bigint PK; `channel_id` FK channels;
+  `platform_account_id` FK platform_accounts; `active`, `auto_select` bool default true;
+  `rights_basis` text CHECK IN ('streamer_account','campaign','written_permission'); `rights_ref`
+  text not null (campaign URL, permission note); `campaign_name`, `campaign_url` text null; `rules`
+  jsonb default '{}' (`RouteRules`); `template` jsonb default '{}' (`PostTemplate`); `created_at`,
+  `updated_at`. UNIQUE (`channel_id`, `platform_account_id`).
+- **`Publication`** (`publications`), writer: publisher. `id` bigint PK; `clip_id` FK clips;
+  `render_id` FK renders; `platform_account_id` FK; `route_id` FK publish_routes; `review_event_id`
+  FK review_events; `status` text default 'scheduled' CHECK IN ('scheduled','uploading',
+  'processing','live','unknown','failed','cancelled','rejected','removed','deleted'); `visibility`
+  text null; `scheduled_for` timestamptz; `handle_enc` bytea null (session URI / publish_id /
+  container id: a bearer capability, so encrypted); `handle_expires_at` null; `platform_post_id`,
+  `post_url` text null; `post_metadata` jsonb (what was sent); `render_sha256` text;
+  `upload_started_at`, `posted_at`, `live_at`, `ended_at`, `status_checked_at` timestamptz null;
+  `status_detail` jsonb default '{}'; `error` text null; `created_at`, `updated_at`.
+  UNIQUE INDEX `ux_publications_clip_account_active` (`clip_id`, `platform_account_id`) WHERE
+  `status NOT IN ('failed','cancelled','deleted')`; UNIQUE (`platform_account_id`,
+  `platform_post_id`); INDEX (`platform_account_id`, `posted_at`); INDEX (`status`, `scheduled_for`).
+- **`PublicationStat`** (`publication_stats`), writer: publisher. PK (`publication_id`, `ts`);
+  `views`, `likes`, `comments`, `shares` bigint null; `extra` jsonb default '{}' (watch time,
+  engaged views, saves).
+
+**`clipper_core.lifecycle`**: `lifecycle_state()` gains `publication_statuses` (mapping in §19).
+
+**Outside core**: controller `STALE_AFTER` += `PUBLISH: 30 min` (the lease protects a slow upload),
+`SYNC_PUBLICATION: 10 min`, `PUBLICATION_ACTION: 10 min`; `services/publisher` (deps `httpx`,
+`cryptography`; `PublisherSettings`, `CLIPPER_PUBLISHER_*`: `TOKEN_KEYS`, `YOUTUBE_CLIENT_ID/SECRET`,
+`TIKTOK_CLIENT_KEY/SECRET`, `META_APP_ID/SECRET`, `INSTAGRAM_LOGIN=facebook|instagram`), compose
+`publisher` (no ports).
+
+**Sources checked 2026-11-19:** YouTube [quota costs](https://developers.google.com/youtube/v3/determine_quota_cost),
+[videos.insert](https://developers.google.com/youtube/v3/docs/videos/insert),
+[OAuth 2.0 (Testing → 7-day tokens)](https://developers.google.com/identity/protocols/oauth2);
+TikTok [Direct Post](https://developers.tiktok.com/doc/content-posting-api-reference-direct-post),
+[post status](https://developers.tiktok.com/doc/content-posting-api-reference-get-video-status);
+Meta [Content Publishing](https://developers.facebook.com/docs/instagram-platform/content-publishing/),
+[API updates 2025-12-03](https://developers.facebook.com/blog/post/2025/12/03/instragram-api-updates/);
+Telegram [Bot FAQ (limits, 50 MB upload)](https://core.telegram.org/bots/faq);
+Whop [Content Rewards](https://docs.whop.com/memberships-and-access/third-party-apps/content-rewards),
+[Content Rewards FAQ](https://contentrewards.com/faqs),
+[bounty program API](https://docs.whop.com/developer/bounties/run-a-bounty-program).
+
+### Decisions and credentials needed from the user (§19–§22)
+
+- **Rights model (§2)**: which channels may be clipped and published, on which platforms and
+  accounts; per route the rights basis, campaign, rules, template and caps; whether backfilled clips
+  (§17) may be published.
+- **Judge model**: provider + model, picked from `clipper-judge eval` numbers (approve the eval spend),
+  and its API key.
+- **Judge budgets**: USD per stream-hour and per day (e.g. $0.50 / $10); judge audio_only channels or
+  switch them to `full` (audio_only can't be rendered in v1).
+- **Taste**: titles, clip lengths (default 10–60 s), caption style presets; sign off 5 real renders.
+- **Layouts**: facecam rects per channel in `layouts.toml` (ohnepixel first, via `layout-preview`).
+- **Licensed SFX/music library** with licence proof per asset (nothing ships without it).
+- **Retention**: discarded clips 7 days, pinned video of published clips 30 days.
+- **Review**: Telegram bot token (@BotFather `/newbot`, `/setjoingroups` off), your numeric user
+  id(s) and chat id; web password; Tailscale on PC + phone (optional); review window and max age per
+  campaign; quiet hours.
+- **YouTube**: Google Cloud project, Data API v3, OAuth client (Desktop), consent screen "In
+  production", scopes `youtube.upload` + `youtube.readonly` (+ `youtube` to delete); run the smoke.
+- **TikTok**: developer app (Login Kit + Content Posting API), redirect URI, client key/secret, the
+  audit. **Instagram**: professional account (+ Facebook Page for local-file upload), Meta app
+  id/secret, app review beyond accounts with a role on the app.
+- **Whop**: account and the campaigns to join (submission stays manual).
