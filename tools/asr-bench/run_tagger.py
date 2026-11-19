@@ -72,8 +72,9 @@ def load(name: str):
             for k, v in inputs.items()
         }
         with torch.inference_mode():
-            logits = model(**inputs).logits.float()
-        return torch.sigmoid(logits).cpu().numpy()
+            out = model(**inputs).logits.float()
+        # CED's model code already ends in a sigmoid (its "logits" are probabilities); AST's don't.
+        return (out if name == "ced" else torch.sigmoid(out)).cpu().numpy()
 
     return scores, labels
 
