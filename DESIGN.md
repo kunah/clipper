@@ -292,6 +292,7 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-19 | Speech model: **Whisper large-v3-turbo** via faster-whisper (float16, beam 5, built-in VAD, word timestamps), "for now" | benchmark (§16): fast enough (49× realtime, ~1.2 GPU-h/day for 60 h audio), least GPU memory (2.3 GB), no made-up text on music/silence, most central transcript of the 5 candidates, word timing close to the others, light runtime (no torch/NeMo); Parakeet is 4× faster but transcribes song lyrics and needs NeMo; Qwen3-ASR too slow on the 4060 |
 | 2026-11-19 | Sound classifier: CED-base (`mispeech/ced-base`), **provisional, not yet confirmed by the user** | 666× realtime, 0.5 GB, works on 2 s windows (per-second resolution); AST needs 10 s windows. Neither could be judged for accuracy: the sample had little laughter/screaming |
 | 2026-11-19 | Voice-activity gate: Silero VAD v6.2 run by onnxruntime on the CPU (pinned model URL + sha256), numpy port of `get_speech_timestamps`; no torch in the transcriber for it | gate is model-independent (§16 step 4); ~185× realtime on one CPU thread; onnxruntime is small, torch would be ~GBs |
+| 2026-11-19 | Transcriber runtime (4b-3): faster-whisper's `vad_filter` **off**; **sequential** decoding of the gated stretches; model libraries as **optional extras** of clipper-transcriber (`whisper`, `ced`; only the CUDA image installs them); CED on the **CPU build of torch** | measured on the 20 benchmark chunks: `vad_filter` gave identical words and was 3 % slower (our Silero gate already runs in front); the batched pipeline was 1.2× faster but changed 1–2 % of the words; extras keep the dev env and tests free of torch/CUDA; the CPU build keeps the image ~5 GB smaller (CED speed is open, §16) |
 
 ## 16. Transcriber design (step 4)
 
@@ -314,7 +315,8 @@ On the 12 minutes with speech, average disagreement with the other models was 6.
 (turbo the most central); word start times agreed within 60–90 ms (large-v3: 130–170 ms).
 Sound classifiers: CED-base 666× realtime, 0.5 GB, 2 s windows; AST 92×, 1.4 GB, needs 10 s windows.
 Implementation notes: pass 16 kHz float32 arrays to faster-whisper (its PyAV file reading breaks
-with current PyAV); `language="en"`, `beam_size=5`, `word_timestamps=True`, `vad_filter=True`,
+with current PyAV); `language="en"`, `beam_size=5`, `word_timestamps=True`, `vad_filter=True`
+(the benchmark's setting; the service runs it off behind its own Silero gate, see 4b-3 below),
 `condition_on_previous_text=False`; faster-whisper's Silero VAD
 (`faster_whisper.vad.get_speech_timestamps`) can also give the speech fraction per second. CED's
 Hub model code already applies the sigmoid (its "logits" are probabilities). CUDA base image that
@@ -463,9 +465,78 @@ Details decided while building it (step 4b-2, job handler `clipper_transcriber.h
   `jobs.PermanentJobError`: the job fails at once (a broken file never decodes), coverage keeps
   showing the chunk as untranscribed. Both audio downloads finish before the temp dir goes.
 - **Engines by name** (`SPEECH_ENGINES`, `SOUND_TAGGERS` in `service.py`); "fake" only when set
-  explicitly, no default engine yet. Heartbeat `info`: `models` (speech, tagger, vad), `device`,
+  explicitly (defaults since 4b-3: "whisper" + "ced"). Heartbeat `info`: `models` (speech, tagger, vad), `device`,
   `realtime_factor`, `jobs_done`, `jobs_failed` (failed attempts), `current_chunk`, `queue`
   (queued transcribe jobs by priority, keys are the priority as text).
+
+Details decided while building it (step 4b-3, model adapters, image, compose):
+- **Adapters** `whisper.WhisperEngine` ("whisper") and `ced.CedTagger` ("ced") are the defaults of
+  `CLIPPER_TRANSCRIBER_ENGINE` / `_TAGGER` ("none" turns sound classes off). Their libraries are
+  **optional extras** of clipper-transcriber, imported only when the adapter is built: `whisper` =
+  faster-whisper 1.2.1, ctranslate2 4.9.0 (as benchmarked), nvidia-ml-py; `ced` = torch 2.15.0 and
+  torchaudio 2.11.0 from the **PyTorch CPU index** (explicit `[[tool.uv.index]]`; the CUDA build
+  adds ~5 GB, PyPI's torchaudio loads `libcudart.so.13` at import) + transformers 5.23.0.
+  `uv sync --all-packages` leaves them out (dev env and tests need no torch/CUDA; adapter tests
+  fake the libraries). A missing extra raises `engines.MissingDependency`; the entry logs it and
+  exits 1.
+- **Whisper**: loaded once at start plus a 1 s warm-up decode (a broken CUDA setup fails at start,
+  not on the first job); calls serialised; float32 arrays in; word probability → confidence,
+  segments keep avg_logprob / no_speech_prob / compression_ratio. **Revision pinned** to the
+  benchmarked commit (`WHISPER_REVISIONS`, setting `whisper_revision`); the stored model id carries
+  it: `faster-whisper/large-v3-turbo@0a363e9`. **`whisper_vad_filter` off**: on the 20 benchmark chunks (as 5
+  contiguous streams) faster-whisper's own VAD behind our Silero gate gave identical words (1747)
+  and segments and was 3 % slower (speech 40.7 s vs 39.3 s). **Sequential** `transcribe_many`:
+  `BatchedInferencePipeline` (stretches as `clip_timestamps`, timestamps on) was only 1.2× faster,
+  changed 1–2 % of the words and drops the temperature fallback.
+- **GPU out of memory** (a game holding the VRAM): an engine call that fails with a CUDA
+  allocation error is retried in-process after 30, 60, 120, 240, 150 s (`gpu_oom_wait_s` = 10 min
+  in all; warnings with the GPU's memory), then the job attempt fails. Shutdown ends the wait at
+  once (`Engines.request_stop`). The job lock (15 min sweeper) outlasts the wait.
+- **CED**: Hub revision pinned (its code runs with `trust_remote_code`), 2 s windows every second,
+  per-second max over windows, group max over labels, the model's own sigmoid kept. CPU by default
+  (`tagger_device`), `tagger_threads` = 2 (set on every call: with OpenMP the thread count belongs to
+  the calling thread), float16 when on CUDA (needs a CUDA torch, not in the image: `load` refuses
+  `tagger_device=cuda` with a CPU-only torch). Its config takes the label names from
+  `topel/ConvNeXt-Tiny-AT` on `main`, which the pin doesn't cover and the remote code can't pin, so
+  `load` checks 527 labels with the 23 group labels at their AudioSet indices (`AUDIOSET_INDEX`)
+  and refuses the model otherwise. **CPU speed:
+  24× realtime on 2 threads** (13× on 1, 34× on 4, 50× on 8) — below the 30× aimed for: ~2.4 s per
+  60 s chunk, more than Whisper's ~2 s. Not yet decided (CED is provisional anyway): more threads,
+  the repo's `model.onnx` on onnxruntime, a smaller CED, or the tagger running alongside the speech
+  engine.
+- **Speed in the pipeline**: speech 31× realtime on window audio, slower than the benchmark's 49×
+  because every gated stretch costs a full 30 s Whisper window (79 stretches in 20 min); overall
+  13× with the tagger (VAD 4.6 s + speech 39 s + tagger 49 s for 1223 s of window audio). GPU: models
+  take 2.2 GB (heartbeat `gpu`: device-wide used/total MB and utilisation via NVML, plus
+  `tagger_device`; start log `gpu_memory_for_models_mb`).
+- **Logging**: every line is JSON. `faster_whisper` and `httpx2` (the hub's HTTP client) log at
+  WARNING by default (core `DEFAULT_LEVELS`; one INFO line per call/request); transformers and
+  huggingface_hub log through our handler (their own stderr handlers removed, no progress bars,
+  `HF_HUB_DISABLE_PROGRESS_BARS=1`); the image has no NVIDIA entrypoint banner (`ENTRYPOINT []`).
+- **Image** `services/transcriber/Dockerfile`: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` (as the
+  bench image, layers shared), uv 0.13.9, Python 3.12.15 via uv, ffmpeg + tzdata (psycopg's time
+  zone lookup) via apt. Layers from slowest- to fastest-changing: apt, Silero, Python, the
+  third-party venv (a `deps` stage syncs `--no-install-workspace` from the pyproject files + lock
+  only), then the workspace packages with uv and only their sources bind-mounted (a code change adds
+  ~1 MB instead of 1.7 GB; other repo changes rebuild nothing). **Silero baked in** by `ADD
+  --checksum=sha256:…` (`/opt/silero_vad.onnx`, `CLIPPER_TRANSCRIBER_VAD_MODEL_PATH`; a test keeps
+  URL + hash equal to `vad.py`'s pin): no GitHub access at runtime. `HF_HOME=/models/hf`. Size 10.3 GB as Docker counts it (7.3 GB shared
+  with asr-bench, 3.0 GB unique; CUDA base ~4.5 GB unpacked). A read-only models volume needs
+  `HF_MODULES_CACHE` on a writable path (transformers copies CED's Hub code there).
+- **Compose** `transcriber`: profile `gpu` (a bare `docker compose up -d` leaves it out;
+  `docker compose up -d transcriber` enables it by name), `x-app-env`, `CLIPPER_WORKER_ID:
+  transcriber-1`, GPU reservation (nvidia, 1, `[gpu]`), `models` volume at `/models`, after
+  `migrate`, `restart: unless-stopped`, 30 s stop grace (the job in progress finishes). **Cold
+  start** (checked on an empty volume, online): the first start downloads ~1.8 GB (turbo at the
+  pinned commit, CED, the label CSV) and writes CED's code to `/models/hf/modules`; the first jobs
+  then ran as usual. Unauthenticated Hub requests only log a warning (set `HF_TOKEN` for higher rate
+  limits).
+- **End-to-end check** (throwaway DB + bucket, the bench image's weights mounted read-only and
+  offline): 20/20 jobs done in one attempt; coverage complete; owned ranges tile; 8 takeovers
+  (0.8–7.4 s lead-in), no duplicate or lost words at the boundaries; 180 segments (none > 30 s, none
+  overlapping), provisional tails only at stream ends; 240 metric rows per 4-minute stream
+  (speech_ratio 0.0 and `music` top class on the music-only channel); words agree 93.7 % per chunk
+  (87–96 % per stream) with the benchmark's turbo output of the same chunks.
 
 **Contract changes (libs/core, additive migration 0002):**
 - `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable),
@@ -480,8 +551,8 @@ Details decided while building it (step 4b-2, job handler `clipper_transcriber.h
 - new module `transcripts` with `words()` and `coverage()`.
 
 **Engine interfaces** (in the service): `SpeechEngine.transcribe(pcm) -> words + segments` and
-`SoundTagger.classify(pcm) -> per-second group scores`. Real adapters (and the CUDA Dockerfile)
-are added once the benchmark has picked the models; a fake engine drives the tests.
+`SoundTagger.classify(pcm) -> per-second group scores`. Real adapters: faster-whisper and CED
+(step 4b-3, above); fake engines drive the tests.
 
 **Edge cases.** Out-of-order processing (N+1 bumped and done before N): N+1 starts at its own
 start; N then keeps no provisional tail (possible small glitch at that one boundary). Gap or

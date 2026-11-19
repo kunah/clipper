@@ -698,6 +698,9 @@ class TranscribeHandler:
             audio_s=timings.audio_s,
             speech_input_s=timings.speech_input_s,
             processing_s=timings.total_s,
+            vad_s=timings.vad_s,
+            speech_s=timings.speech_s,
+            tagger_s=timings.tagger_s,
             realtime_factor=round(rtf, 1) if rtf is not None else None,
             fetch_decode_s=round(audio_s, 3),
         )

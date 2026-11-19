@@ -2,15 +2,22 @@
 
 Engines are synchronous and blocking (GPU/CPU work); the pipeline runs them in a worker thread.
 They get 16 kHz mono float32 PCM (`audio.Pcm`) and return times in seconds relative to the
-start of the array they were given. Adapters for real models (faster-whisper, Parakeet,
-Qwen3-ASR, AST, CED, ...) implement these protocols; `fakes` has deterministic test engines.
+start of the array they were given. Adapters for real models implement these protocols
+(`whisper.WhisperEngine`, `ced.CedTagger`; their libraries are optional extras of the package,
+imported only when the adapter is built); `fakes` has deterministic test engines.
 """
 
 from __future__ import annotations
 
+import contextlib
+import importlib
+import logging
+import sys
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -18,6 +25,45 @@ import numpy.typing as npt
 
 from clipper_core.contracts import SoundGroup
 from clipper_transcriber.audio import SAMPLE_RATE, Pcm
+
+
+class MissingDependency(ImportError):
+    """An adapter's library is not installed (the package extra is missing)."""
+
+
+def require(module: str, extra: str) -> ModuleType:
+    """Import an adapter's optional library, or raise MissingDependency naming the extra."""
+    try:
+        return importlib.import_module(module)
+    except ImportError as exc:
+        raise MissingDependency(
+            f"{module} is not installed: install clipper-transcriber with the {extra!r} extra"
+            f" (uv sync --package clipper-transcriber --extra {extra}): {exc}"
+        ) from exc
+
+
+def route_hf_logging() -> None:
+    """Let huggingface_hub and transformers log through the root logger (our JSON handler)
+    instead of their own stderr handlers, without progress bars. Call after importing them."""
+    # The hub imports its logging module lazily, and that adds a stderr handler on import: load
+    # it now, so the handler is there to be removed.
+    with contextlib.suppress(ImportError):
+        importlib.import_module("huggingface_hub.utils.logging")
+    for name in ("huggingface_hub", "transformers"):
+        logger = logging.getLogger(name)
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        logger.propagate = True
+    tf_logging = getattr(getattr(sys.modules.get("transformers"), "utils", None), "logging", None)
+    if tf_logging is not None:
+        tf_logging.disable_default_handler()
+        tf_logging.enable_propagation()
+        tf_logging.disable_progress_bar()
+    hub = sys.modules.get("huggingface_hub")
+    disable = getattr(getattr(hub, "utils", None), "disable_progress_bars", None)
+    if disable is not None:
+        disable()
+
 
 # --------------------------------------------------------------------------- speech
 
@@ -199,3 +245,11 @@ class Engines:
     speech: SpeechEngine
     vad: VoiceActivityDetector
     tagger: SoundTagger | None = None
+
+    def request_stop(self) -> None:
+        """Shutdown: engines waiting out a full GPU (`gpu.retry_on_oom`) stop waiting. Engines
+        that can wait have a `stopping` threading.Event."""
+        for engine in (self.speech, self.vad, self.tagger):
+            event = getattr(engine, "stopping", None)
+            if isinstance(event, threading.Event):
+                event.set()

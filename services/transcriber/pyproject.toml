@@ -9,11 +9,37 @@ dependencies = [
     "onnxruntime==1.31.1",
 ]
 
+# Real model adapters (the CUDA image installs both: --extra whisper --extra ced). A plain
+# `uv sync --all-packages` leaves them out, so the dev env and the tests need no torch/CUDA.
+[project.optional-dependencies]
+# Speech: Whisper via faster-whisper (CTranslate2 on CUDA 12 + cuDNN 9, from the base image).
+# Versions as in tools/asr-bench. nvidia-ml-py: GPU memory/utilisation in the heartbeat.
+whisper = [
+    "faster-whisper==1.2.1",
+    "ctranslate2==4.9.0",
+    "nvidia-ml-py==13.615.71",
+]
+# Sound classes: CED-base (transformers + the model's Hub code, which needs torchaudio). torch
+# and torchaudio from the PyTorch CPU index: the CUDA builds add ~5 GB to the image (PyPI's
+# torchaudio wheel loads libcudart.so.13 at import, so it can't pair with the CPU torch).
+ced = [
+    "torch==2.15.0",
+    "torchaudio==2.11.0",
+    "transformers==5.23.0",
+]
+
 [project.scripts]
 clipper-transcriber = "clipper_transcriber.main:main"
 
 [tool.uv.sources]
 clipper-core = { workspace = true }
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

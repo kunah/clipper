@@ -17,6 +17,8 @@ from clipper_core.db import create_engine, session_factory
 from clipper_core.logs import get_logger, setup_logging
 from clipper_core.runtime import run, stop_event_on_signals
 from clipper_core.storage import ObjectStore
+from clipper_transcriber.engines import MissingDependency
+from clipper_transcriber.gpu import gpu_status
 from clipper_transcriber.service import (
     SERVICE,
     SOUND_TAGGERS,
@@ -56,7 +58,20 @@ async def amain() -> int:
         return 1
     stop = stop_event_on_signals()
 
-    engines = await asyncio.to_thread(build_engines, ts)
+    gpu_before = gpu_status()
+    try:
+        engines = await asyncio.to_thread(build_engines, ts)
+    except MissingDependency as exc:
+        log.error(
+            "engine libraries not installed",
+            engine=ts.engine,
+            tagger=ts.tagger,
+            error=str(exc),
+            hint="natively (no extras) set CLIPPER_TRANSCRIBER_ENGINE=fake and"
+            " CLIPPER_TRANSCRIBER_TAGGER=none; the CUDA image has the real engines",
+        )
+        return 1
+    gpu_after = gpu_status()
     db = create_engine(settings)
     store = ObjectStore(settings)
     await asyncio.to_thread(store.ensure_bucket)
@@ -74,6 +89,12 @@ async def amain() -> int:
         vad=engines.vad.name,
         tagger=engines.tagger.name if engines.tagger is not None else None,
         device=engine_device(engines),
+        gpu=gpu_after,
+        gpu_memory_for_models_mb=(
+            gpu_after["memory_used_mb"] - gpu_before["memory_used_mb"]
+            if gpu_before and gpu_after
+            else None
+        ),
     )
     try:
         await service.run(stop)

@@ -20,6 +20,11 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   and the `clipper-channels` CLI. `services/chat-ingest/`: chat logger + per-second stats.
   `services/recorder/`: HLS -> chunks (local spool -> S3), gaps, transcription jobs; needs
   ffmpeg on PATH when run natively (`CLIPPER_RECORDER_*` settings).
+  `services/transcriber/`: GPU worker for `transcribe` jobs (Silero VAD gate -> faster-whisper
+  large-v3-turbo -> sentences + provisional tails, CED sound classes -> per-second audio metrics;
+  `CLIPPER_TRANSCRIBER_*`). The real model libraries are optional extras (`whisper`, `ced`) that
+  only the CUDA image installs; natively the service needs `CLIPPER_TRANSCRIBER_ENGINE=fake` and
+  `CLIPPER_TRANSCRIBER_TAGGER=none` (or `fake`) set explicitly, and tests use the fakes.
 - `tools/`: CLIs like backfill (later).
 - `compose.yaml`: Postgres 18 + pgvector, SeaweedFS (S3), migrate, and services.
 
@@ -34,6 +39,8 @@ uv run ruff check . --fix && uv run ruff format .
 uv run alembic -c db/alembic.ini revision -m "add x"   # then write the migration by hand
 uv run clipper-channels add xqc --mode audio_only      # list | mode <login> <mode> | enable | disable
 docker compose up -d --build controller chat-ingest recorder
+docker compose up -d --build transcriber    # GPU (profile gpu, enabled by naming it); first start
+                                            # downloads ~2 GB of weights into the `models` volume
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).
@@ -66,5 +73,7 @@ uv was installed with winget; in an old shell it may not be on PATH yet (restart
 - PowerShell 5.1 `Set-Content -Encoding utf8` writes a BOM that breaks TOML. Use the
   Edit/Write tools or bash for file edits.
 - Docker's disk image is on `E:\DockerDesktopWSL` (moved off the slow D: HDD on 2026-11-19). GPU works
-  in containers (RTX 4060).
+  in containers (RTX 4060). The transcriber image is ~10 GB as Docker counts it (7.3 GB of CUDA base
+  layers shared with the asr-bench image). Its torch is the CPU build (CUDA torch would add ~5 GB);
+  CED speed is an open item (DESIGN §16).
 - MinIO is not an option (no community images since Oct 2025); object storage is SeaweedFS.

@@ -6,8 +6,9 @@
     await service.run(stop)                             # until `stop`; finishes the current job
 
 Engines are picked by name from `SPEECH_ENGINES` / `SOUND_TAGGERS` (`CLIPPER_TRANSCRIBER_ENGINE`,
-`CLIPPER_TRANSCRIBER_TAGGER`). Real adapters register themselves there; "fake" (the sine-tone
-test engine) is only used when configured explicitly.
+`CLIPPER_TRANSCRIBER_TAGGER`): "whisper" (default) and "ced" (default) are the real adapters,
+whose libraries are the package's optional extras (`engines.MissingDependency` without them);
+"fake" (the sine-tone test engines) is only used when configured explicitly.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from clipper_core.jobs import JobRunner
 from clipper_core.logs import get_logger
 from clipper_core.timeline import utc_now
 from clipper_transcriber.engines import Engines, SoundTagger, SpeechEngine, VoiceActivityDetector
+from clipper_transcriber.gpu import gpu_status
 from clipper_transcriber.handler import JobStats, Store, TranscribeHandler
 from clipper_transcriber.settings import TranscriberSettings
 from clipper_transcriber.vad import EnergyVad, SileroVad
@@ -50,18 +52,35 @@ def _fake_tagger(settings: TranscriberSettings) -> SoundTagger:
     return FakeSoundTagger()
 
 
+def _whisper(settings: TranscriberSettings) -> SpeechEngine:
+    from clipper_transcriber.whisper import WhisperEngine
+
+    return WhisperEngine.load(settings.whisper_options())
+
+
+def _ced(settings: TranscriberSettings) -> SoundTagger:
+    from clipper_transcriber.ced import CedTagger
+
+    return CedTagger.load(
+        device=settings.tagger_device,
+        threads=settings.tagger_threads,
+        batch_size=settings.tagger_batch_size,
+        oom_wait_s=settings.gpu_oom_wait_s,
+    )
+
+
 # Speech engine adapters by `CLIPPER_TRANSCRIBER_ENGINE`. A factory builds the engine and loads
 # its model (blocking; called once at start in a worker thread).
 SPEECH_ENGINES: dict[str, Callable[[TranscriberSettings], SpeechEngine]] = {
+    "whisper": _whisper,  # faster-whisper large-v3-turbo on CUDA (extra "whisper")
     "fake": _fake_speech,  # sine-tone "speech" for tests; never a default
-    # "whisper": faster-whisper large-v3-turbo on CUDA (step 4b-3, the real adapter)
 }
 
 # Sound taggers by `CLIPPER_TRANSCRIBER_TAGGER`; "none" = no `classes` in audio_metrics_1s.
 SOUND_TAGGERS: dict[str, Callable[[TranscriberSettings], SoundTagger | None]] = {
+    "ced": _ced,  # CED-base AudioSet tagger, CPU by default (extra "ced"); provisional
     "none": lambda settings: None,
     "fake": _fake_tagger,  # loudness-based scores for tests
-    # "ced": CED-base AudioSet tagger (with the real adapters)
 }
 
 
@@ -153,12 +172,20 @@ class TranscriberService:
         beats = asyncio.create_task(
             self._every(stop, self.settings.heartbeat_interval_s, self.beat), name="heartbeat"
         )
+        stopper = asyncio.create_task(self._stop_engines_on(stop), name="stop-engines")
         try:
             await self.runner.run(stop)
         finally:
-            beats.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await beats
+            for task in (beats, stopper):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def _stop_engines_on(self, stop: asyncio.Event) -> None:
+        """On shutdown, an engine waiting for GPU memory gives up at once (its job attempt
+        fails and is retried later) instead of holding the stop for minutes."""
+        await stop.wait()
+        self.engines.request_stop()
 
     def info(self, queue: Mapping[str, int]) -> dict[str, Any]:
         tagger = self.engines.tagger
@@ -170,6 +197,8 @@ class TranscriberService:
                 "vad": self.engines.vad.name,
             },
             "device": self.device,
+            "tagger_device": getattr(tagger, "device", None) if tagger is not None else None,
+            "gpu": gpu_status() if self.device.startswith("cuda") else None,
             "realtime_factor": round(rtf, 1) if rtf is not None else None,
             "jobs_done": self.stats.done,
             "jobs_failed": self.stats.failed,

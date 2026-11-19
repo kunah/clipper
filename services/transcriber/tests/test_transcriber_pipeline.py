@@ -218,8 +218,10 @@ def test_window_and_config_validation():
 
 
 def test_settings_are_validated_and_build_the_configs():
+    defaults = TranscriberSettings(_env_file=None)
+    assert (defaults.engine, defaults.tagger, defaults.tagger_device) == ("whisper", "ced", "cpu")
     with pytest.raises(ValidationError, match="engine"):
-        TranscriberSettings(_env_file=None)  # no default engine (yet)
+        TranscriberSettings(_env_file=None, engine="")
     settings = TranscriberSettings(_env_file=None, engine="fake", gate_max_s=20, tail_margin_s=0.7)
     assert settings.pipeline_config() == PipelineConfig(gate_max_s=20, tail_margin_s=0.7)
     assert settings.vad_params().max_speech_s == pytest.approx(19.6)

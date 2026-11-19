@@ -3,6 +3,7 @@ stats, and the engine registry. No database, no object storage."""
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -271,7 +272,7 @@ def test_engine_registry():
     assert engine_device(engines) == "cpu"
     no_tagger = build_engines(settings.model_copy(update={"tagger": "none"}))
     assert no_tagger.tagger is None
-    with pytest.raises(ValueError, match=r"unknown speech engine 'nope' \(known: fake\)"):
+    with pytest.raises(ValueError, match=r"unknown speech engine 'nope' \(known: fake, whisper\)"):
         build_engines(settings.model_copy(update={"engine": "nope"}))
     with pytest.raises(ValueError, match="unknown sound tagger"):
         build_engines(settings.model_copy(update={"tagger": "nope"}))
@@ -279,7 +280,7 @@ def test_engine_registry():
 
 def test_silero_is_loaded_at_build_time(silero_model):
     settings = TranscriberSettings(
-        engine="fake", vad="silero", vad_model_path=silero_model, _env_file=None
+        engine="fake", tagger="none", vad="silero", vad_model_path=silero_model, _env_file=None
     )
     engines = build_engines(settings)
     assert engines.vad.name.startswith("silero-vad") and engines.vad._session is not None
@@ -288,10 +289,11 @@ def test_silero_is_loaded_at_build_time(silero_model):
 @pytest.mark.parametrize(
     ("env", "message"),
     [
-        ({}, "invalid transcriber settings (CLIPPER_TRANSCRIBER_*)"),
-        ({"CLIPPER_TRANSCRIBER_ENGINE": "whisper"}, "unknown engine"),
+        ({"CLIPPER_TRANSCRIBER_ENGINE": ""}, "invalid transcriber settings"),
+        ({"CLIPPER_TRANSCRIBER_ENGINE": "nope"}, "unknown engine"),
         ({"CLIPPER_TRANSCRIBER_ENGINE": "fake", "CLIPPER_TRANSCRIBER_TAGGER": "x"}, "unknown"),
         ({"CLIPPER_TRANSCRIBER_ENGINE": "fake", "CLIPPER_TRANSCRIBER_FFMPEG": "nope"}, "ffmpeg"),
+        ({}, "engine libraries not installed"),  # defaults: whisper + ced, extras missing
     ],
 )
 async def test_entry_point_refuses_to_start_without_a_usable_config(
@@ -300,6 +302,8 @@ async def test_entry_point_refuses_to_start_without_a_usable_config(
     from clipper_transcriber import main
 
     monkeypatch.chdir(tmp_path)  # no .env
+    for module in ("faster_whisper", "torch", "transformers"):
+        monkeypatch.setitem(sys.modules, module, None)  # as on the dev env: extras not installed
     for name in ("ENGINE", "TAGGER", "FFMPEG"):
         monkeypatch.delenv(f"CLIPPER_TRANSCRIBER_{name}", raising=False)
     for name, value in env.items():

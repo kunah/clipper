@@ -44,8 +44,11 @@ DEFAULT_LEVELS = {
     "asyncio": "WARNING",
     "boto3": "WARNING",
     "botocore": "WARNING",
+    "faster_whisper": "WARNING",  # one INFO line per transcribe call
     "httpcore": "WARNING",
+    "httpcore2": "WARNING",
     "httpx": "WARNING",
+    "httpx2": "WARNING",  # huggingface_hub's client: one INFO line per request
     "s3transfer": "WARNING",
     "sqlalchemy.engine": "WARNING",
     "urllib3": "WARNING",

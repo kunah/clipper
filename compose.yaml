@@ -1,7 +1,8 @@
 # Clipper stack. Every service is its own app + image (see services/*/Dockerfile).
 # Infra ports are bound to 127.0.0.1 only, so nothing is exposed to the network.
 #
-#   docker compose up -d            # postgres + object storage + migrate (and services later)
+#   docker compose up -d            # postgres + object storage + migrate + CPU services
+#   docker compose up -d transcriber   # the GPU worker (profile `gpu`; naming it enables it)
 #   docker compose logs -f migrate
 #
 # Data lives in named volumes inside Docker's disk image (on E: on this PC).
@@ -116,7 +117,37 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s   # close open chunks and upload them
 
+  # GPU worker: transcribes chunks (faster-whisper large-v3-turbo on CUDA, CED sound classes on
+  # the CPU, Silero VAD baked into the image). Model weights (~2 GB) are downloaded into the
+  # `models` volume on first start. One per GPU; SIGTERM finishes the job in progress.
+  # Profile `gpu`: a bare `docker compose up -d` leaves it out; start it by name (see the header).
+  transcriber:
+    profiles: [gpu]
+    build:
+      context: .
+      dockerfile: services/transcriber/Dockerfile
+    image: clipper/transcriber:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: transcriber
+      CLIPPER_WORKER_ID: transcriber-1   # stable id: one heartbeat row across restarts
+    volumes:
+      - models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
 volumes:
   pgdata:
   objectdata:
   spool:
+  models:

@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from clipper_core.contracts import CHUNK_JITTER
 from clipper_transcriber.pipeline import PipelineConfig
 from clipper_transcriber.vad import VadParams
+from clipper_transcriber.whisper import WhisperOptions
 
 
 class TranscriberSettings(BaseSettings):
@@ -18,11 +19,31 @@ class TranscriberSettings(BaseSettings):
         env_prefix="CLIPPER_TRANSCRIBER_", env_file=".env", extra="ignore"
     )
 
-    # Engines. Required until the real adapter exists (then it becomes the default); "fake"
-    # (the test engine) only when set explicitly.
-    engine: str = Field(min_length=1)  # speech engine adapter
-    tagger: str = "none"  # sound tagger adapter; "none" = no `classes` in audio_metrics_1s
-    models_dir: Path = Path("data/models")  # model cache (a volume in Docker), incl. the VAD
+    # Engines (registries in service.py). The defaults need the package extras (the CUDA image
+    # has them); natively set ENGINE=fake and TAGGER=none (or fake), the test engines.
+    engine: str = Field(default="whisper", min_length=1)  # speech engine adapter
+    tagger: str = "ced"  # sound tagger adapter; "none" = no `classes` in audio_metrics_1s
+    models_dir: Path = Path("data/models")  # VAD model dir (HF weights: HF_HOME)
+
+    # Speech engine "whisper" (faster-whisper; DESIGN.md §16).
+    whisper_model: str = "large-v3-turbo"
+    # Hub commit; empty = the pinned one of a known model (whisper.WHISPER_REVISIONS).
+    whisper_revision: str | None = None
+    whisper_device: Literal["cuda", "cpu", "auto"] = "cuda"
+    whisper_compute_type: str = "float16"
+    whisper_beam_size: int = Field(default=5, ge=1)
+    # faster-whisper's own Silero VAD inside each stretch our gate sends: same words on the
+    # benchmark audio, 3 % slower (4b-3 e2e), so off.
+    whisper_vad_filter: bool = False
+
+    # Sound tagger "ced" (CED-base). CPU by default: the image has the CPU build of torch.
+    tagger_device: Literal["cpu", "cuda"] = "cpu"
+    tagger_threads: int = Field(default=2, ge=0)  # torch CPU threads; 0 = torch's default
+    tagger_batch_size: int = Field(default=16, ge=1)  # 2 s windows per forward pass
+
+    # A GPU out-of-memory error (a game holding the VRAM) is retried in-process for this long
+    # (waits 30, 60, 120, 240 s, ...) before the job attempt fails.
+    gpu_oom_wait_s: float = Field(default=600.0, ge=0, allow_inf_nan=False)
 
     ffmpeg: str = "ffmpeg"
     decode_timeout_s: float = Field(default=120.0, gt=0, allow_inf_nan=False)
@@ -70,6 +91,17 @@ class TranscriberSettings(BaseSettings):
             min_silence_ms=self.vad_min_silence_ms,
             speech_pad_ms=self.vad_speech_pad_ms,
             max_speech_s=self.gate_max_s - 2 * self.gate_pad_s,
+        )
+
+    def whisper_options(self) -> WhisperOptions:
+        return WhisperOptions(
+            model=self.whisper_model,
+            revision=self.whisper_revision or None,
+            device=self.whisper_device,
+            compute_type=self.whisper_compute_type,
+            beam_size=self.whisper_beam_size,
+            vad_filter=self.whisper_vad_filter,
+            oom_wait_s=self.gpu_oom_wait_s,
         )
 
     def pipeline_config(self) -> PipelineConfig:
