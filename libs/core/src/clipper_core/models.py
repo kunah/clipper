@@ -218,9 +218,33 @@ class ChatMetricSecond(Base):
 
 
 class ChunkTranscript(Base):
-    """Marks a chunk as transcribed; words live in object storage. Writer: transcriber."""
+    """Marks a chunk as transcribed; words live in object storage. Writer: transcriber.
+
+    Ownership: the words file (`words_key`, a `contracts.WordsFile`) is authoritative only for
+    `[owned_from, owned_to)`; a word belongs to the chunk whose owned range contains its start.
+    Owned ranges of contiguous chunks tile: `P.owned_to == N.owned_from` for neighbours P, N.
+    - `owned_from`: start of the transcribed window (= the words file's `t0`). Normally the
+      chunk's `start_utc`; earlier when this chunk took over the previous chunk's provisional
+      tail.
+    - `owned_to`: the chunk's `end_utc`; on a takeover the previous chunk's `owned_to` becomes
+      this chunk's `owned_from` in the same transaction (and its `tail_from` NULL), so owned
+      ranges never overlap. A re-run while the next contiguous chunk is already transcribed
+      writes `owned_to = min(end_utc, next.owned_from)`.
+    - `tail_from`: words at or after it are provisional (the last sentence ran into the cut and
+      the next chunk will re-transcribe it). NULL = nothing provisional.
+    The writer clamps words to the window and drops a tail that would start at or after
+    `owned_to` (the CHECK requires `owned_from <= tail_from < owned_to`).
+    Read through `clipper_core.transcripts` (`words()`, `coverage()`), never the files directly.
+    """
 
     __tablename__ = "chunk_transcripts"
+    __table_args__ = (
+        CheckConstraint(
+            "owned_to >= owned_from"
+            " AND (tail_from IS NULL OR (tail_from >= owned_from AND tail_from < owned_to))",
+            name="owned_range",
+        ),
+    )
 
     chunk_id: Mapped[int] = mapped_column(ForeignKey("chunks.id"), primary_key=True)
     model: Mapped[str] = mapped_column(Text)
@@ -228,15 +252,25 @@ class ChunkTranscript(Base):
     words_key: Mapped[str] = mapped_column(Text)
     segment_count: Mapped[int] = mapped_column(Integer)
     processing_s: Mapped[float | None] = mapped_column(Float)
+    owned_from: Mapped[datetime]
+    owned_to: Mapped[datetime]
+    tail_from: Mapped[datetime | None]
     created_at: Mapped[datetime] = _created_at()
 
 
 class TranscriptSegment(Base):
-    """Sentence-level text with full-text search. Writer: transcriber."""
+    """Sentence-level text with full-text search. Writer: transcriber.
+
+    `chunk_id` is the chunk whose words file the sentence came from (it may start before that
+    chunk's `start_utc` when the chunk took over the previous chunk's tail). `provisional`: the
+    sentence ran into the end of the chunk and will be replaced by the next contiguous chunk's
+    version (its words are at or after the chunk's `tail_from`).
+    """
 
     __tablename__ = "transcript_segments"
     __table_args__ = (
         Index(None, "stream_id", "start_utc"),
+        Index(None, "chunk_id"),
         Index("ix_transcript_segments_text_tsv", "text_tsv", postgresql_using="gin"),
     )
 
@@ -250,10 +284,42 @@ class TranscriptSegment(Base):
     avg_logprob: Mapped[float | None] = mapped_column(Float)
     no_speech_prob: Mapped[float | None] = mapped_column(Float)
     model: Mapped[str] = mapped_column(Text)
+    provisional: Mapped[bool] = mapped_column(server_default=sql_text("false"))
     text_tsv: Mapped[Any] = mapped_column(
         TSVECTOR, Computed("to_tsvector('simple', text)", persisted=True)
     )
     created_at: Mapped[datetime] = _created_at()
+
+
+class AudioMetricSecond(Base):
+    """Per-second audio features; the detector reads them next to `chat_metrics_1s`.
+
+    Writer: transcriber (upserts the seconds of each chunk it processes).
+    - `ts`: start of the UTC second; the row describes `[ts, ts + 1 s)`.
+    - `loudness_db`: RMS level in dBFS (<= 0; the writer floors digital silence at a finite
+      value, never -inf).
+    - `speech_ratio`: fraction of the second the voice-activity detector marked as speech (0..1).
+    - `classes`: sound-class group -> score 0..1 (laughter, screaming, shouting, cheering, gasp,
+      crying, music, singing, speech, gunfire_explosion; each the max over its AudioSet labels).
+      `{}` when no sound tagger ran.
+    The CHECK also rejects NaN (NaN compares greater than every number in Postgres).
+    """
+
+    __tablename__ = "audio_metrics_1s"
+    __table_args__ = (
+        PrimaryKeyConstraint("stream_id", "ts"),
+        CheckConstraint(
+            "speech_ratio BETWEEN 0 AND 1 AND loudness_db <= 0"
+            " AND loudness_db > '-Infinity'::float8",
+            name="ranges",
+        ),
+    )
+
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    ts: Mapped[datetime]
+    loudness_db: Mapped[float] = mapped_column(Float)
+    speech_ratio: Mapped[float] = mapped_column(Float)
+    classes: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
 
 
 # --------------------------------------------------------------------------- coordination

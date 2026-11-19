@@ -33,6 +33,31 @@ def test_models_match_migrations(db_url):
     assert diff == [], f"models and migrations differ: {diff}"
 
 
+CHECKS_SQL = """
+    SELECT conrelid::regclass::text AS tbl, conname, pg_get_constraintdef(oid) AS definition
+      FROM pg_constraint WHERE contype = 'c' AND connamespace = 'public'::regnamespace
+"""
+
+
+def test_check_constraints_match_models(db_url, fresh_database):
+    """Autogenerate doesn't compare CHECKs, and their texts are repeated in models and
+    migrations: compare what Postgres made of each (migrated DB vs. create_all from models)."""
+    cli.upgrade(db_url)
+    checks = []
+    for url, from_models in ((db_url, False), (fresh_database("clipper_models_test"), True)):
+        engine = create_engine(url)
+        with engine.begin() as conn:
+            if from_models:
+                Base.metadata.create_all(conn)
+            rows = conn.execute(text(CHECKS_SQL))
+            checks.append({(r.tbl, r.conname): r.definition for r in rows})
+        engine.dispose()
+    migrated, declared = checks
+    assert ("audio_metrics_1s", "ck_audio_metrics_1s_ranges") in declared
+    assert ("chunk_transcripts", "ck_chunk_transcripts_owned_range") in declared
+    assert migrated == declared
+
+
 def test_chat_partitions_route_rows_and_reject_unknown_days(db_url):
     cli.upgrade(db_url)
     cli.ensure_partitions(db_url)

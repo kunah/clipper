@@ -148,7 +148,7 @@ Services talk only through Postgres and object storage.
 | controller | Helix polling, streams, viewer counts, stale-job sweeper | channels, streams, viewer_snapshots | slim |
 | chat-ingest | IRC, raw chat, events, per-second stats. **Rarely redeployed** (restart = lost chat) | chat_messages, chat_events, chat_metrics_1s | slim |
 | recorder | HLS segments → ~60 s `.ts` + `.aac` (local spool first, crash-safe), gaps, enqueue transcription. Claims channels itself via leases. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
-| transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments | CUDA |
+| transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
 | detector | live (reads per-second stats, ~1 s behind) + offline. Separate so tuning never restarts chat logging | candidates (later) | slim |
 | judge | LLM verdict + edit plan, context requests | clips (later) | slim |
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
@@ -300,8 +300,11 @@ model-independent and can be built first, behind an engine interface with a fake
 1. Load chunk N. No `audio_key` → nothing to do, job done.
 2. **Window.** If the previous chunk P (same stream, `seq - 1`) is contiguous (`P.end_utc ==
    N.start_utc` within 50 ms), already transcribed, and has a provisional tail (`tail_from` not
-   null), the window starts at `P.tail_from` (at most 30 s before `N.start_utc`): download P's
-   audio too and prepend its tail. Otherwise the window starts at `N.start_utc`.
+   null), the window starts at `max(P.tail_from, P.start_utc, N.start_utc − 30 s)`: download P's
+   audio too and prepend that part. When the 30 s cap applies, P keeps (now non-provisional)
+   ownership of `[P.tail_from, window start)`. Otherwise the window starts at `N.start_utc`.
+   The window end (`owned_to`) is `N.end_utc`; on a re-run while the next contiguous chunk is
+   already transcribed it is `min(N.end_utc, next.owned_from)`, and N keeps no provisional tail.
 3. **Decode** to 16 kHz mono float32 PCM ourselves (ffmpeg/soundfile), never via an engine's own
    file reader (faster-whisper's PyAV path broke with current PyAV).
 4. **Speech recognition** through the engine interface → words (text, start, end, confidence)
@@ -322,24 +325,58 @@ model-independent and can be built first, behind an engine interface with a fake
    gunfire_explosion; each the max over its AudioSet labels, see `tools/asr-bench/run_tagger.py`).
 8. **Words file** for N: `streams/{id}/transcripts/{seq}.json` = `WordsFile` (chunk id, stream id,
    seq, model, `t0` = UTC of the window start, words with start/end seconds relative to `t0`).
-9. **One transaction:** upsert `chunk_transcripts` (+ `owned_from` = window start, `owned_to` =
-   `N.end_utc`, `tail_from`); delete + insert N's `transcript_segments` (retries are idempotent);
-   if P's tail was taken over: delete P's provisional segments and set `P.owned_to =
-   P.tail_from`, `P.tail_from = NULL`; upsert N's `audio_metrics_1s` rows;
+9. **One transaction:** upsert `chunk_transcripts` (+ `owned_from` = window start, `owned_to`
+   from step 2, `tail_from`); delete + insert N's `transcript_segments` (retries are idempotent);
+   if P's tail was taken over: set `P.owned_to = N.owned_from` (the window start, **not**
+   `P.tail_from`: they differ when the cap applied), `P.tail_from = NULL`, and replace P's
+   provisional segments by non-provisional ones from P's words before the window start (none
+   unless the cap applied); upsert N's `audio_metrics_1s` rows;
    `NOTIFY clipper_transcripts, '<stream_id>'` (sent on commit; the judge waits on it).
+   Writer rules (the CHECK enforces `owned_from <= owned_to` and `owned_from <= tail_from <
+   owned_to`): words are clamped to the window, a tail that would start at or after `owned_to`
+   is dropped, loudness is floored at a finite dBFS (CHECK: `loudness_db <= 0`, no NaN/-inf,
+   `speech_ratio` 0..1).
 
 **Ownership rule.** A chunk's words file is authoritative only for `[owned_from, owned_to)` of its
-`chunk_transcripts` row. Consumers never read words files directly; they call
-`clipper_core.transcripts.words(session, store, stream_id, interval)` (UTC words, ownership
-applied) and `transcripts.coverage(session, stream_id, interval)` (transcribed / gap / pending
-parts, using `stream_gaps`), which the judge uses for "transcripts cover T−90 s … T+30 s".
+`chunk_transcripts` row; a word belongs to the chunk whose owned range contains the word's start.
+Owned ranges of contiguous chunks tile (`P.owned_to == N.owned_from`). Consumers never read words
+files directly; they call `clipper_core.transcripts.words(session, store, stream_id, interval)`
+(UTC words, ownership applied) and `transcripts.coverage(session, stream_id, interval)`, which the
+judge uses for "transcripts cover T−90 s … T+30 s". Coverage splits the interval into:
+- `transcribed` (union of owned ranges; `provisional` = their `[tail_from, owned_to)` parts),
+- `untranscribed` (a chunk with audio is there but no transcript yet: job queued, running or
+  failed),
+- `gap` (`stream_gaps`, chunks without audio, before the stream started or its first chunk, after
+  `ended_at` or the last chunk of an ended stream; from `ended_at + 5 min` (`ended_grace`) on,
+  everything after the last chunk, since the recorder writes nothing more),
+- `unrecorded` (no chunk there yet).
+`pending` = untranscribed + unrecorded; `complete` = nothing pending (provisional counts as done).
+
+Details decided while building it (step 4a):
+- **Chunk jitter 0.5 s** (`contracts.CHUNK_JITTER`): neighbouring chunks don't line up to the
+  millisecond (a chunk ends at its last segment's PDT + duration, the next starts at the next
+  PDT), and the recorder writes gap rows only for longer holes (its tolerance uses the same
+  constant). Coverage treats shorter holes with known parts on both sides as transcribed (between
+  two transcribed parts), untranscribed (next to an untranscribed chunk) or gap (otherwise); it
+  never bridges over a chunk with audio.
+- **Time before `streams.started_at`** is gap (else a window around a moment in the first 90 s
+  never completes).
+- **Later chunk wins** where two owned ranges overlap (jitter), so `words()` never returns a word
+  twice.
+- **Words files are forward-compatible**: `WordsFile`/`Word` ignore unknown fields (old readers
+  read newer files after additive changes); incompatible changes bump `version` (now 1), which
+  old readers reject.
 
 **Contract changes (libs/core, additive migration 0002):**
-- `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable).
-- `transcript_segments`: + `provisional` (bool, default false).
-- new `audio_metrics_1s` (PK `stream_id, ts`; `loudness_db`, `speech_ratio`, `classes` jsonb).
-  Writer: transcriber; the detector reads it next to `chat_metrics_1s`.
-- `contracts`: `TRANSCRIPTS_NOTIFY_CHANNEL = "clipper_transcripts"`, `WordsFile` / `Word` models.
+- `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable),
+  CHECK `owned_from <= owned_to` and `owned_from <= tail_from < owned_to`.
+- `transcript_segments`: + `provisional` (bool, default false), index on `chunk_id` (the
+  transcriber replaces a chunk's segments on every job).
+- new `audio_metrics_1s` (PK `stream_id, ts`, FK streams; `loudness_db`, `speech_ratio`,
+  `classes` jsonb; CHECK ranges). Writer: transcriber; the detector reads it next to
+  `chat_metrics_1s`.
+- `contracts`: `TRANSCRIPTS_NOTIFY_CHANNEL = "clipper_transcripts"`, `WordsFile` / `Word` models,
+  `CHUNK_JITTER`.
 - new module `transcripts` with `words()` and `coverage()`.
 
 **Engine interfaces** (in the service): `SpeechEngine.transcribe(pcm) -> words + segments` and

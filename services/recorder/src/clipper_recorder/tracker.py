@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from clipper_core.contracts import GapReason
+from clipper_core.contracts import CHUNK_JITTER, GapReason
 from clipper_twitch.hls import Segment
 
 
@@ -42,7 +42,7 @@ class SegmentTracker:
         media_end: datetime | None,
         seen_until: datetime | None = None,
         reason: GapReason | None = None,
-        tolerance_s: float = 0.5,
+        tolerance_s: float = CHUNK_JITTER.total_seconds(),
     ) -> None:
         """
         media_end: where recorded media ends (resume) or the stream started (fresh); gaps are
