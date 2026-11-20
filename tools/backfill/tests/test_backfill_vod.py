@@ -1,8 +1,10 @@
 """Backfill of a mock VOD end to end: FakeVodSource + a mock CDN (httpx.MockTransport) serving
-lavfi-made 10 s MPEG-TS segments, the fake GQL, Postgres and an in-memory store.
+lavfi-made 10 s MPEG-TS segments, the fake GQL (chat replay), fixed emote sets, Postgres and an
+in-memory store.
 
 The default VOD: 16 segments (160 s), 8-9 muted, a discontinuity before 12, audio_only with
-EXT-X-PROGRAM-DATE-TIME = T0 + offset on every segment (as Twitch serves it).
+EXT-X-PROGRAM-DATE-TIME = T0 + offset on every segment (as Twitch serves it). Its chat: 120
+comments whose replay anchor is T0 + 3.9 s.
 """
 
 import asyncio
@@ -18,14 +20,17 @@ from sqlalchemy import text
 
 from clipper_backfill import rows as bf_rows
 from clipper_backfill.backfill import Backfiller, VodOptions
+from clipper_backfill.chat import ChatClock, StaticEmoteSets, map_comment
 from clipper_backfill.cli import status_lines
 from clipper_backfill.pipeline import LeaseLost, MediaError
 from clipper_backfill.planner import at
 from clipper_backfill.settings import BackfillSettings
+from clipper_core.chat import SecondAggregator
 from clipper_core.contracts import Priority, backfill_lease
 from clipper_core.models import Base
 from clipper_core.storage import keys
-from clipper_twitch.gql import Comment, FakeChatReplay, Fragment, VideoInfo
+from clipper_twitch.gql import Comment, FakeChatReplay, Fragment, GqlUnavailable, VideoInfo
+from clipper_twitch.helix import HelixClient
 from clipper_twitch.vod import FakeVodSource, VodGone, VodRestricted
 
 pytestmark = [
@@ -170,8 +175,23 @@ def replay(**kwargs) -> FakeChatReplay:
     return FakeChatReplay({VIDEO: comments}, videos={VIDEO: video_info()}, **kwargs)
 
 
+CHANNEL_EMOTES = {"KEKW": "7tv", "OMEGALUL": "bttv"}
+GLOBAL_EMOTES = {"Clap": "7tv", "KEKW": "ffz"}
+
+
 def backfiller(
-    sessions, cdn, store, *, vods=None, gql=None, after_commit=None, owner="run-1", stop=None
+    sessions,
+    cdn,
+    store,
+    *,
+    vods=None,
+    gql=None,
+    after_commit=None,
+    owner="run-1",
+    stop=None,
+    after_chat_commit=None,
+    chat_batch_pages=20,
+    emotes=None,
 ):
     return Backfiller(
         sessions=sessions,
@@ -182,10 +202,14 @@ def backfiller(
         ),
         gql=gql or replay(),
         http=httpx.AsyncClient(transport=httpx.MockTransport(cdn.handler)),
-        settings=BackfillSettings(_env_file=None, t0_chat_pages=3, retry_backoff_s=0),
+        settings=BackfillSettings(
+            _env_file=None, t0_chat_pages=3, retry_backoff_s=0, chat_batch_pages=chat_batch_pages
+        ),
         owner=owner,
         after_commit=after_commit,
         stop=stop,
+        emotes=emotes or StaticEmoteSets(GLOBAL_EMOTES, {"4242": CHANNEL_EMOTES}),
+        after_chat_commit=after_chat_commit,
     )
 
 
@@ -202,8 +226,8 @@ async def snapshot(sessions) -> dict:
         "streams": "SELECT platform_stream_id, title, category, started_at, ended_at, status, "
         "source FROM streams",
         "vods": "SELECT platform_video_id, title, platform_created_at, duration_s, t0_utc, "
-        "t0_method, t0_candidates, rendition, media_status, media_done_s, chat_status, flags "
-        "FROM vods",
+        "t0_method, t0_candidates, rendition, media_status, media_done_s, chat_status, flags, "
+        "chat_done_s, chat_metrics_to FROM vods",
         "chunks": "SELECT seq, start_utc, end_utc, video_key, audio_key, video_bytes, "
         "audio_bytes, source FROM chunks ORDER BY seq",
         "gaps": "SELECT start_utc, end_utc, reason FROM stream_gaps ORDER BY start_utc",
@@ -211,6 +235,12 @@ async def snapshot(sessions) -> dict:
         "'chunk_id', c.id) AS payload_ok FROM jobs j JOIN chunks c ON c.id = j.ref_id "
         "ORDER BY c.seq",
         "leases": "SELECT resource FROM leases",
+        "messages": "SELECT sent_at, msg_id, channel_id, stream_id, received_at, user_id, "
+        "user_login, text, emotes, badges, deleted, source FROM chat_messages "
+        "ORDER BY sent_at, msg_id",
+        "metrics": "SELECT channel_id, ts, stream_id, messages, unique_chatters, emote_counts, "
+        "event_counts FROM chat_metrics_1s ORDER BY ts",
+        "events": "SELECT * FROM chat_events",
     }
     return {name: [tuple(r) for r in await rows(sessions, sql)] for name, sql in queries.items()}
 
@@ -239,11 +269,12 @@ async def test_vod_becomes_contiguous_chunks_muted_gaps_and_backfill_jobs(sessio
         (STREAM, "Test stream \U0001f334", "Just Chatting", T0, at(T0, 160), "ended", "backfill")
     ]
     ((vid, title, created, duration, t0, method, cands, rendition, mstatus, done, chat, flags),) = (
-        snap["vods"]
+        v[:12] for v in snap["vods"]
     )
     assert (vid, created, duration, t0, method) == (VIDEO, CREATED, 160.0, T0, "pdt")
     assert title == "Test stream 🌴"
-    assert (rendition, mstatus, done, chat) == ("audio_only", "done", 160.0, "pending")
+    assert (rendition, mstatus, done, chat) == ("audio_only", "done", 160.0, "done")
+    assert len(snap["messages"]) == 120 and snap["events"] == []
     assert cands["pdt"] == T0.isoformat() and cands["gql_created_at"] == CREATED.isoformat()
     assert abs(cands["chat_minus_pdt_s"] - 3.9) < 0.5 and cands["created_at_minus_t0_s"] == 3.216
     assert cands["stream_ids"] == {"preview_path": STREAM, "playlist_path": STREAM}
@@ -275,7 +306,8 @@ async def test_vod_becomes_contiguous_chunks_muted_gaps_and_backfill_jobs(sessio
 
     # a re-run finds the rows and has nothing to do
     again = await backfiller(sessions, MockCdn(audio_segments), MemoryStore()).vod(VIDEO)
-    assert again.status == "done" and again.message == "media complete already"
+    assert again.status == "done" and again.message == "media complete already; chat done"
+    assert "chat: complete already" in again.lines
     assert await snapshot(sessions) == snap
 
 
@@ -654,3 +686,447 @@ async def test_highlights_and_live_archives_are_skipped(sessions, audio_segments
         out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql).vod(VIDEO)
         assert out.status == "skipped" and why in out.message
     assert await rows(sessions, "SELECT * FROM streams") == []
+
+
+# --------------------------------------------------------------------------- chat replay
+
+
+def chat_comments() -> list[Comment]:
+    """150 comments over ~135 s: Twitch + third-party emotes, badges, two deleted users, a
+    missing createdAt and one an hour off (both fall back to the chat clock)."""
+    out = []
+    for i in range(150):
+        true_offset = i * 0.9 + 0.21
+        created = T0 + timedelta(seconds=3.9 + true_offset)
+        if i == 40:
+            created = None
+        elif i == 41:
+            created += timedelta(hours=1)
+        if i % 10 == 3:
+            fragments = (Fragment("Kappa", "25"), Fragment(" KEKW KEKW Clap"))
+        elif i % 10 == 5:
+            fragments = (Fragment("OMEGALUL hi"),)
+        else:
+            fragments = (Fragment(f"msg {i} KEKW"),)
+        deleted = i in (17, 90)
+        out.append(
+            Comment(
+                id=f"m{i:03d}",
+                created_at=created,
+                content_offset_s=int(true_offset),
+                commenter_id=None if deleted else f"u{i % 11}",
+                commenter_login=None if deleted else f"user{i % 11}",
+                commenter_display_name=None,
+                fragments=fragments,
+                badges=(("subscriber", "12"),) if i % 2 else (),
+                user_color=None,
+                cursor=None,
+            )
+        )
+    return out
+
+
+def chat_replay(page_size=10, **kwargs) -> FakeChatReplay:
+    return FakeChatReplay(
+        {VIDEO: chat_comments()}, videos={VIDEO: video_info()}, page_size=page_size, **kwargs
+    )
+
+
+async def reference_metrics(sessions) -> list[tuple]:
+    """What one pass of the live aggregator gives for all comments (the VOD's chat clock)."""
+    (vod,) = await rows(sessions, "SELECT channel_id, stream_id, t0_candidates FROM vods")
+    clock = ChatClock(datetime.fromisoformat(vod.t0_candidates["chat"]), "chat_anchor")
+    agg = SecondAggregator()
+    for c in chat_comments():
+        row, _ = map_comment(
+            c,
+            channel_id=vod.channel_id,
+            stream_id=vod.stream_id,
+            clock=clock,
+            channel_emotes=CHANNEL_EMOTES,
+            global_emotes=GLOBAL_EMOTES,
+        )
+        agg.add_row(row)
+    return [
+        (m.channel_id, m.ts, m.stream_id, m.messages, m.unique_chatters, m.emote_counts, {})
+        for m in agg.pop_all()
+    ]
+
+
+async def test_chat_replay_becomes_live_rows_and_metrics(sessions, audio_segments):
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay())
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    assert out.status == "rows_only" and out.message.endswith("chat done"), out
+    assert any(line.startswith("chat done at 160/160 s: 150 new messages") for line in out.lines)
+    assert any("KEKW 150 (7tv)" in line for line in out.lines)  # the channel set wins
+    assert bf.emotes.calls == ["4242", "global"]
+
+    snap = await snapshot(sessions)
+    (vod,) = await rows(sessions, "SELECT * FROM vods")
+    assert (vod.chat_status, vod.chat_done_s) == ("done", 160)
+    assert vod.chat_metrics_to >= at(T0, 160)
+    assert vod.flags == {
+        "muted_s": 20.0,
+        "discontinuities": 1,
+        "chat_time_fallbacks": 2,
+        "comments_without_user": 2,
+    }
+    clock = ChatClock(datetime.fromisoformat(vod.t0_candidates["chat"]), "chat_anchor")
+    assert abs((clock.t0 - T0).total_seconds() - 3.9) < 0.5  # the replay anchor
+
+    messages = {m[1]: m for m in snap["messages"]}
+    assert len(messages) == 150 and snap["events"] == []
+    assert {(m[2], m[3], m[4], m[11]) for m in messages.values()} == {
+        (vod.channel_id, vod.stream_id, None, "backfill")
+    }
+    sent_at, _, _, _, _, uid, login, text_, emotes, badges, deleted, _ = messages["m003"]
+    assert (uid, login, text_) == ("u3", "user3", "Kappa KEKW KEKW Clap")
+    assert (badges, deleted) == ({"subscriber": "12"}, False)
+    assert emotes == [
+        {"name": "Kappa", "count": 1, "source": "twitch", "id": "25"},
+        {"name": "KEKW", "count": 2, "source": "7tv"},
+        {"name": "Clap", "count": 1, "source": "7tv"},
+    ]
+    assert sent_at == T0 + timedelta(seconds=3.9 + 3 * 0.9 + 0.21)  # createdAt
+    assert messages["m005"][8] == [{"name": "OMEGALUL", "count": 1, "source": "bttv"}]
+    assert messages["m017"][5:7] == (None, None)  # deleted user: kept, not a chatter
+    for i in (40, 41):  # missing / an hour off: T_chat + offset + 0.5 s
+        assert messages[f"m{i:03d}"][0] == clock.expected(int(i * 0.9 + 0.21))
+
+    assert snap["metrics"] == await reference_metrics(sessions)
+    assert sum(m[3] for m in snap["metrics"]) == 150
+    (partition,) = await rows(sessions, "SELECT to_regclass('chat_messages_p20261118') AS p")
+    assert partition.p is not None
+
+
+async def test_chat_crash_and_resume_give_the_rows_of_one_clean_run(sessions, audio_segments):
+    class Crash(Exception):
+        pass
+
+    def crash_after(n):
+        async def hook(batch):
+            if batch == n:
+                raise Crash
+
+        return hook
+
+    for n in (3, 4):  # crash after the 3rd batch, then after 4 more
+        bf = backfiller(
+            sessions,
+            MockCdn(audio_segments),
+            MemoryStore(),
+            gql=chat_replay(page_size=7),
+            chat_batch_pages=1,
+            after_chat_commit=crash_after(n),
+        )
+        with pytest.raises(Crash):
+            await bf.vod(VIDEO, VodOptions(media=False))
+        (vod,) = await rows(sessions, "SELECT chat_status, chat_done_s, chat_metrics_to FROM vods")
+        assert vod.chat_status == "pending" and vod.chat_done_s > 0
+        (late,) = await rows(sessions, "SELECT max(ts) AS ts FROM chat_metrics_1s")
+        assert late.ts < vod.chat_metrics_to  # nothing at or after the watermark is written
+        assert await rows(sessions, "SELECT * FROM leases") == []
+
+    gql = chat_replay(page_size=7)
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql, chat_batch_pages=1)
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    assert out.message.endswith("chat done")
+    assert any("read again" in line for line in out.lines)  # resumed just before the watermark
+    resumed = await snapshot(sessions)
+
+    await truncate(sessions)  # same page size: the T0 sample (and so the chat clock) is the same
+    gql = chat_replay(page_size=7)
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert out.message.endswith("chat done")
+    assert await snapshot(sessions) == resumed
+    assert resumed["metrics"] == await reference_metrics(sessions)
+
+
+async def test_chat_max_minutes_runs_add_up_to_one_run(sessions, audio_segments):
+    statuses, starts = [], []
+    for _ in range(8):
+        bf = backfiller(
+            sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay(page_size=8)
+        )
+        if statuses:  # a dry run in between shows the resume point and writes nothing
+            before = await snapshot(sessions)
+            dry = await bf.vod(VIDEO, VodOptions(media=False, dry_run=True))
+            starts.append(next(line for line in dry.lines if line.startswith("chat:")))
+            assert await snapshot(sessions) == before
+        out = await bf.vod(VIDEO, VodOptions(media=False, chat_max_minutes=0.5))
+        statuses.append(out.status)
+        if out.status != "partial":
+            break
+    assert statuses == ["partial"] * (len(statuses) - 1) + ["rows_only"]
+    assert len(statuses) >= 4  # 135 s of chat, 30 s per run
+    assert all("would resume at offset" in line for line in starts), starts
+    split = await snapshot(sessions)
+
+    await truncate(sessions)
+    gql = chat_replay(page_size=8)
+    await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert await snapshot(sessions) == split
+
+
+async def live_chat_seconds(sessions, seconds: int) -> datetime:
+    """The channel, with chat-ingest's rows (offline: no stream) for `seconds` seconds from
+    T0 + 50 s, in the VOD's range. Returns the first second."""
+    first = at(T0, 50).replace(microsecond=0)
+    async with sessions.begin() as s:
+        cid = (
+            await s.execute(
+                text(
+                    "INSERT INTO channels (login, platform_user_id) VALUES ('streamer', '4242') "
+                    "RETURNING id"
+                )
+            )
+        ).scalar_one()
+        await s.execute(
+            text(
+                "INSERT INTO chat_metrics_1s (channel_id, ts, stream_id, messages, "
+                "unique_chatters) SELECT :c, :t + make_interval(secs => i), NULL, 3, 2 "
+                "FROM generate_series(0, :n - 1) AS i"
+            ),
+            {"c": cid, "t": first, "n": seconds},
+        )
+    return first
+
+
+async def test_a_minute_of_live_chat_in_the_vod_range_skips_its_chat(sessions, audio_segments):
+    await live_chat_seconds(sessions, 60)  # the default guard: 60 s
+    gql = chat_replay()
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert out.message.endswith("chat skipped")
+    assert any("live chat in the VOD's range (60 seconds" in line for line in out.lines)
+    (vod,) = await rows(sessions, "SELECT chat_status, chat_done_s FROM vods")
+    assert tuple(vod) == ("skipped", 0)
+    assert await rows(sessions, "SELECT * FROM chat_messages") == []
+    metrics = await rows(sessions, "SELECT DISTINCT stream_id, messages FROM chat_metrics_1s")
+    assert [tuple(m) for m in metrics] == [(None, 3)]
+    assert len(gql.calls) == 3  # the T0 sample only
+
+
+async def test_a_few_stray_live_seconds_are_kept_and_the_rest_is_backfilled(
+    sessions, audio_segments
+):
+    first = await live_chat_seconds(sessions, 2)
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay()).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert out.message.endswith("chat done")
+    assert any(line.startswith("chat: 2 seconds of live chat") for line in out.lines)
+    (vod,) = await rows(sessions, "SELECT stream_id, flags FROM vods")
+    assert vod.flags["chat_foreign_seconds"] == 2
+    assert len(await rows(sessions, "SELECT * FROM chat_messages")) == 150
+    theirs = await rows(
+        sessions, "SELECT ts, stream_id, messages FROM chat_metrics_1s WHERE stream_id IS NULL"
+    )
+    assert [tuple(m) for m in theirs] == [(first, None, 3), (first + timedelta(seconds=1), None, 3)]
+    ours = await rows(sessions, "SELECT count(*) AS n FROM chat_metrics_1s WHERE stream_id = :s",
+                      s=vod.stream_id)  # fmt: skip
+    assert ours[0].n > 100
+
+
+async def test_no_chat_then_chat_and_an_unavailable_replay(sessions, audio_segments):
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay()).vod(
+        VIDEO, VodOptions(media=False, chat=False)
+    )
+    assert out.message == "--no-media: no media fetched"
+    (vod,) = await rows(sessions, "SELECT chat_status FROM vods")
+    assert vod.chat_status == "off"
+    assert await rows(sessions, "SELECT * FROM chat_messages") == []
+
+    gone = FakeChatReplay({}, videos={VIDEO: video_info()})  # the replay is gone now
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gone).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert out.message.endswith("chat unavailable")
+    (vod,) = await rows(sessions, "SELECT chat_status FROM vods")
+    assert vod.chat_status == "unavailable"
+
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay()).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert out.message.endswith("chat done")
+    assert len(await rows(sessions, "SELECT * FROM chat_messages")) == 150
+
+
+async def test_a_replay_error_mid_run_keeps_the_batches_before_it(sessions, audio_segments):
+    gql = chat_replay(page_size=7, errors={3 + 6: GqlUnavailable("deadline")})  # 3: T0 sample
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql, chat_batch_pages=2)
+    with pytest.raises(GqlUnavailable):
+        await bf.vod(VIDEO, VodOptions(media=False))
+    (vod,) = await rows(sessions, "SELECT chat_status, chat_done_s FROM vods")
+    assert vod.chat_status == "pending" and vod.chat_done_s > 0
+    assert await rows(sessions, "SELECT * FROM leases") == []
+    out = await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay()).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    assert out.message.endswith("chat done")
+    assert len(await rows(sessions, "SELECT * FROM chat_messages")) == 150
+
+
+# --------------------------------------------------------------------------- viewer clips
+
+
+def helix_fake(clips: list[dict] | None) -> HelixClient:
+    """Helix with this VOD (stream STREAM) and `clips` (Get Clips ignores the window here;
+    None: it answers something that isn't JSON)."""
+    video = {
+        "id": VIDEO,
+        "stream_id": STREAM,
+        "user_id": "4242",
+        "user_login": "streamer",
+        "user_name": "Streamer",
+        "title": "Test stream",
+        "description": "",
+        "created_at": "2026-11-18T06:27:52Z",
+        "published_at": None,
+        "url": "",
+        "thumbnail_url": "",
+        "viewable": "public",
+        "view_count": 1,
+        "language": "en",
+        "type": "archive",
+        "duration": "2m40s",
+        "muted_segments": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "id.twitch.tv":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 3600})
+        if request.url.path == "/helix/videos":
+            return httpx.Response(200, json={"data": [video]})
+        if request.url.path == "/helix/clips":
+            if clips is None:
+                return httpx.Response(200, text="<html>not json</html>")
+            return httpx.Response(200, json={"data": clips})
+        return httpx.Response(404)
+
+    return HelixClient("cid", "s", http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def helix_clip(cid: str, offset: int | None) -> dict:
+    return {
+        "id": cid,
+        "url": "",
+        "embed_url": "",
+        "broadcaster_id": "4242",
+        "broadcaster_name": "Streamer",
+        "creator_id": "1",
+        "creator_name": "Clipper",
+        "video_id": VIDEO,
+        "game_id": "1",
+        "language": "en",
+        "title": "the moment",
+        "view_count": 42,
+        "created_at": "2026-11-18T06:29:00Z",
+        "thumbnail_url": "",
+        "duration": 20.0,
+        "vod_offset": offset,
+        "is_featured": True,
+    }
+
+
+async def test_a_vod_run_attaches_viewer_clips(sessions, audio_segments):
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore())
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    assert any(line.startswith("clips: skipped: needs Helix credentials") for line in out.lines)
+    assert await rows(sessions, "SELECT * FROM viewer_clips") == []
+
+    bf.helix = helix_fake([helix_clip("Moment", 95)])
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    assert any(line.startswith(f"clips (video {VIDEO}): 1 of 1 fetched") for line in out.lines)
+    (clip,) = await rows(sessions, "SELECT * FROM viewer_clips")
+    (stream,) = await rows(sessions, "SELECT id FROM streams")
+    assert (clip.stream_id, clip.time_source, clip.start_utc) == (stream.id, "vod_t0", at(T0, 95))
+    assert clip.slack_s == 30.0 and clip.is_featured
+
+    out = await bf.vod(VIDEO, VodOptions(media=False, clips=False))
+    assert not any(line.startswith("clips") for line in out.lines)
+
+
+async def test_a_vod_recorded_live_gets_its_clips_only(sessions, audio_segments):
+    async with sessions.begin() as s:
+        cid = (
+            await s.execute(
+                text(
+                    "INSERT INTO channels (login, platform_user_id) VALUES ('streamer', '4242') "
+                    "RETURNING id"
+                )
+            )
+        ).scalar_one()
+        live = (
+            await s.execute(
+                text(
+                    "INSERT INTO streams (channel_id, platform_stream_id, started_at, status) "
+                    "VALUES (:c, :p, :t, 'ended') RETURNING id"
+                ),
+                {"c": cid, "p": STREAM, "t": T0},
+            )
+        ).scalar_one()
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore())
+    bf.helix = helix_fake([helix_clip("Moment", 95)])
+    out = await bf.vod(VIDEO)
+    assert out.status == "skipped" and "clips only" in out.message
+    (clip,) = await rows(sessions, "SELECT * FROM viewer_clips")
+    created = datetime(2026, 11, 18, 6, 27, 52, tzinfo=UTC)  # Helix created_at
+    assert (clip.stream_id, clip.time_source) == (live, "helix_created_at")
+    assert clip.start_utc == created + timedelta(seconds=95) and clip.slack_s == 35.0
+    assert await rows(sessions, "SELECT * FROM vods") == []
+    assert await rows(sessions, "SELECT * FROM chat_messages") == []
+
+
+async def test_failed_emote_sets_and_many_time_fallbacks_are_flagged(sessions, audio_segments):
+    def sets(failed):
+        return StaticEmoteSets(GLOBAL_EMOTES, {"4242": CHANNEL_EMOTES}, failed_providers=failed)
+
+    comments = chat_comments()
+    for i, c in enumerate(comments):
+        if i % 10 == 7:  # 15 more an hour off: 17 of 150 fall back
+            comments[i] = dataclasses.replace(c, created_at=c.created_at + timedelta(hours=1))
+    gql = FakeChatReplay({VIDEO: comments}, videos={VIDEO: video_info()}, page_size=10)
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=gql, emotes=sets(["ffz"]))
+    out = await bf.vod(VIDEO, VodOptions(media=False, chat_max_minutes=1))
+    assert out.status == "partial"
+    assert any("emote sets of ffz could not be fetched" in line for line in out.lines)
+    gql = FakeChatReplay({VIDEO: comments}, videos={VIDEO: video_info()}, page_size=10)
+    bf = backfiller(
+        sessions, MockCdn(audio_segments), MemoryStore(), gql=gql, emotes=sets(["bttv"])
+    )
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    assert out.message.endswith("chat done")
+    (vod,) = await rows(sessions, "SELECT flags FROM vods")
+    assert vod.flags["emote_sets_failed"] == ["bttv", "ffz"]  # every run's failures add up
+    assert vod.flags["chat_time_fallbacks"] == 17
+    assert vod.flags["chat_time_fallback_share"] == round(17 / 150, 4)
+
+    await truncate(sessions)  # the usual 2 of 150: no share flag, no failed sets
+    await backfiller(sessions, MockCdn(audio_segments), MemoryStore(), gql=chat_replay()).vod(
+        VIDEO, VodOptions(media=False)
+    )
+    (vod,) = await rows(sessions, "SELECT flags FROM vods")
+    assert vod.flags["chat_time_fallbacks"] == 2
+    assert "chat_time_fallback_share" not in vod.flags and "emote_sets_failed" not in vod.flags
+
+
+async def test_a_clips_failure_never_fails_the_vod_run(sessions, audio_segments):
+    bf = backfiller(sessions, MockCdn(audio_segments), MemoryStore())
+    bf.helix = helix_fake(None)  # Get Clips gone strange (an error none of ours expects)
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    assert out.ok and out.message.endswith("chat done")
+    assert any(line.startswith("clips: failed: JSONDecodeError") for line in out.lines)
+    (vod,) = await rows(sessions, "SELECT flags FROM vods")
+    assert vod.flags["clips_error"].startswith("JSONDecodeError")
+
+    bf.helix = helix_fake([helix_clip("Moment", 95)])  # the next run works: the flag goes
+    out = await bf.vod(VIDEO, VodOptions(media=False))
+    (vod,) = await rows(sessions, "SELECT flags FROM vods")
+    assert "clips_error" not in vod.flags
+    assert len(await rows(sessions, "SELECT * FROM viewer_clips")) == 1

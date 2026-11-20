@@ -6,16 +6,21 @@
   one transaction on the first run, found again on every later one.
 - `chunks`/`stream_gaps` of a backfilled stream: via `clipper_core.chunks.commit_chunk` (one
   transaction per chunk, with `vods.media_done_s`), plus gap-only commits here.
+- `chat_messages`/`chat_metrics_1s` of a backfilled stream: `clipper_backfill.chat` (through
+  `clipper_core.chat.ChatWriter`, one transaction per batch with `vods.chat_done_s`/
+  `chat_metrics_to`). Never `chat_events`, never `viewer_snapshots` (replay has neither).
+- `viewer_clips` (`upsert_clips`): the backfill tool is their only writer.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import insert, select, text, update
+from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,7 +37,7 @@ from clipper_core.contracts import (
     VodMediaStatus,
     dedupe_key,
 )
-from clipper_core.models import Channel, Stream, Vod
+from clipper_core.models import Channel, Stream, ViewerClip, Vod
 from clipper_core.timeline import Interval, ensure_utc
 
 PLATFORM = "twitch"
@@ -61,7 +66,10 @@ class VodRow:
     media_status: str
     media_done_s: float
     chat_status: str
+    chat_done_s: int
+    chat_metrics_to: datetime | None
     flags: dict[str, Any]
+    channel_user_id: str | None = None  # the channel's Twitch user id (third-party emote sets)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +107,10 @@ _VOD_SELECT = (
         Vod.media_status,
         Vod.media_done_s,
         Vod.chat_status,
+        Vod.chat_done_s,
+        Vod.chat_metrics_to,
         Vod.flags,
+        Channel.platform_user_id.label("channel_user_id"),
     )
     .join(Channel, Channel.id == Vod.channel_id)
     .where(Channel.platform == PLATFORM)
@@ -108,6 +119,11 @@ _VOD_SELECT = (
 
 async def find_vod(session: AsyncSession, video_id: str) -> VodRow | None:
     row = (await session.execute(_VOD_SELECT.where(Vod.platform_video_id == video_id))).first()
+    return VodRow(**row._mapping) if row else None
+
+
+async def find_vod_of_stream(session: AsyncSession, stream_id: int) -> VodRow | None:
+    row = (await session.execute(_VOD_SELECT.where(Vod.stream_id == stream_id))).first()
     return VodRow(**row._mapping) if row else None
 
 
@@ -127,6 +143,12 @@ async def find_channel(session: AsyncSession, *, login: str, user_id: str | None
         await session.execute(
             select(Channel.id).where(Channel.platform == PLATFORM, Channel.login == login.lower())
         )
+    ).scalar_one_or_none()
+
+
+async def channel_user_id(session: AsyncSession, channel_id: int) -> str | None:
+    return (
+        await session.execute(select(Channel.platform_user_id).where(Channel.id == channel_id))
     ).scalar_one_or_none()
 
 
@@ -300,6 +322,44 @@ async def add_to_flag(session: AsyncSession, vod_id: int, key: str, amount: floa
     )
 
 
+async def merge_flags(session: AsyncSession, vod_id: int, values: dict[str, Any]) -> None:
+    """`vods.flags || values` in place (keys set, the rest kept)."""
+    await session.execute(
+        text(
+            "UPDATE vods SET flags = flags || CAST(:v AS jsonb), updated_at = now() WHERE id = :id"
+        ),
+        {"v": json.dumps(values), "id": vod_id},
+    )
+
+
+async def drop_flags(session: AsyncSession, vod_id: int, *keys: str) -> None:
+    """Remove keys from `vods.flags` (no-op when absent)."""
+    await session.execute(
+        text("UPDATE vods SET flags = flags - CAST(:k AS text[]) WHERE id = :id AND flags ?| :k"),
+        {"k": list(keys), "id": vod_id},
+    )
+
+
+async def flag_value(session: AsyncSession, vod_id: int, key: str, *, lock: bool = False) -> Any:
+    sql = "SELECT flags -> CAST(:k AS text) FROM vods WHERE id = :id"
+    return (
+        await session.execute(text(sql + (" FOR UPDATE" if lock else "")), {"k": key, "id": vod_id})
+    ).scalar_one_or_none()
+
+
+async def flag_number(session: AsyncSession, vod_id: int, key: str) -> float:
+    value = await flag_value(session, vod_id, key)
+    return float(value) if isinstance(value, int | float) else 0.0
+
+
+async def stream_message_count(session: AsyncSession, stream_id: int) -> int:
+    return (
+        await session.execute(
+            text("SELECT count(*) FROM chat_messages WHERE stream_id = :s"), {"s": stream_id}
+        )
+    ).scalar_one()
+
+
 async def enqueue_missing_jobs(session: AsyncSession, stream_id: int) -> int:
     """`transcribe` jobs for the stream's chunks with audio that have none (committed with
     `--no-transcribe` earlier). Returns how many were added."""
@@ -376,7 +436,11 @@ async def status_rows(session: AsyncSession, video_ids: Sequence[str] = ()) -> l
                 f"""
                 SELECT v.platform_video_id AS video_id, c.login, v.stream_id, v.t0_utc,
                        v.t0_method, v.duration_s, v.rendition, v.media_status, v.media_done_s,
-                       v.chat_status, v.flags, v.updated_at,
+                       v.chat_status, v.chat_done_s, v.chat_metrics_to, v.flags, v.updated_at,
+                       (SELECT count(*) FROM chat_metrics_1s m
+                         WHERE m.stream_id = v.stream_id) AS chat_seconds,
+                       (SELECT count(*) FROM viewer_clips vc
+                         WHERE vc.stream_id = v.stream_id) AS clips,
                        (SELECT count(*) FROM chunks k WHERE k.stream_id = v.stream_id) AS chunks,
                        (SELECT count(*) FROM stream_gaps g
                          WHERE g.stream_id = v.stream_id) AS gaps,
@@ -399,3 +463,171 @@ async def status_rows(session: AsyncSession, video_ids: Sequence[str] = ()) -> l
             {"platform": PLATFORM, "ids": list(video_ids)},
         )
     ).all()
+
+
+# --------------------------------------------------------------------------- chat
+
+
+@dataclass(frozen=True, slots=True)
+class ForeignChat:
+    """chat_metrics_1s rows of the channel in a VOD's range that are not the VOD's own."""
+
+    rows: int
+    live: bool  # some are live chat (of a live stream, or of none: chat while offline)
+    first: datetime
+    last: datetime
+
+
+async def foreign_chat_metrics(
+    session: AsyncSession, *, channel_id: int, stream_id: int, window: Interval
+) -> ForeignChat | None:
+    """Guard 2 (DESIGN §17): the channel's rows in `window` that belong to another stream or to
+    none (chat-ingest logs active channels while offline too). Backfilled chat would collide with
+    them on the PK `(channel_id, ts)`: live data wins, the VOD's chat is skipped."""
+    found = (
+        await session.execute(
+            text(
+                """
+                SELECT count(*) AS n, min(m.ts) AS first, max(m.ts) AS last,
+                       bool_or(s.id IS NULL OR s.source = :live) AS live
+                  FROM chat_metrics_1s m LEFT JOIN streams s ON s.id = m.stream_id
+                 WHERE m.channel_id = :c AND m.ts >= :a AND m.ts < :b
+                   AND m.stream_id IS DISTINCT FROM :s
+                """
+            ),
+            {
+                "c": channel_id,
+                "s": stream_id,
+                "a": window.start,
+                "b": window.end,
+                "live": str(DataSource.LIVE),
+            },
+        )
+    ).one()
+    if not found.n:
+        return None
+    return ForeignChat(found.n, bool(found.live), found.first, found.last)
+
+
+# --------------------------------------------------------------------------- viewer clips
+
+
+@dataclass(frozen=True, slots=True)
+class StreamRow:
+    id: int
+    channel_id: int
+    platform_stream_id: str
+    started_at: datetime
+    ended_at: datetime | None
+    source: str
+
+
+_STREAM_SELECT = select(
+    Stream.id,
+    Stream.channel_id,
+    Stream.platform_stream_id,
+    Stream.started_at,
+    Stream.ended_at,
+    Stream.source,
+)
+
+
+async def channel_streams(session: AsyncSession, channel_id: int) -> list[StreamRow]:
+    """All our streams of a channel (live and backfilled), oldest first."""
+    found = await session.execute(
+        _STREAM_SELECT.where(Stream.channel_id == channel_id).order_by(Stream.started_at, Stream.id)
+    )
+    return [StreamRow(**r._mapping) for r in found]
+
+
+async def find_stream(
+    session: AsyncSession, *, channel_id: int, platform_stream_id: str
+) -> StreamRow | None:
+    """Our stream (live or backfilled) of this broadcast."""
+    found = (
+        await session.execute(
+            _STREAM_SELECT.where(
+                Stream.channel_id == channel_id, Stream.platform_stream_id == platform_stream_id
+            )
+        )
+    ).first()
+    return StreamRow(**found._mapping) if found else None
+
+
+async def clip_offsets(session: AsyncSession, clip_ids: Sequence[str]) -> dict[str, int | None]:
+    """{clip id: stored vod_offset_s} of the clips we have already."""
+    if not clip_ids:
+        return {}
+    found = await session.execute(
+        select(ViewerClip.clip_id, ViewerClip.vod_offset_s).where(
+            ViewerClip.platform == PLATFORM, ViewerClip.clip_id.in_(list(clip_ids))
+        )
+    )
+    return {r.clip_id: r.vod_offset_s for r in found}
+
+
+_CLIP_LINK = ("platform_video_id", "vod_offset_s", "start_utc", "end_utc")
+_CLIP_SPAN = ("slack_s", "time_source")
+_CLIP_REFRESH = ("duration_s", "title", "creator_login", "view_count", "is_featured")
+
+
+async def upsert_clips(session: AsyncSession, clips: Sequence[dict[str, Any]]) -> None:
+    """Insert or refresh `viewer_clips` rows (PK platform + clip_id; `clips` must not repeat
+    an id: one statement can't update a row twice).
+
+    A refresh updates counters and titles; the VOD link and the time span (`platform_video_id`,
+    `vod_offset_s`, `start_utc`, `end_utc`, `slack_s`, `time_source`) take the new value only
+    when it is known, so a re-run fills a null `vod_offset_s` and never erases one. `stream_id`
+    keeps the first known value (two overlapping stream windows can't take turns)."""
+    if not clips:
+        return
+    stmt = pg_insert(ViewerClip).values(list(clips))
+    table = ViewerClip.__table__.c
+    set_: dict[str, Any] = {
+        c: func.coalesce(stmt.excluded[c], table[c]) for c in (*_CLIP_LINK, *_CLIP_SPAN)
+    }
+    set_["stream_id"] = func.coalesce(table.stream_id, stmt.excluded.stream_id)
+    set_.update({c: stmt.excluded[c] for c in _CLIP_REFRESH})
+    set_["fetched_at"] = func.now()
+    await session.execute(
+        stmt.on_conflict_do_update(index_elements=["platform", "clip_id"], set_=set_)
+    )
+
+
+# --------------------------------------------------------------------------- calibrate (reads)
+
+
+async def stream_chunks(session: AsyncSession, stream_id: int) -> list[Any]:
+    """The stream's chunks with audio, in order (seq, start_utc, end_utc, audio_key)."""
+    return (
+        await session.execute(
+            text(
+                "SELECT seq, start_utc, end_utc, audio_key FROM chunks "
+                "WHERE stream_id = :s AND audio_key IS NOT NULL ORDER BY seq"
+            ),
+            {"s": stream_id},
+        )
+    ).all()
+
+
+async def live_messages_by_id(
+    session: AsyncSession, *, channel_id: int, msg_ids: Sequence[str], window: Interval
+) -> dict[str, datetime]:
+    """{msg_id: sent_at (tmi-sent-ts)} of the channel's live chat messages among `msg_ids`, sent
+    in `window` (keeps the partition scan small)."""
+    if not msg_ids:
+        return {}
+    found = await session.execute(
+        text(
+            "SELECT msg_id, sent_at FROM chat_messages WHERE channel_id = :c "
+            "AND msg_id = ANY(:ids) AND sent_at >= :a AND sent_at < :b AND source = :live"
+        ),
+        {
+            "c": channel_id,
+            "ids": list(msg_ids),
+            "a": window.start,
+            "b": window.end,
+            "live": str(DataSource.LIVE),
+        },
+    )
+    return {r.msg_id: r.sent_at for r in found}

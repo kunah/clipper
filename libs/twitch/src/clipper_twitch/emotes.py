@@ -71,8 +71,13 @@ async def _ffz_channel(http: httpx.AsyncClient, twitch_id: str) -> list[str]:
     return _ffz_names(await _get_json(http, f"https://api.frankerfacez.com/v1/room/id/{twitch_id}"))
 
 
-async def _collect(fetchers: dict[str, Callable[[], Awaitable[list[str]]]]) -> dict[str, str]:
-    """Query all providers in parallel; merge in PROVIDER_ORDER so precedence is stable."""
+async def _collect(
+    fetchers: dict[str, Callable[[], Awaitable[list[str]]]], failed: list[str] | None = None
+) -> dict[str, str]:
+    """Query all providers in parallel; merge in PROVIDER_ORDER so precedence is stable.
+
+    A provider that fails is logged and left out; its name is appended to `failed` if given
+    (404 = "doesn't use this provider" is not a failure)."""
     outcomes = await asyncio.gather(
         *(fetchers[p]() for p in PROVIDER_ORDER), return_exceptions=True
     )
@@ -84,29 +89,37 @@ async def _collect(fetchers: dict[str, Callable[[], Awaitable[list[str]]]]) -> d
                 provider=provider,
                 error=f"{type(names).__name__}: {names}".strip(),
             )
+            if failed is not None:
+                failed.append(provider)
             continue
         for name in names:
             result.setdefault(name, provider)
     return result
 
 
-async def fetch_global_emotes(http: httpx.AsyncClient) -> dict[str, str]:
+async def fetch_global_emotes(
+    http: httpx.AsyncClient, *, failed: list[str] | None = None
+) -> dict[str, str]:
     return await _collect(
         {
             "7tv": lambda: _7tv_global(http),
             "bttv": lambda: _bttv_global(http),
             "ffz": lambda: _ffz_global(http),
-        }
+        },
+        failed,
     )
 
 
-async def fetch_channel_emotes(http: httpx.AsyncClient, twitch_id: str) -> dict[str, str]:
+async def fetch_channel_emotes(
+    http: httpx.AsyncClient, twitch_id: str, *, failed: list[str] | None = None
+) -> dict[str, str]:
     return await _collect(
         {
             "7tv": lambda: _7tv_channel(http, twitch_id),
             "bttv": lambda: _bttv_channel(http, twitch_id),
             "ffz": lambda: _ffz_channel(http, twitch_id),
-        }
+        },
+        failed,
     )
 
 

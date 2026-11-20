@@ -82,3 +82,37 @@ async def test_chat_writer_stores_backfilled_rows_idempotently(sessions):
         (metric,) = (await s.execute(text("SELECT * FROM chat_metrics_1s"))).all()
     assert [tuple(r) for r in stored] == [(None, "backfill")] * 3
     assert (metric.ts, metric.messages, metric.emote_counts) == (day, 1, {"KEKW": 2})
+
+
+@pytest.mark.integration
+async def test_chat_writer_can_leave_other_streams_metrics_alone(sessions):
+    """The backfill's writer never replaces a live second (or another stream's); its own seconds
+    are still refreshed. The default (live) writer upserts as before."""
+    t = datetime(2025, 3, 4, 12, 0, tzinfo=UTC)
+    live = [
+        MetricRow(1, t, None, 5, 4, {}, {}),
+        MetricRow(1, t + timedelta(seconds=1), 3, 5, 4, {}, {}),
+    ]
+    async with sessions.begin() as s:
+        await ChatWriter().write(s, [], [], live, [])
+    ours = [MetricRow(1, t + timedelta(seconds=i), 9, 1, 1, {"KEKW": 1}, {}) for i in range(3)]
+    writer = ChatWriter(keep_foreign_metrics=True)
+    for messages in (1, 2):  # the second write refreshes our own second
+        for m in ours:
+            m.messages = messages
+        async with sessions.begin() as s:
+            await writer.write(s, [], [], ours, [])
+    async with sessions() as s:
+        stored = (
+            await s.execute(text("SELECT stream_id, messages FROM chat_metrics_1s ORDER BY ts"))
+        ).all()
+    assert [tuple(r) for r in stored] == [(None, 5), (3, 5), (9, 2)]
+    async with sessions.begin() as s:  # the live writer still upserts whatever is there
+        await ChatWriter().write(s, [], [], [MetricRow(1, t, 3, 7, 6, {}, {})], [])
+    async with sessions() as s:
+        first = (
+            await s.execute(
+                text("SELECT stream_id, messages FROM chat_metrics_1s ORDER BY ts LIMIT 1")
+            )
+        ).one()
+    assert tuple(first) == (3, 7)

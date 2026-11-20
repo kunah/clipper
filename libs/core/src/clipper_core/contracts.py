@@ -103,6 +103,15 @@ class VodChatStatus(StrEnum):
     OFF = "off"  # not requested (`--no-chat`)
 
 
+class ClipTimeSource(StrEnum):
+    """`viewer_clips.time_source`: which T0 `start_utc = T0 + vod_offset_s` was computed from."""
+
+    VOD_T0 = "vod_t0"  # our backfilled VOD's `vods.t0_utc` (PDT clock, like live media)
+    # the VOD's Helix `created_at` (a stream we recorded live, or a VOD we didn't backfill): a few
+    # seconds off T0 (GQL createdAt was T0_pdt + 3.2 s on the smoke VOD), so `slack_s` is larger
+    HELIX_CREATED_AT = "helix_created_at"
+
+
 class SoundGroup(StrEnum):
     """Sound-class groups: the keys of `audio_metrics_1s.classes` (written by the transcriber,
     read by the detector). Each value is a score 0..1 for one second: the max over the group's

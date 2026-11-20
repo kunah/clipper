@@ -81,13 +81,7 @@ class ChatIngest:
             m = mapped.message
             self.messages.append(m)
             self.stats["messages"] += 1
-            self.aggregator.add_message(
-                channel.channel_id,
-                channel.stream_id,
-                m.sent_at,
-                m.user_id or m.user_login,
-                ((e["name"], e["count"]) for e in m.emotes or ()),
-            )
+            self.aggregator.add_row(m)  # channel_id/stream_id: map_message took them from `channel`
         for event in mapped.events:
             self.events.append(event)
             self.stats["events"] += 1

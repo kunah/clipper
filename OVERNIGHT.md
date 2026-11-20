@@ -72,15 +72,27 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   chunks, muted gaps, hard kill + resume OK, ~16 MB downloaded. compose `backfill` service
   (profile `tools`, not built). 503 tests.
 
+- Step 5d (commit "Backfill: chat replay, viewer clips, calibrate"): chat replay →
+  `chat_messages` / `chat_metrics_1s` through the same `SecondAggregator` as live (chat-ingest
+  reviewed unchanged), watermark resume (no double counting), skipped where ≥ 60 s of live chat
+  exists in the range; failed third-party emote sets recorded in `vods.flags` (FFZ is unreachable
+  from this PC); viewer clips via Helix → `viewer_clips` (needs Twitch app credentials in this
+  checkout's `.env`; tested with fakes only); `calibrate <video>` (read-only, audio
+  cross-correlation vs our live recording) — **run it once yourself** on a stream we recorded
+  live, to confirm the PDT T0. Real chat run: 2426 messages / 905 chatters / 215 metric seconds
+  from 4 min of an xqc VOD, hard kill + resume without duplicates. **Step 5 done.** 531 tests.
+
 ## In progress
 
-- Step 5d: chat replay → chat_messages / chat_metrics_1s (same aggregator as live), viewer clips
-  (needs Helix credentials for Get Clips; built + tested with fakes), `calibrate`.
+- Transcriber: CED on the GPU (your decision, recipe from the main session: CED-base exported to
+  ONNX fp16 at image build time, onnxruntime-gpu 1.29 from ORT's CUDA-12 index, no torch), then
+  rerun the GPU end-to-end test.
 
 ## Next
 
 - Phase 2 in roadmap order (detector §18 first): the parts that are safe to build before the
-  designs are agreed.
+  designs are agreed (contracts + migration 0004, pure scorer + fake-spike filter + lexicon,
+  live service with provisional defaults).
 
 ## How to deploy the transcriber (your call, in the morning)
 
@@ -99,11 +111,14 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
-- 2026-11-19 ~21:34 local: you stopped the Clipper compose stack to use the PC. It stays
-  stopped; **live recording and chat logging are off until you start it again**
-  (`docker compose up -d postgres objectstore controller chat-ingest recorder`). For tests this
-  session uses a separate throwaway Postgres container `clipper-orch-testpg` on 127.0.0.1:5434
-  (removed at the end of the run). No GPU work or image builds while you use the PC.
+- 2026-11-19 ~21:34 local: you stopped the Clipper compose stack to use the PC.
+- 2026-11-20 02:31 local: restarted at your OK with `docker start` on the same five containers
+  (postgres, objectstore, controller, chat-ingest, recorder; same images, no `compose up`, so no
+  migration ran and nothing was rebuilt). All three services logged in normally; ohnepixel was
+  offline. Tests keep using the separate throwaway Postgres `clipper-orch-testpg` on
+  127.0.0.1:5434 (removed at the end of the run).
+- Seen in the live recorder logs: `"level": "info"` in lowercase (importing streamlink renames
+  the stdlib level names); fixed in core logs by step 5d (takes effect on the next rebuild).
 
 ## Status of external gates
 
@@ -120,10 +135,13 @@ Designs written overnight and marked "proposed, not yet agreed" in DESIGN.md: §
 §18 detector, §19 judge, §20 renderer, §21 review, §22 publisher. Their decision rows sit under each section, not in the
 decision log, until you agree.
 
-- **Transcriber:** confirm CED-base. On CPU it is the slowest stage (24× realtime on 2 threads;
-  34× on 4, 50× on 8). Options: more threads, its Hub repo's `model.onnx` on onnxruntime (CPU or
-  GPU, no torch), CUDA torch (+~5 GB image), or a smaller tagger. Also possible: pack short speech
-  stretches into fewer 30 s Whisper windows (Whisper is 31× per stretch vs 49× on whole chunks).
+- **Transcriber:** confirm CED-base (still provisional). On CPU it is the slowest stage (24×
+  realtime on 2 threads). **Decided by you (via the main session, 2026-11-19 evening): CED runs on
+  the GPU.** The main session is comparing CED's ONNX model on onnxruntime-gpu (preferred, no
+  torch) vs CUDA torch (+~5 GB image) and will send a recipe; this session implements it then and
+  reruns the GPU e2e test (when you're not using the PC). Until then CED's adapter is unchanged.
+  Also possible: pack short speech stretches into fewer 30 s Whisper windows (Whisper is 31× per
+  stretch vs 49× on whole chunks).
   The decision log says "built-in VAD"; measured, our Silero gate makes it redundant, so
   `vad_filter` defaults to False (setting).
 - **Backfill (§17):** use Twitch's undocumented GQL API at all (VOD playback token + chat

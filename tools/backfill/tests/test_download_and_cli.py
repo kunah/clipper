@@ -154,6 +154,24 @@ def test_vod_arguments():
         parse_args(["vod", "1", "--max-minutes", "0"])
 
 
+def test_chat_and_clips_arguments():
+    opts = options(parse_args(["vod", "1", "--no-media", "--chat-max-minutes", "5"]))
+    assert (opts.media, opts.chat, opts.clips, opts.chat_max_minutes) == (False, True, True, 5.0)
+    opts = options(parse_args(["vod", "1", "--max-minutes", "3", "--no-clips", "--no-chat"]))
+    assert (opts.max_minutes, opts.chat_max_minutes, opts.chat, opts.clips) == (
+        3.0,
+        None,
+        False,
+        False,
+    )
+    args = parse_args(["clips", "xqc", "2932113307", "--top", "20"])
+    assert (args.refs, args.top) == (["xqc", "2932113307"], 20)
+    args = parse_args(["calibrate", "https://www.twitch.tv/videos/2932113307"])
+    assert (args.ref, args.windows, args.search) == (
+        "https://www.twitch.tv/videos/2932113307", 3, 20.0
+    )  # fmt: skip
+
+
 def test_channel_and_status_arguments():
     args = parse_args(["channel", "xqc", "--since", "2026-11-01", "--limit", "2"])
     assert (args.login, args.limit, args.since.isoformat()) == (

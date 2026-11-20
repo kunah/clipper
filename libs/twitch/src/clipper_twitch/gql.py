@@ -104,7 +104,9 @@ class Fragment:
 @dataclass(frozen=True, slots=True)
 class Comment:
     id: str  # message uuid (probably live IRC's `id` tag: unverified)
-    created_at: datetime  # UTC as Twitch reports it (server clock; see DESIGN §17 for bugs)
+    # UTC as Twitch reports it (server clock; see DESIGN §17 for bugs); None when the field is
+    # missing or null (never seen; the backfill then uses its chat clock)
+    created_at: datetime | None
     content_offset_s: int  # VOD time, whole seconds from the VOD start (fractional: GqlBroken)
     commenter_id: str | None  # None: the user was deleted
     commenter_login: str | None
@@ -200,9 +202,10 @@ def _comment(edge: dict[str, Any]) -> Comment:
         for b in message.get("userBadges") or []
         if b.get("setID") and b.get("version")
     )
+    created = node.get("createdAt")
     return Comment(
         id=str(node["id"]),
-        created_at=ensure_utc(datetime.fromisoformat(node["createdAt"])),
+        created_at=ensure_utc(datetime.fromisoformat(created)) if created else None,
         content_offset_s=_offset(node["contentOffsetSeconds"]),
         commenter_id=commenter.get("id") or None,
         commenter_login=commenter.get("login") or None,
@@ -531,6 +534,11 @@ def _retry_after(resp: httpx.Response) -> float | None:
 # --------------------------------------------------------------------------- fake
 
 
+def _replay_order(c: Comment) -> tuple[int, float, str]:
+    """Twitch's order: by offset, then by time (a comment without `createdAt` first)."""
+    return (c.content_offset_s, c.created_at.timestamp() if c.created_at else float("-inf"), c.id)
+
+
 class FakeChatReplay:
     """Test double: serves comments in pages of `page_size`, like Twitch does.
 
@@ -551,8 +559,7 @@ class FakeChatReplay:
         videos: Mapping[str, VideoInfo] | None = None,
     ) -> None:
         self._comments = {
-            vid: sorted(cs, key=lambda c: (c.content_offset_s, c.created_at, c.id))
-            for vid, cs in (comments or {}).items()
+            vid: sorted(cs, key=_replay_order) for vid, cs in (comments or {}).items()
         }
         self._page_size = page_size
         self._creator_id = creator_id

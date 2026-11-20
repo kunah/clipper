@@ -3,14 +3,20 @@
     uv run clipper-backfill vod 2932113307 --dry-run         # reads only, prints the plan
     uv run clipper-backfill vod https://www.twitch.tv/videos/2932113307 --max-minutes 5
     uv run clipper-backfill vod 2932113307 --video 720p60    # video + its audio (default: audio)
+    uv run clipper-backfill vod 2932113307 --no-media --chat-max-minutes 30   # chat only
     uv run clipper-backfill channel xqc --since 2026-11-01 --limit 3   # needs Helix credentials
+    uv run clipper-backfill clips xqc | clips 2932113307    # viewer clips (Helix credentials)
+    uv run clipper-backfill calibrate 2932113307            # read-only: VOD vs our live recording
     uv run clipper-backfill status [VIDEO_ID ...]
 
 In Docker: `docker compose run --rm backfill vod <id> --dry-run` (profile `tools`).
-Idempotent: a re-run resumes where the last one committed (`vods.media_done_s`). Needs ffmpeg on
-PATH (`CLIPPER_BACKFILL_FFMPEG`). Step 5c = media + time; chat replay, viewer clips and
-`calibrate` are step 5d (not yet): `--no-chat`/`--no-clips` are accepted, but chat and clips
-are not fetched either way.
+A `vod` run does media (audio_only by default), then the chat replay (into the live chat tables),
+then viewer clips (only with Helix credentials, else skipped with a note). Idempotent: a re-run
+resumes where the last one committed (`vods.media_done_s`, `vods.chat_done_s`). Needs ffmpeg on
+PATH (`CLIPPER_BACKFILL_FFMPEG`) for media and `calibrate`; `--no-media` needs no object storage.
+A third-party emote provider that can't be reached (FFZ is unreachable from the dev PC) doesn't
+stop the chat: its emotes aren't counted and `vods.flags.emote_sets_failed` names it. Viewer-clip
+failures never fail a `vod` run (logged, `vods.flags.clips_error`).
 """
 
 from __future__ import annotations
@@ -26,7 +32,16 @@ from datetime import UTC, datetime
 import httpx
 
 from clipper_backfill import rows
-from clipper_backfill.backfill import Backfiller, UsageError, VodOptions, VodOutcome
+from clipper_backfill.backfill import (
+    NO_HELIX,
+    Backfiller,
+    UsageError,
+    VodOptions,
+    VodOutcome,
+    parse_video_ref,
+)
+from clipper_backfill.chat import HttpEmoteSets
+from clipper_backfill.clips import ClipCollector
 from clipper_backfill.download import DownloadError
 from clipper_backfill.pipeline import LeaseLost, MediaError, remove_stale_workdirs
 from clipper_backfill.settings import BackfillSettings
@@ -88,7 +103,11 @@ def _day(value: str) -> datetime:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     media = argparse.ArgumentParser(add_help=False)
     media.add_argument("--dry-run", action="store_true", help="read only, print the plan")
-    media.add_argument("--no-media", action="store_true", help="rows only (media_status=off)")
+    media.add_argument(
+        "--no-media",
+        action="store_true",
+        help="no media (media_status=off); chat and clips still run",
+    )
     media.add_argument(
         "--video",
         nargs="?",
@@ -97,18 +116,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="take video too, from rendition Q (default best = source); its audio is used",
     )
     media.add_argument(
-        "--max-minutes", type=_positive, metavar="N", help="fetch at most N minutes this run"
+        "--max-minutes",
+        type=_positive,
+        metavar="N",
+        help="fetch at most N minutes of media and of chat this run",
+    )
+    media.add_argument(
+        "--chat-max-minutes",
+        type=_positive,
+        metavar="N",
+        help="fetch at most N minutes of chat this run (instead of --max-minutes)",
     )
     media.add_argument(
         "--start-offset",
         type=parse_offset,
         default=0.0,
         metavar="S",
-        help="start at VOD offset S (90, 1:30, 1h2m3s); the part before is a not_recorded gap",
+        help="media: start at VOD offset S (90, 1:30, 1h2m3s); the part before is a "
+        "not_recorded gap (chat always starts at 0)",
     )
     media.add_argument("--no-transcribe", action="store_true", help="queue no transcribe jobs")
-    media.add_argument("--no-chat", action="store_true", help="chat_status=off (5d: not yet)")
-    media.add_argument("--no-clips", action="store_true", help="(5d: not yet)")
+    media.add_argument("--no-chat", action="store_true", help="no chat replay this run")
+    media.add_argument("--no-clips", action="store_true", help="no viewer clips this run")
 
     p = argparse.ArgumentParser(
         prog="clipper-backfill",
@@ -123,6 +152,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     c.add_argument("login")
     c.add_argument("--since", type=_day, metavar="YYYY-MM-DD", help="archives created since")
     c.add_argument("--limit", type=int, default=5, metavar="N", help="newest N archives (5)")
+    k = sub.add_parser(
+        "clips", help="viewer clips of a VOD, or of all our streams of a channel (Helix)"
+    )
+    k.add_argument("refs", nargs="+", metavar="LOGIN_OR_VIDEO")
+    k.add_argument("--top", type=int, metavar="N", help="clips per broadcast, by views (100)")
+    cal = sub.add_parser(
+        "calibrate", help="read-only: a VOD vs our live recording of it (T0, chat clock)"
+    )
+    cal.add_argument("ref", metavar="ID_OR_URL")
+    cal.add_argument("--windows", type=int, default=3, metavar="N", help="audio windows (3)")
+    cal.add_argument(
+        "--search", type=_positive, default=20.0, metavar="S", help="search +/- S s (20)"
+    )
     s = sub.add_parser("status", help="backfilled VODs and their progress")
     s.add_argument("video_ids", nargs="*")
     return p.parse_args(argv)
@@ -134,6 +176,7 @@ def options(args: argparse.Namespace) -> VodOptions:
         media=not args.no_media,
         video=args.video,
         max_minutes=args.max_minutes,
+        chat_max_minutes=args.chat_max_minutes,
         start_offset_s=args.start_offset,
         transcribe=not args.no_transcribe,
         chat=not args.no_chat,
@@ -158,16 +201,21 @@ def status_lines(found: list) -> list[str]:
         return ["no backfilled VODs"]
     out = [
         f"{'video':<12} {'channel':<16} {'stream':>6} {'t0 (method)':<36} {'media':<11} "
-        f"{'done':>15} {'chunks':>6} {'gaps':>4} {'muted':>7} {'transcribed':>11}"
+        f"{'done':>15} {'chunks':>6} {'gaps':>4} {'muted':>7} {'transcribed':>11} "
+        f"{'chat':<11} {'chat done':>15} {'chat s':>7} {'clips':>5}"
     ]
     for r in found:
         pct = 100 * r.media_done_s / r.duration_s if r.duration_s else 100.0
+        chat_pct = 100 * r.chat_done_s / r.duration_s if r.duration_s else 100.0
         out.append(
             f"{r.video_id:<12} {r.login:<16} {r.stream_id:>6} "
             f"{r.t0_utc.isoformat(timespec='milliseconds') + ' (' + r.t0_method + ')':<36} "
             f"{r.media_status:<11} {f'{r.media_done_s:.0f}/{r.duration_s:.0f}s {pct:.0f}%':>15} "
             f"{r.chunks:>6} {r.gaps:>4} {f'{float(r.muted_s):.0f}s':>7} "
-            f"{f'{r.transcribed}/{r.transcribed + r.transcribe_pending}':>11}"
+            f"{f'{r.transcribed}/{r.transcribed + r.transcribe_pending}':>11} "
+            f"{r.chat_status:<11} "
+            f"{f'{r.chat_done_s}/{r.duration_s:.0f}s {min(100, chat_pct):.0f}%':>15} "
+            f"{r.chat_seconds:>7} {r.clips:>5}"
         )
         if r.flags:
             out.append(f"{'':<12} flags: {r.flags}")
@@ -195,15 +243,68 @@ async def amain(argv: list[str]) -> int:
                 found = await rows.status_rows(s, args.video_ids)
             print("\n".join(status_lines(found)))
             return 0
+        if args.cmd == "clips":
+            return await _clips(args, sessions)
         return await _backfill(args, settings, sessions)
     finally:
         await engine.dispose()
 
 
+async def _clips(args: argparse.Namespace, sessions) -> int:
+    twitch = TwitchSettings()
+    if not twitch.has_credentials:
+        error(f"`clips` {NO_HELIX}")
+        return 2
+    bs = BackfillSettings()
+    helix = HelixClient.from_settings(twitch)
+    collector = ClipCollector(sessions, helix, top=args.top or bs.clips_top)
+    failed = 0
+    try:
+        for ref in args.refs:
+            try:
+                if ref.isdigit() or "/" in ref:
+                    results = [await collector.for_video(parse_video_ref(ref))]
+                else:
+                    results = await collector.for_channel(ref.lower())
+            except Exception as exc:  # one bad ref must not stop the others
+                if not isinstance(exc, UsageError | LookupError | HelixError | httpx.HTTPError):
+                    log.exception("clips failed", ref=ref)
+                error(f"[error] {ref}: {type(exc).__name__}: {exc}"[:300])
+                failed += 1
+                continue
+            if not results:
+                print(f"{ref}: no streams of ours")
+            for result in results:
+                print("\n".join(result.lines()))
+    finally:
+        await helix.aclose()
+    return 1 if failed else 0
+
+
+async def _calibrate(args: argparse.Namespace, settings: Settings, backfiller) -> int:
+    from clipper_backfill.calibrate import calibrate  # numpy: only this command needs it
+
+    store = ObjectStore(settings)  # read-only: the live chunks' audio
+    try:
+        found = await calibrate(
+            backfiller, store, args.ref, windows=args.windows, search_s=args.search
+        )
+    except (UsageError, ValueError) as exc:  # ValueError: e.g. no T0 candidate at all
+        error(f"[error] {args.ref}: {type(exc).__name__}: {exc}")
+        return 2
+    except (DownloadError, MediaError, VodError, GqlError, HelixError, httpx.HTTPError) as exc:
+        log.exception("calibrate failed", ref=args.ref)
+        error(f"[failed] {args.ref}: {type(exc).__name__}: {exc}"[:300])
+        return 1
+    print("\n".join(found.lines()))
+    return 0
+
+
 async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> int:
     bs = BackfillSettings()
-    opts = options(args)
-    if opts.media and not opts.dry_run and shutil.which(bs.ffmpeg) is None:
+    opts = options(args) if args.cmd != "calibrate" else VodOptions(dry_run=True)
+    needs_ffmpeg = args.cmd == "calibrate" or (opts.media and not opts.dry_run)
+    if needs_ffmpeg and shutil.which(bs.ffmpeg) is None:
         log.error("ffmpeg not found, set CLIPPER_BACKFILL_FFMPEG", ffmpeg=bs.ffmpeg)
         return 1
     twitch = TwitchSettings()
@@ -217,6 +318,7 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
         stale = remove_stale_workdirs(bs.temp_dir, older_than_s=bs.lease_ttl_s)
         if stale:
             log.info("removed temp dirs of killed runs", dirs=[str(p) for p in stale])
+    if not opts.dry_run and opts.media:  # chat and clips need no object storage
         store = ObjectStore(settings)
         await asyncio.to_thread(store.ensure_bucket)
     gql = GqlChatReplay.from_settings(twitch)
@@ -234,7 +336,10 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
                 owner=settings.worker_id,
                 helix=helix,
                 stop=stop,
+                emotes=HttpEmoteSets(http),
             )
+            if args.cmd == "calibrate":
+                return await _calibrate(args, settings, backfiller)
             refs = args.refs if args.cmd == "vod" else await channel_refs(helix, args)
             if not refs:
                 print("no archives found")

@@ -46,3 +46,8 @@ async def test_channel_emotes_and_404_means_none():
 async def test_failing_provider_does_not_break_the_others():
     emotes = await fetch_channel_emotes(client(fail={"7tv.io"}), "42")
     assert emotes == {"OMEGALUL": "bttv", "PogU": "bttv"}
+    failed: list[str] = []
+    await fetch_channel_emotes(client(fail={"7tv.io"}), "42", failed=failed)
+    assert failed == ["7tv"]  # reported to a caller that asks
+    await fetch_channel_emotes(client(), "999", failed=failed)
+    assert failed == ["7tv"]  # 404: the channel just doesn't use it

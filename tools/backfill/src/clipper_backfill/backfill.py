@@ -5,9 +5,12 @@ credentials), the renditions (streamlink), the media playlist (+ `audio_only` fo
 first run with `--video`), a few chat pages for the T0 cross-check (first run only), and our
 own rows. Then, unless dry: the lease, stream + vods rows (first run), and the media pipeline.
 
+Then, in order: media (`pipeline`), chat replay (`chat`: the live chat tables, unless the channel
+has live chat in the VOD's range), viewer clips (`clips`, Helix credentials needed).
+
 Skipped: highlights/uploads (no broadcast), archives still recording, broadcasts we recorded live
-(clips only, step 5d). Sub-only (usher 403): `media_status='restricted'` and a `not_recorded` gap
-over the VOD. Chat replay and viewer clips are step 5d (not written yet).
+(clips only). Sub-only (usher 403): `media_status='restricted'` and a `not_recorded` gap over the
+VOD; its chat is still fetched.
 """
 
 from __future__ import annotations
@@ -26,6 +29,16 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from clipper_backfill import rows
+from clipper_backfill.chat import (
+    ChatRunner,
+    EmoteSets,
+    StaticEmoteSets,
+    chat_clock,
+    chat_window,
+    window_for,
+)
+from clipper_backfill.chat import result_lines as chat_result_lines
+from clipper_backfill.clips import ClipCollector
 from clipper_backfill.download import Downloader
 from clipper_backfill.pipeline import TEMP_PREFIX, LeaseKeeper, MediaResult, MediaRunner, Store
 from clipper_backfill.planner import Plan, PlanError, Unit, check_aligned, plan_units
@@ -42,6 +55,7 @@ log = get_logger(__name__)
 
 AUDIO = "audio_only"
 AUDIO_BYTES_PER_S = 27_400  # audio_only TS: ~274 KB per 10 s segment (DESIGN §3)
+NO_HELIX = "needs Helix credentials (CLIPPER_TWITCH_CLIENT_ID / CLIPPER_TWITCH_CLIENT_SECRET)"
 _VIDEO_PATH = re.compile(r"/videos?/(\d+)")
 
 
@@ -69,11 +83,12 @@ class VodOptions:
     dry_run: bool = False
     media: bool = True  # False (`--no-media`): rows only, `media_status='off'`
     video: str | None = None  # rendition to take (video + its audio); None: audio_only
-    max_minutes: float | None = None  # media per run
-    start_offset_s: float = 0.0  # first run: start here (the part before is `not_recorded`)
+    max_minutes: float | None = None  # media and chat per run (each from its own resume point)
+    chat_max_minutes: float | None = None  # chat per run, instead of `max_minutes`
+    start_offset_s: float = 0.0  # first run, media only: start here (before: `not_recorded`)
     transcribe: bool = True
-    chat: bool = True  # step 5d (not fetched yet): False sets `chat_status='off'`
-    clips: bool = True  # step 5d (not fetched yet)
+    chat: bool = True  # False: no chat replay this run (`chat_status='off'` on a first run)
+    clips: bool = True  # viewer clips (Helix credentials needed)
 
 
 @dataclass(slots=True)
@@ -163,6 +178,8 @@ class Backfiller:
         helix: HelixClient | None = None,
         stop: asyncio.Event | None = None,
         after_commit: Callable[[Unit], Awaitable[Any]] | None = None,
+        emotes: EmoteSets | None = None,
+        after_chat_commit: Callable[[int], Awaitable[Any]] | None = None,
     ) -> None:
         self.sessions = sessions
         self.store = store
@@ -174,6 +191,10 @@ class Backfiller:
         self.helix = helix
         self.stop = stop
         self.after_commit = after_commit
+        self.after_chat_commit = after_chat_commit
+        if emotes is None:
+            log.warning("no third-party emote sets: only Twitch emotes are counted")
+        self.emotes = emotes or StaticEmoteSets()
         self.downloader = Downloader(
             http,
             concurrency=settings.downloads,
@@ -184,12 +205,17 @@ class Backfiller:
     async def vod(self, ref: str, opts: VodOptions | None = None) -> VodOutcome:
         video_id = parse_video_ref(ref)
         requests, size = self.downloader.requests, self.downloader.bytes
+        gql_requests = getattr(self.gql, "requests", None)
         with log_context(video_id=video_id):
             outcome = await self._vod(video_id, opts or VodOptions())
         if self.downloader.requests > requests:
             outcome.lines.append(
                 f"downloaded: {self.downloader.requests - requests} requests, "
                 f"{(self.downloader.bytes - size) / 1e6:.2f} MB (playlists + segments)"
+            )
+        if gql_requests is not None:
+            outcome.lines.append(
+                f"gql: {self.gql.requests - gql_requests} requests (metadata + chat pages)"
             )
         return outcome
 
@@ -230,18 +256,23 @@ class Backfiller:
                     platform_stream_id=broadcast.stream_id,
                 )
             if live is not None:
-                return VodOutcome(
-                    video_id,
-                    "skipped",
-                    f"recorded live as stream {live}: live data wins (clips only: step 5d)",
-                )
+                message = f"recorded live as stream {live}: live data wins (clips only)"
+                clips = await self._clips(video_id, opts, vod_id=None)
+                return VodOutcome(video_id, "skipped", message, clips)
             new = await self._new_vod(meta, media, broadcast, opts)
 
         lines = self._describe(meta, media, existing, new)
         if opts.dry_run:
             lines += await self._describe_plan(media, existing, opts)
+            lines += await self._describe_chat(meta, existing, new, opts)
+            if opts.clips:
+                lines.append(
+                    f"clips: would fetch the top {self.settings.clips_top} by views (Helix)"
+                    if self.helix
+                    else f"clips: skipped: {NO_HELIX}"
+                )
             return VodOutcome(video_id, "dry_run", "nothing written", lines)
-        return await self._write(video_id, media, existing, new, opts, lines)
+        return await self._write(video_id, meta, media, existing, new, opts, lines)
 
     async def _playlists(self, video_id: str, opts: VodOptions, *, first_run: bool) -> _Media:
         media = _Media()
@@ -283,7 +314,8 @@ class Backfiller:
                 log.warning("chat sample failed, T0 without chat", error=str(exc))
                 break
             for c in page.comments:
-                points.setdefault(c.id, ChatPoint(c.content_offset_s, c.created_at))
+                if c.created_at is not None:
+                    points.setdefault(c.id, ChatPoint(c.content_offset_s, c.created_at))
         return list(points.values()), info
 
     async def _new_vod(
@@ -356,6 +388,7 @@ class Backfiller:
     async def _write(
         self,
         video_id: str,
+        meta: VodMeta,
         media: _Media,
         existing: rows.VodRow | None,
         new: rows.NewVod | None,
@@ -367,6 +400,7 @@ class Backfiller:
             holder = await lease.holder()
             return VodOutcome(video_id, "busy", f"another run holds the lease ({holder})", lines)
         lease.start()
+        live = chat = None
         try:
             async with self.sessions.begin() as s:
                 await lease.check(s)
@@ -376,48 +410,189 @@ class Backfiller:
                     try:
                         vod = await rows.create_vod(s, new)
                     except rows.RecordedLive as exc:
-                        return VodOutcome(video_id, "skipped", f"{exc}: clips only (5d)", lines)
-                    lines.append(f"created stream {vod.stream_id} and vods row {vod.id}")
-            if media.restricted and vod.media_status == VodMediaStatus.DONE:
-                note = "media complete already (now restricted)"
-                return VodOutcome(video_id, "done", note, lines)
-            if media.restricted:
-                async with self.sessions.begin() as s:
-                    await lease.check(s)
-                    marked = await rows.mark_restricted(s, vod)
-                note = "marked restricted, not_recorded gap" if marked else "already restricted"
-                return VodOutcome(video_id, "restricted", f"sub-only: {note}", lines)
-            if not opts.media:
-                return VodOutcome(video_id, "rows_only", "--no-media: no media fetched", lines)
-            if opts.transcribe:
-                async with self.sessions.begin() as s:
-                    await lease.check(s)
-                    added = await rows.enqueue_missing_jobs(s, vod.stream_id)
-                if added:
-                    lines.append(f"queued {added} transcribe jobs left out by --no-transcribe")
-            if vod.media_status == VodMediaStatus.DONE:
-                return VodOutcome(video_id, "done", "media complete already", lines)
-            if vod.media_status != VodMediaStatus.PENDING:  # off/gone/restricted -> fetch again
-                async with self.sessions.begin() as s:
-                    await lease.check(s)
-                    await rows.update_vod(s, vod.id, media_status=str(VodMediaStatus.PENDING))
-                vod = replace(vod, media_status=str(VodMediaStatus.PENDING))
-            assert media.playlist is not None
-            try:  # another rendition may be cut elsewhere: its chunks would overlap ours
-                check_aligned(media.playlist.segments, vod.media_done_s)
-            except PlanError as exc:
-                hint = f"; continue with --video {vod.rendition}" if vod.rendition else ""
-                if vod.rendition == AUDIO:
-                    hint = "; continue without --video"
-                return VodOutcome(video_id, "refused", f"{media.rendition}: {exc}{hint}", lines)
-            if vod.rendition and media.rendition != vod.rendition:
-                log.info("rendition differs from the first run", first=vod.rendition)
-            result = await self._media(vod, media, opts, lease)
+                        live = exc.stream_id
+                        vod = None
+                    else:
+                        lines.append(f"created stream {vod.stream_id} and vods row {vod.id}")
+            if vod is None:
+                lines += await self._clips(video_id, opts, vod_id=None)
+                return VodOutcome(
+                    video_id, "skipped", f"recorded live as stream {live}: clips only", lines
+                )
+            status, message, result = await self._media_stage(vod, media, opts, lease, lines)
+            if status == "refused":
+                return VodOutcome(video_id, status, message, lines)
+            if opts.chat and not (self.stop is not None and self.stop.is_set()):
+                chat = await self._chat_stage(vod, meta, opts, lease, lines)
         finally:
             await lease.release()
+        if chat is not None:
+            message += f"; chat {chat}"
+            if chat == VodChatStatus.PENDING and status in ("done", "rows_only"):
+                status = "partial"
+        if self.stop is None or not self.stop.is_set():
+            lines += await self._clips(video_id, opts, vod_id=vod.id)
+        return VodOutcome(video_id, status, message, lines, result)
+
+    async def _media_stage(
+        self,
+        vod: rows.VodRow,
+        media: _Media,
+        opts: VodOptions,
+        lease: LeaseKeeper,
+        lines: list[str],
+    ) -> tuple[str, str, MediaResult | None]:
+        """(outcome status, message, result) of the media part of a run."""
+        if media.restricted and vod.media_status == VodMediaStatus.DONE:
+            return "done", "media complete already (now restricted)", None
+        if media.restricted:
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                marked = await rows.mark_restricted(s, vod)
+            note = "marked restricted, not_recorded gap" if marked else "already restricted"
+            return "restricted", f"sub-only: {note}", None
+        if not opts.media:
+            return "rows_only", "--no-media: no media fetched", None
+        if opts.transcribe:
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                added = await rows.enqueue_missing_jobs(s, vod.stream_id)
+            if added:
+                lines.append(f"queued {added} transcribe jobs left out by --no-transcribe")
+        if vod.media_status == VodMediaStatus.DONE:
+            return "done", "media complete already", None
+        if vod.media_status != VodMediaStatus.PENDING:  # off/gone/restricted -> fetch again
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                await rows.update_vod(s, vod.id, media_status=str(VodMediaStatus.PENDING))
+            vod = replace(vod, media_status=str(VodMediaStatus.PENDING))
+        assert media.playlist is not None
+        try:  # another rendition may be cut elsewhere: its chunks would overlap ours
+            check_aligned(media.playlist.segments, vod.media_done_s)
+        except PlanError as exc:
+            hint = f"; continue with --video {vod.rendition}" if vod.rendition else ""
+            if vod.rendition == AUDIO:
+                hint = "; continue without --video"
+            return "refused", f"{media.rendition}: {exc}{hint}", None
+        if vod.rendition and media.rendition != vod.rendition:
+            log.info("rendition differs from the first run", first=vod.rendition)
+        result = await self._media(vod, media, opts, lease)
         lines += _result_lines(result)
         status = "done" if result.status == VodMediaStatus.DONE else "partial"
-        return VodOutcome(video_id, status, f"media {result.status}", lines, result)
+        return status, f"media {result.status}", result
+
+    async def _chat_stage(
+        self,
+        vod: rows.VodRow,
+        meta: VodMeta,
+        opts: VodOptions,
+        lease: LeaseKeeper,
+        lines: list[str],
+    ) -> str:
+        """Chat replay -> the live chat tables; returns `vods.chat_status` afterwards."""
+        if vod.chat_status == VodChatStatus.DONE:
+            lines.append("chat: complete already")
+            return str(VodChatStatus.DONE)
+        async with self.sessions() as s:
+            foreign = await rows.foreign_chat_metrics(
+                s, channel_id=vod.channel_id, stream_id=vod.stream_id, window=chat_window(vod)
+            )
+        what = "live chat" if foreign is None or foreign.live else "another stream's chat"
+        if foreign is not None and foreign.rows >= self.settings.chat_guard_min_s:
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                await rows.update_vod(s, vod.id, chat_status=str(VodChatStatus.SKIPPED))
+            lines.append(
+                f"chat: skipped: the channel has {what} in the VOD's range ({foreign.rows} "
+                f"seconds, {foreign.first.isoformat()} .. {foreign.last.isoformat()}): live wins"
+            )
+            return str(VodChatStatus.SKIPPED)
+        if foreign is not None:  # a few stray seconds: proceed, those seconds stay theirs
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                await rows.merge_flags(s, vod.id, {"chat_foreign_seconds": foreign.rows})
+            lines.append(
+                f"chat: {foreign.rows} seconds of {what} in the VOD's range (< "
+                f"{self.settings.chat_guard_min_s}): kept as they are, the rest is backfilled"
+            )
+        if vod.chat_status != VodChatStatus.PENDING:  # off/skipped/unavailable -> try again
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                await rows.update_vod(s, vod.id, chat_status=str(VodChatStatus.PENDING))
+        twitch_id = vod.channel_user_id or meta.user_id
+        channel_emotes = await self.emotes.channel_emotes(twitch_id) if twitch_id else {}
+        global_emotes = await self.emotes.global_emotes()
+        failed = self.emotes.failed(twitch_id)
+        if failed:  # proceed (FFZ is unreachable from the dev PC), but say so in the row
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                before = await rows.flag_value(s, vod.id, "emote_sets_failed", lock=True)
+                failed = sorted({*(before or []), *failed})
+                await rows.merge_flags(s, vod.id, {"emote_sets_failed": failed})
+            lines.append(
+                f"chat: emote sets of {', '.join(failed)} could not be fetched: their emotes "
+                "are not counted (vods.flags.emote_sets_failed)"
+            )
+        minutes = opts.chat_max_minutes if opts.chat_max_minutes is not None else opts.max_minutes
+        runner = ChatRunner(
+            self.sessions,
+            self.gql,
+            lease,
+            batch_pages=self.settings.chat_batch_pages,
+            stop=self.stop,
+            after_commit=self.after_chat_commit,
+        )
+        try:
+            result = await runner.run(
+                vod,
+                channel_emotes=channel_emotes,
+                global_emotes=global_emotes,
+                until_s=None if minutes is None else vod.chat_done_s + minutes * 60,
+            )
+        except ReplayUnavailable as exc:
+            async with self.sessions.begin() as s:
+                await lease.check(s)
+                await rows.update_vod(s, vod.id, chat_status=str(VodChatStatus.UNAVAILABLE))
+            lines.append(f"chat: unavailable: {exc}")
+            return str(VodChatStatus.UNAVAILABLE)
+        lines.append(
+            f"chat sets: {len(channel_emotes)} channel + {len(global_emotes)} global "
+            "third-party emotes (current sets)"
+        )
+        lines += chat_result_lines(result, vod.duration_s)
+        return result.status
+
+    async def _clips(self, video_id: str, opts: VodOptions, *, vod_id: int | None) -> list[str]:
+        """Viewer clips of the VOD (`--no-clips` turns it off). Never fails the run: media and
+        chat are committed by now; a failure is logged and kept in `vods.flags.clips_error`
+        (cleared by the next successful fetch)."""
+        if not opts.clips or opts.dry_run:
+            return []
+        if self.helix is None:
+            return [f"clips: skipped: {NO_HELIX}"]
+        try:
+            found = await ClipCollector(
+                self.sessions, self.helix, top=self.settings.clips_top
+            ).for_video(video_id)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"[:300]
+            log.exception("clips failed, a re-run tries again", error=error)
+            await self._clips_flag(vod_id, error)
+            return [f"clips: failed: {error}"]
+        await self._clips_flag(vod_id, None)
+        return found.lines()
+
+    async def _clips_flag(self, vod_id: int | None, error: str | None) -> None:
+        if vod_id is None:
+            return
+        try:
+            async with self.sessions.begin() as s:
+                if error is None:
+                    await rows.drop_flags(s, vod_id, "clips_error")
+                else:
+                    await rows.merge_flags(s, vod_id, {"clips_error": error})
+        except Exception:
+            log.exception("could not record the clips outcome")
 
     async def _media(
         self, vod: rows.VodRow, media: _Media, opts: VodOptions, lease: LeaseKeeper
@@ -484,6 +659,43 @@ class Backfiller:
             if new.flags:
                 lines.append(f"  flags: {_compact(new.flags)}")
         return lines
+
+    async def _describe_chat(
+        self,
+        meta: VodMeta,
+        existing: rows.VodRow | None,
+        new: rows.NewVod | None,
+        opts: VodOptions,
+    ) -> list[str]:
+        if not opts.chat:
+            return ["chat: --no-chat"]
+        if existing is not None and existing.chat_status == VodChatStatus.DONE:
+            return ["chat: complete already"]
+        async with self.sessions() as s:
+            if existing is not None:
+                channel_id, stream_id = existing.channel_id, existing.stream_id
+                window = chat_window(existing)
+            else:
+                assert new is not None
+                channel_id = await rows.find_channel(s, login=meta.login, user_id=meta.user_id)
+                stream_id = -1
+                t0 = new.t0
+                window = window_for(t0.t0, t0.method, t0.candidates, new.duration_s)
+            foreign = None
+            if channel_id is not None:
+                foreign = await rows.foreign_chat_metrics(
+                    s, channel_id=channel_id, stream_id=stream_id, window=window
+                )
+        if foreign is not None and foreign.rows >= self.settings.chat_guard_min_s:
+            return [f"chat: would be skipped: {foreign.rows} seconds of other chat in range"]
+        if existing is None or existing.chat_metrics_to is None:
+            return ["chat: would page the replay from offset 0"]
+        start = chat_clock(existing).resume_offset(existing.chat_metrics_to)
+        return [
+            f"chat: would resume at offset {min(start, existing.chat_done_s)} s (messages "
+            f"committed to {existing.chat_done_s} s, metrics final before "
+            f"{existing.chat_metrics_to.isoformat()})"
+        ]
 
     async def _describe_plan(
         self, media: _Media, existing: rows.VodRow | None, opts: VodOptions

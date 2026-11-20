@@ -190,7 +190,8 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         doc: dict[str, Any] = {
             "timestamp": _timestamp(record),
-            "level": record.levelname,
+            # upper(): streamlink renames the stdlib levels to lowercase when it is imported
+            "level": record.levelname.upper(),
             "service": _process["service"],
             "worker": _process["worker"],
             "logger": record.name,
@@ -206,7 +207,7 @@ class ConsoleFormatter(logging.Formatter):
         exception = fields.pop("exception", None)
         fields.pop("exc_type", None)
         line = (
-            f"{_timestamp(record)[11:]} {record.levelname:<7} {_process['service']} "
+            f"{_timestamp(record)[11:]} {record.levelname.upper():<7} {_process['service']} "
             f"{record.name}: {record.getMessage()}"
         )
         if fields:

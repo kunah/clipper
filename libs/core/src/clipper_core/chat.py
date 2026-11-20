@@ -123,6 +123,18 @@ class SecondAggregator:
         for name, count in emotes:
             bucket.emotes[name] += count
 
+    def add_row(self, row: MessageRow) -> None:
+        """Count one stored message: its channel, stream and second; a chatter is its user id
+        (else login; none: not a chatter); emotes by name. Live and backfill both count this way,
+        so their `chat_metrics_1s` agree for the same messages."""
+        self.add_message(
+            row.channel_id,
+            row.stream_id,
+            row.sent_at,
+            row.user_id or row.user_login,
+            ((e["name"], e["count"]) for e in row.emotes or ()),
+        )
+
     def add_event(
         self, channel_id: int, stream_id: int | None, sent_at: datetime, kind: str
     ) -> None:
@@ -174,10 +186,15 @@ class ChatWriter:
     Messages: `ON CONFLICT DO NOTHING` (PK `sent_at, msg_id`), so re-writing a batch is safe.
     Metrics: upserted per `(channel_id, ts)`. Events: plain inserts. Creates the chat partitions
     of the days it writes (remembered per writer instance).
+
+    `keep_foreign_metrics=True` (the backfill tool): an existing metrics row of another stream, or
+    of no stream (live chat while offline), is left as it is instead of overwritten, so a writer
+    never replaces the other source's seconds (one writer per table and source, DESIGN §17).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, keep_foreign_metrics: bool = False) -> None:
         self._partition_days: set[date] = set()
+        self.keep_foreign_metrics = keep_foreign_metrics
 
     async def write(
         self,
@@ -206,6 +223,11 @@ class ChatWriter:
                     "emote_counts": stmt.excluded.emote_counts,
                     "event_counts": stmt.excluded.event_counts,
                 },
+                where=(
+                    ChatMetricSecond.stream_id == stmt.excluded.stream_id
+                    if self.keep_foreign_metrics
+                    else None
+                ),
             )
             await session.execute(stmt, [asdict(m) for m in metrics])
         if deleted_msg_ids:

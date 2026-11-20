@@ -4,12 +4,11 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-19):** Phase 1 / steps 1–4 done (workspace, shared core, schema, job queue,
-> unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber). The transcriber
+> **Status (2026-11-20):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
+> unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill). The transcriber
 > is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
-> `transcriber` compose service, profile `gpu`). Step 5 (backfill, design §17 proposed) in
-> progress: 5a (contract + shared code), 5b (Twitch VOD access + smoke test) and 5c (`clipper-backfill`:
-> VOD media + time, tested on a real VOD) done; 5d (chat replay, clips, calibrate) next.
+> `transcriber` compose service, profile `gpu`). Step 5 (backfill tool, design §17 proposed)
+> done 2026-11-20; it needs migration 0003 on the live DB before a real backfill.
 > Phase 2 designs §18–§22 are proposed, not yet agreed.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
@@ -76,7 +75,7 @@ may contain copyrighted music (Content ID).
 | TikTok posting API | Posts are private-only until the app passes an audit. |
 | Twitch chat | IRC (anonymous read-only) can join many channels. Tags give `tmi-sent-ts`, emotes, badges, USERNOTICE (subs/raids), CLEARMSG. |
 | Twitch status | Helix Get Streams: up to 100 channels per request, includes viewer count. |
-| Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. Seen 2026-11-19 (smoke test, xqc archive, anonymous GQL `VideoCommentsByOffsetOrCursor` with the old mobile client id, no integrity error): pages of 53–56 comments; a page asked by offset starts a few s **before** it (41867 → 41864); `contentOffsetSeconds` is a JSON int; `createdAt` is UTC (`Z`, ms, trailing zeros dropped), no whole-hour shift in 216 comments; `createdAt − offset` stays in one 1 s band from the start to 11.6 h in (no drift): Twitch's chat T0 ≈ the video's GQL `createdAt` + 0.7 s if offsets are truncated (+ 1.2 s if rounded; not decidable from replay alone). 5c run: 338 comments from 6 pages spread over the 23 h: one band of 0.99 s, chat anchor (truncated) = `T0_pdt` + 3.916 s. The smoke test compared against GQL `createdAt`; Helix `created_at` was not fetched (no credentials). A resub showed up as a plain comment carrying the system text; 7TV/BTTV emotes are plain text; badges with empty set id/version occur. |
+| Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. Seen 2026-11-19 (smoke test, xqc archive, anonymous GQL `VideoCommentsByOffsetOrCursor` with the old mobile client id, no integrity error): pages of 53–56 comments; a page asked by offset starts a few s **before** it (41867 → 41864); `contentOffsetSeconds` is a JSON int; `createdAt` is UTC (`Z`, ms, trailing zeros dropped), no whole-hour shift in 216 comments; `createdAt − offset` stays in one 1 s band from the start to 11.6 h in (no drift): Twitch's chat T0 ≈ the video's GQL `createdAt` + 0.7 s if offsets are truncated (+ 1.2 s if rounded; not decidable from replay alone). 5c run: 338 comments from 6 pages spread over the 23 h: one band of 0.99 s, chat anchor (truncated) = `T0_pdt` + 3.916 s. 5d run (first 4 min, 2426 comments, 0 off the band by > 2 s, none without `createdAt` or commenter): `createdAt − T_chat − offset` ∈ [0.001, 0.987] s on the re-fetched boundary pages, i.e. consistent with truncated offsets; ~5.6 s of VOD per page at the stream start (~10 comments/s); cursor pages never repeated a comment. The smoke test compared against GQL `createdAt`; Helix `created_at` was not fetched (no credentials). A resub showed up as a plain comment carrying the system text; 7TV/BTTV emotes are plain text; badges with empty set id/version occur. |
 | Twitch VOD HLS | Seen 2026-11-19 (smoke test, xqc archive 2932113307, 23 h, via streamlink): renditions `audio_only`, 160p30–1080p60 (`best` = source 1080p60). Media playlists `index-dvr.m3u8`: `PLAYLIST-TYPE:EVENT` + `ENDLIST`, segments `N.ts`, **MPEG-TS** (audio_only: AAC 48 kHz stereo + timed ID3, ~274 KB per 10 s; 1080p60: H.264 + AAC + ID3, ~10.5 MB per 10 s), EXTINF mostly 10.000 with some longer (TARGETDURATION 13), segment timestamps don't start at 0. **Only `audio_only` has `EXT-X-PROGRAM-DATE-TIME`** (every segment, ms), and it is exactly T0 + ΣEXTINF (zero deviation over 23 h, so it shows no gaps) with T0 = the video's GQL `createdAt` − 3.2 s (Helix not checked: no credentials); video renditions have none. `EXT-X-TWITCH-TOTAL-SECS` = ΣEXTINF (83735.25; `lengthSeconds` 83735). `#ID3-EQUIV-TDTG` (no zone) ≈ the VOD's *end* (+ 6 s), not its start. Path `<hash>_<login>_<stream_id>_<epoch>`: epoch = GQL `createdAt` − 6 s. Muted parts: `N-muted.ts`; `audio_only` and 1080p60 were compared: same count (1280 of 8343) and same first names (18–20-muted), full index sets not compared; a muted segment still has its AAC track. No `-unmuted` names, no discontinuities. fMP4 VODs not seen yet (xqc is TS live too). Unknown VOD id: no playback token (streamlink returns no streams); GQL `video: null`. 5c run (2026-11-19, same VOD, first 10 min): segments 18–35 muted, the stored `.aac` (ADTS copy of the TS audio) is ~1.27 MB per 60 s; anonymous GQL metadata (plain query, web client id) gives `createdAt`, `lengthSeconds`, `status`, `broadcastType`, owner, game and `seekPreviewsURL`, whose path `<hash>_<login>_<stream_id>_<epoch>` names the broadcast without a playlist (also for sub-only VODs, presumably). |
 | Twitch clips | Get Clips returns top viewer-made clips with `vod_offset` → free ground truth for testing the detector. |
 | Twitch HLS | 2 s segments, each with `EXT-X-PROGRAM-DATE-TIME`, in one of two containers depending on the channel (seen 2026-11-18): MPEG-TS (H.264 + AAC 48 kHz + timed ID3; e.g. xqc) or fragmented MP4 (`EXT-X-MAP` init section + `.mp4` fragments, all renditions incl. audio_only; e.g. ohnepixel), even when only H.264 is requested; the live playlist holds only ~30 s, so a recorder restarted within ~30 s loses nothing. Source 1080p60 ≈ 8.4 Mbps (~63 MB/min); audio ≈ 165 kbps (~1.2 MB/min). Ads are inserted for our recorder (a viewer): segments titled "Amazon…" or inside a `twitch-stitched-ad` DATERANGE; filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
@@ -161,7 +160,7 @@ Services talk only through Postgres and object storage.
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Telegram bot | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
-| tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c); chat_*, viewer_clips (5d) | slim + ffmpeg (profile `tools`) |
+| tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c), chat_messages, chat_metrics_1s (5d); viewer_clips (5d, all streams) | slim + ffmpeg (profile `tools`) |
 
 Rules:
 - **One writer per table**, anyone reads.
@@ -248,16 +247,17 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    `clipper_core.transcripts.words()/coverage()` for consumers. E2e on 20 real chunks: 13×
    realtime (CED on CPU is the slowest stage), 2.35 GB GPU. 313 tests.
    Full design: [§16](#16-transcriber-design-step-4).
-5. ⬜ backfill tool: past VODs + chat replay + top clips → detector development offline.
-   Design: [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed
-   2026-11-19, not yet agreed). In progress: 5a done (migration 0003 `vods` + `viewer_clips` +
-   `streams` source CHECKs, `GapReason.MUTED`, shared `clipper_core.{chunks,chat,ffmpeg}` used by
-   recorder and chat-ingest, controller guard for backfilled streams, VOD playlist parser); 5b
-   done (Helix `get_videos`/`get_clips`, `clipper_twitch.vod` (streamlink) and `clipper_twitch.gql`
-   (chat replay) with fakes, `twitch_live` smoke test run once: VOD facts in §3); 5c done
-   (`tools/backfill`, `clipper-backfill vod|channel|status`: T0 from the `audio_only` PDT (chat
-   anchor + created_at as cross-checks), chunk planner, downloads ≤ 4 at a time, one transaction per
-   chunk with `vods.media_done_s`, resume after a crash, `--dry-run`; real run on 10 min of a VOD).
+5. ✅ backfill tool (`tools/backfill`, `clipper-backfill vod|channel|clips|status|calibrate`):
+   past VODs written in the live format. Media: `audio_only` ~60 s chunks, T0 from the playlist's
+   PDT (chat anchor + created_at as cross-checks), `muted` gaps, priority-0 transcribe jobs, one
+   transaction per chunk with `vods.media_done_s`, lease + resume, `--dry-run`. Chat replay (GQL)
+   → `chat_messages` / `chat_metrics_1s` through the live aggregator, watermark resume, skipped
+   where live chat exists. Viewer clips (Helix) → `viewer_clips` (T0 + vod_offset ± slack).
+   Shared code moved to `clipper_core.{chunks,chat,ffmpeg}`; migration 0003 (`vods`,
+   `viewer_clips`, `streams` CHECKs). Tested on a real VOD (10 min media, 4 min chat); clips and
+   `calibrate` still need a real run (Helix credentials; a stream recorded live). Design:
+   [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not
+   yet agreed).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
@@ -584,8 +584,9 @@ are requeued by the controller after 15 min (exists).
 
 ## 17. Backfill tool (step 5) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal; 5a (shared pieces + contract), 5b (Twitch VOD access) and 5c (media + time:
-`tools/backfill`) are built. The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
+**Status:** proposal; 5a (shared pieces + contract), 5b (Twitch VOD access), 5c (media + time:
+`tools/backfill`) and 5d (chat replay, viewer clips, `calibrate`) are built; `calibrate` has not
+run on real data yet (needs a broadcast we recorded live, and the live DB/storage). The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
 and chat questions: see §3 (rows "Twitch VOD chat", "Twitch VOD HLS"); the time model below is
 updated with it (5c: T0 from PDT, see "Time model").
 
@@ -595,11 +596,12 @@ and viewer clips in the live format, so transcriber, detector and judge need no 
 
 **Commands** (idempotent; `--dry-run` does all reads, prints the plan, writes nothing):
 - `vod <id|url>... [--no-media] [--video [Q]] [--video-range A-B]... [--no-chat] [--no-clips]
-  [--no-transcribe]`: default is audio_only + chat + clips + jobs. `--video` takes a video rendition
+  [--no-transcribe] [--max-minutes N] [--chat-max-minutes N]`: default is audio_only + chat +
+  clips + jobs (in that order; clips only with Helix credentials). `--video` takes a video rendition
   and copies its audio out, like the recorder; `--video-range` adds video to the chunks it overlaps.
 - `channel <login> [--since D] [--limit N]`: the newest N archives, **oldest first** (VODs expire).
-- `clips <login>`, `status`, `calibrate <video_id>` (read-only; a stream also recorded live): T0
-  methods vs live PDT by audio correlation, `createdAt` vs `tmi-sent-ts`.
+- `clips <login|video>...`, `status`, `calibrate <video_id>` (read-only; a stream also recorded
+  live): T0 methods vs live PDT by audio correlation, `createdAt` vs `tmi-sent-ts`.
 
 **Skipped:** highlights/uploads (no `stream_id`), archives still live, streams with
 `source = 'live'` (clips only), sub-only media (usher 403 → one `not_recorded` gap; chat tried).
@@ -652,7 +654,9 @@ every candidate in `vods.t0_candidates` (pure estimator `clipper_backfill.t0`).
 - **Audio** (`calibrate`, ±20 ms, needs a live recording) measures both methods' bias once.
 - **Chat time:** `sent_at = createdAt` (ms, the `tmi-sent-ts` clock). Replay shows comments late by
   latency + reaction, like live, so `video_time ≈ chat_time − channel_delay` keeps the live delay.
-  Missing or > 2 s off → `T0 + offset + 0.5 s`. ~1 s suffices (per-second features).
+  Missing or > 2 s off → the **chat clock** `T_chat + offset + 0.5 s` (5d: not the media T0, which
+  is ~4 s earlier), `T_chat` = the frozen chat anchor (`t0_candidates.chat`), else `T0 + 3.9 s`
+  for a PDT T0, else T0. ~1 s suffices (per-second features).
 - **Gaps:** VODs have no ads. Each `EXT-X-DISCONTINUITY` starts a chunk (5c). Planned, not built:
   a *part* per discontinuity with T0 re-checked per part, a step ≥ 1 s becoming an `unknown` gap
   that shifts the rest (5c only flags PDT steps and counts `discontinuities`).
@@ -679,7 +683,7 @@ contiguous and exact. ffmpeg copy → `.ts` + `.aac` at `storage.keys`; 403 → 
 backfill match), `message_emotes()` → `clipper_twitch.emotes` (takes parsed Twitch emotes).
 - Mapping: `msg_id` = comment id. The user comes from `commenter` (null: kept, not a chatter).
   Twitch emotes come from fragments; 7TV/BTTV/FFZ match the *current* sets, so removed ones are
-  lost. Badges: `{setID: version}`. Clock: `T0 + offset`.
+  lost. Badges: `{setID: version}`. Clock: see "Chat time" (the chat clock, not `T0 + offset`).
 - **Not recoverable:** deleted messages (backfill is quieter in spam/mod waves) and all events (no
   USERNOTICE/CLEAR*/ROOMSTATE; bits only as text; a resub appeared as a plain comment by the
   subscriber carrying the system text, so sub notices count as chat messages, not events). So: **no** `chat_events` or `viewer_snapshots`,
@@ -818,6 +822,99 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
 4. **5d Chat + clips (+ calibrate):** mapping, watermark resume, the live-chat skip, `clips`,
    DESIGN.md updates. *Done when:* fixture pages give the live aggregator's metrics, a resume adds
    no duplicates, and clips map to `T0 + vod_offset`.
+   **Done 2026-11-19** (not deployed; no migration: 0003 has every column). `vod` runs media, then
+   chat, then clips; `clipper-backfill clips <login|video>...` and `calibrate <video>` are new.
+   - **Chat** (`clipper_backfill.chat`): pages `VideoCommentsByOffsetOrCursor` from 0 (or the
+     resume offset) by cursor; `map_comment` gives chat-ingest's `MessageRow` (`source='backfill'`,
+     `received_at` NULL) and `SecondAggregator.add_row` counts it exactly like live (new
+     `add_row`, which chat-ingest now uses too). Emote sets fetched once per run
+     (`HttpEmoteSets`; tests `StaticEmoteSets`). **Watermark:** comments come in offset order;
+     after a page whose last offset is L, a batch commit (every `chat_batch_pages` = 20 pages, at a
+     limit, at a stop and at the end; one transaction with the lease check) writes the messages
+     with offset < L (those at L wait), the metrics of seconds before
+     `M = second(T_chat + L − 3 s)`, `chat_done_s = L`, `chat_metrics_to = M` and the flag
+     counters (`chat_time_fallbacks`, `comments_without_user`, `chat_late_dropped`) of exactly the
+     committed rows. A resume pages from `M − T_chat − 3.5 s` (≈ L − 7 s), counts only comments with
+     `sent_at ≥ M` and inserts only those with offset ≥ `chat_done_s`: a crash loses at most a
+     batch and the rows equal one clean run's (tested with crashes after batches, `--max-minutes`
+     slices, a GQL error mid-run). At the end: `done`, `chat_done_s ≥ duration`,
+     `chat_metrics_to ≥ max(ended_at, last second + 1)`. Statuses: `pending` → `done` /
+     `unavailable` (first page: no replay) / `skipped` (guard 2) / `off` (`--no-chat` on a first
+     run); a later run retries anything but `done`.
+   - **Guard 2:** `chat_metrics_1s` rows of the channel in `[min(T0, T_chat) − 10 s,
+     max(T0, T_chat) + duration + 10 s]` that are not the VOD's stream (a live stream, or none:
+     chat-ingest logs active channels while offline): at least `chat_guard_min_s` (60) of them →
+     `skipped`, nothing written; fewer (stray seconds) → the chat is backfilled, those seconds
+     stay theirs (`ChatWriter(keep_foreign_metrics=True)` never overwrites another stream's or a
+     stream-less metrics row) and `flags.chat_foreign_seconds` counts them.
+   - **Quality flags:** a third-party emote provider that fails (FFZ is unreachable from the dev
+     PC) doesn't stop the chat (its emotes are simply not counted, as live): `flags.
+     emote_sets_failed` lists the providers of every run so far (a run proceeds and flags rather
+     than refusing; review decision 2026-11-20). `flags.chat_time_fallback_share` while more than
+     5 % of the VOD's messages got the clock's time (checked after each run).
+   - **Clips** (`clipper_backfill.clips`, writer of `viewer_clips`): Helix Get Clips over the
+     broadcast's window ± 2 min, top `clips_top` (100) by views, kept when cut from that VOD (or
+     from no VOD); linked through the VOD: our `vods` row (`time_source = vod_t0`, slack =
+     duration + 10 s) else Helix Get Videos' `stream_id` → our live stream (`helix_created_at`,
+     slack + 5 s). Upsert: counters/titles refreshed, link and span only overwritten by known
+     values (a null `vod_offset_s` gets filled, never erased); `stream_id` keeps its first value
+     (only a clip without a known VOD, found by two overlapping stream windows, could be claimed
+     twice). Clip ids repeated by Helix are written once; clips of other videos are dropped before
+     any lookup. `clips <login>` covers every stream of ours of the channel (live and backfilled).
+     Without Helix credentials: skipped with a line in the report (`clips` exits 2). A VOD
+     recorded live gets its clips only. A clips failure never fails a `vod`/`channel` run (media
+     and chat are committed by then): logged, `flags.clips_error` until a fetch succeeds.
+   - **Calibrate** (`clipper_backfill.calibrate`, read-only, numpy): live chunks spread over the
+     stream whose ± 20 s search range lies inside the VOD and has no muted segment; the VOD's
+     `audio_only` segments around each are decoded (ffmpeg, mono 8 kHz) and the chunk's audio is
+     located by normalised FFT cross-correlation: `T0_audio = chunk.start_utc − VOD offset of the
+     match` (median of the windows with a score ≥ 0.5). Table: every T0 candidate (PDT, chat
+     anchor truncated and rounded, created_at, path epoch) minus `T0_audio`; replay comments of
+     the T0 sample found in our live chat by msg_id: `createdAt − tmi-sent-ts` and
+     `tmi-sent-ts − (T0_audio + offset)`. Synthetic test (noise cut two ways from one AAC
+     encode): T0 recovered to < 1 ms, a 137 ms PDT error shown as +0.137. On real data read
+     `T0_audio` as ± one AAC frame (~21 ms): the match is sample-exact, but neither the live
+     `.aac` (ADTS) nor the playlist offsets carry the audio PTS (no PTS correction: the live side
+     has none to correct with). Near-silent windows score 0, scores ≤ 1; its temp dir
+     (`clipper-calibrate-*`) is not a backfill temp dir; no T0 candidate at all → exit 2.
+     **To run once by the user** on a broadcast recorded live (needs the live DB + storage):
+     `clipper-backfill calibrate <video_id>`; it settles truncated vs rounded offsets and
+     `T0_pdt`'s bias.
+   - **Deviations:** the chat-time fallback uses the chat clock (above), not `T0 + offset`;
+     `--max-minutes` limits media and chat (each from its own resume point), `--chat-max-minutes`
+     chat alone; `--start-offset` is media only (chat always starts at 0: missing seconds would
+     read as "no chat"); `--no-media` needs no object storage; `Comment.created_at` may be None
+     (missing `createdAt` → fallback instead of `GqlBroken`); `ClipTimeSource` enum in contracts;
+     `viewer_clips.creator_login` holds Helix's `creator_name` (Helix has no creator login);
+     `vods.flags` gets `chat_time_fallbacks`/`comments_without_user`/`chat_late_dropped` only when
+     non-zero; the report prints the GQL request count; `clipper_core.logs` prints level names
+     upper-case (importing streamlink renames the stdlib levels to lower case: backfill logs said
+     `warning`, and `test_logs` failed when `test_vod` ran first). Not built: `--yes`/`--max-gb`/
+     `--video-range` (5c), clips in `--dry-run` (described, not fetched).
+   - **Tests:** 101 in `tools/backfill` (+26), 1 in core, 1 in `test_emotes`: the fixture pages
+     through chat-ingest's real IRC path (`ChatIngest.on_message`) and through `map_comment` give
+     identical rows and metrics; chat rows/metrics/emotes/badges/fallbacks/deleted users; crash
+     after batches + resume = one clean run (messages, metrics, flags); `--chat-max-minutes`
+     slices; guard 2 (a minute of live chat → skipped, two stray seconds → kept + flagged);
+     failed emote sets and the fallback share flagged; `--no-chat` → `off` → done; unavailable;
+     GQL error mid-run; watermark math (2000 random cuts); clips (span, fill, never erase,
+     repeated ids, first stream kept, live stream by Helix `stream_id`, unknown VOD, a Get Clips
+     failure that doesn't fail the run); `vod` with clips and a live-recorded VOD (clips only);
+     calibrate (synthetic audio, muted windows, needs a live recording, silence scores 0, temp dir
+     prefix, CLI `ValueError` → exit 2); `ChatWriter(keep_foreign_metrics)`.
+   - **Real run** (2026-11-19, xqc archive 2932113307, chat only, throwaway DB on the test
+     Postgres, dropped afterwards; no Helix credentials, so clips were skipped): run 1
+     `--no-media --max-minutes 1.5` (16 pages, 829 messages, 23 GQL requests incl. metadata + the
+     6 T0 sample pages); run 2 `--max-minutes 2` hard-killed (TerminateProcess) mid-run after 3
+     committed batches (of 5 pages); run 3 at once → `busy` (0 requests); after the 30 s test TTL run 3 resumed at offset
+     141 (watermark 149, 94 comments read again) and ended at 241 s. Result: 2426 messages, 2426
+     distinct ids, 905 chatters, 215 metric seconds, all before `chat_metrics_to`, and all 215
+     equal to a recomputation from the stored messages (messages, unique chatters, emote counts);
+     emote tokens 7TV 1615, Twitch 465, BTTV 6 (FFZ timed out again: its sets were empty; top:
+     OOOO, xqcL, AURA, LOL, agahi); 0 fallbacks, 0 comments without user, no `chat_events`.
+     Re-fetching the pages at both run boundaries (offsets 83–92 and 143–152): no comment
+     missing. ~70 GQL requests in all (+ streamlink's resolution per run, one 0.6 MB playlist,
+     the emote sets).
 
 ### Proposed decision-log rows
 
@@ -827,7 +924,8 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
 | 2026-11-19 | The controller never updates a stream with `source = 'backfill'` (upsert `WHERE streams.source = 'live'`) | a stream id that shows up live again would flip it to live, and the recorder would write into it |
 | 2026-11-19 | Backfill skips VODs of streams recorded live (clips only), and writes chat only where the channel has no live chat | live data is better (ms chat times, events, PDT); the `chat_metrics_1s` PK `(channel_id, ts)` can't hold both |
 | 2026-11-19 | VOD time: `UTC = T0 + offset`, T0 frozen per VOD in `vods.t0_utc`. T0 = the `audio_only` playlist's PDT (`T0Method.PDT`; video renditions use the same T0); without PDT the chat anchor (median of `createdAt − contentOffsetSeconds` − 0.5 s), then Helix/GQL `created_at` (also when the chat anchor is > 30 s off it); all candidates in `vods.t0_candidates`, disagreements (chat − pdt not ≈ 3.9 s ± 3 s, created_at > 30 s off, PDT steps) in `vods.flags` | live media times come from PDT; the chat anchor sits ~4 s after `T0_pdt` (Twitch's replay compensates latency: 3.9 s smoke test, 3.916 s 5c run), so using it for media would silently cancel the chat delay (`video ≈ chat − delay`). `calibrate` (5d) still checks `T0_pdt` against a live recording |
-| 2026-11-19 | VOD chat `sent_at = createdAt` (fallback `T0 + offset + 0.5 s`) | the same server clock as `tmi-sent-ts`, at ms resolution; `video ≈ chat − delay` holds with the delay learned live |
+| 2026-11-19 | VOD chat `sent_at = createdAt` (fallback, when missing or > 2 s off: the chat clock `T_chat + offset + 0.5 s`, `T_chat` = the frozen chat anchor) | the same server clock as `tmi-sent-ts`, at ms resolution; `video ≈ chat − delay` holds with the delay learned live; the media T0 is ~4 s earlier than the chat clock |
+| 2026-11-19 | Backfilled chat metrics are final only before `vods.chat_metrics_to` (`second(T_chat + L − 3 s)` after the comments up to offset L), committed with the messages before L; a resume re-reads from ~7 s before | a crash or a `--max-minutes` slice never double counts nor loses a second; same rows as one clean run |
 | 2026-11-19 | Muted VOD segments become a gap with reason `muted`; their audio is not stored or transcribed | silence would read as a quiet moment; `coverage()` and the detector already understand gaps |
 | 2026-11-19 | Backfill takes audio_only by default; video only on request (full, or ranges added to existing chunks) | ~1.2 MB/min vs ~63 MB/min; detector development needs audio + chat |
 | 2026-11-19 | Chat row types, per-second aggregation and the chunk commit move into `libs/core` (`chat`, `chunks`); ffmpeg copy helpers into `clipper_core.ffmpeg`; `message_emotes` into `clipper_twitch.emotes` | live and backfill must compute and commit identically; a tool must not import a service |
@@ -931,6 +1029,8 @@ for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-inge
 - `class VodMediaStatus(StrEnum)`: `pending`, `done`, `restricted`, `gone`, `off`.
   `class VodChatStatus(StrEnum)`: `pending`, `done`, `skipped`, `unavailable`, `off`.
 - `def backfill_lease(video_id: str) -> str: return f"backfill:vod:{video_id}"`.
+- `class ClipTimeSource(StrEnum)` (5d): `VOD_T0 = "vod_t0"`, `HELIX_CREATED_AT =
+  "helix_created_at"` (`viewer_clips.time_source`).
 - Unchanged and used as they are: `Priority.BACKFILL`, `DataSource.BACKFILL`, `dedupe_key`,
   `CHUNK_JITTER`.
 
@@ -944,7 +1044,9 @@ for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-inge
   `vods` update to it.
 - `clipper_core.chat`: `MessageRow` (`received_at: datetime | None`), `EventRow`, `MetricRow`,
   `SecondAggregator`, `ChatWriter`, moved unchanged from chat-ingest (`mapping`, `aggregator`,
-  `writer`).
+  `writer`). 5d (additive): `SecondAggregator.add_row(row)` (chat-ingest uses it too) and
+  `ChatWriter(keep_foreign_metrics=True)` (the backfill: never overwrite another stream's or a
+  stream-less metrics row).
 - `clipper_core.ffmpeg`: `copy()`, `extract_audio()`, `remux_to_ts()` from `recorder.finisher`.
 
 **Outside `libs/core` (for completeness)**

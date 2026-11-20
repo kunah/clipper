@@ -32,10 +32,13 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   only the CUDA image installs; natively the service needs `CLIPPER_TRANSCRIBER_ENGINE=fake` and
   `CLIPPER_TRANSCRIBER_TAGGER=none` (or `fake`) set explicitly, and tests use the fakes.
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
-  (DESIGN §17). 5c done: VOD media + time (T0 estimator, chunk planner, `audio_only` by default,
-  muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`);
-  chat replay, viewer clips and `calibrate` are 5d. Needs ffmpeg on PATH natively
-  (`CLIPPER_BACKFILL_*`); compose service `backfill` (profile `tools`, `docker compose run --rm`).
+  (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
+  muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then
+  the chat replay into `chat_messages`/`chat_metrics_1s` (same `SecondAggregator` as live, resume
+  from `vods.chat_done_s`/`chat_metrics_to`, skipped where the channel has live chat), then viewer
+  clips into `viewer_clips` (Helix credentials, else skipped). `clips`, `calibrate` (read-only:
+  VOD vs our live recording), `status`. Needs ffmpeg on PATH natively (`CLIPPER_BACKFILL_*`);
+  compose service `backfill` (profile `tools`, `docker compose run --rm`).
   `tools/asr-bench/` is outside the workspace (own Dockerfile).
 - `compose.yaml`: Postgres 18 + pgvector, SeaweedFS (S3), migrate, and services.
 
@@ -50,7 +53,10 @@ uv run ruff check . --fix && uv run ruff format .
 uv run alembic -c db/alembic.ini revision -m "add x"   # then write the migration by hand
 uv run clipper-channels add xqc --mode audio_only      # list | mode <login> <mode> | enable | disable
 uv run clipper-backfill vod <id|url> --dry-run         # reads only; prints T0 + plan
-uv run clipper-backfill vod <id> --max-minutes 5      # resumable; status | channel <login> (Helix)
+uv run clipper-backfill vod <id> --max-minutes 5      # media + chat, resumable; status | channel <login>
+uv run clipper-backfill vod <id> --no-media --chat-max-minutes 30   # chat only (no object storage)
+uv run clipper-backfill clips <login|id>              # viewer clips (Helix credentials)
+uv run clipper-backfill calibrate <id>                # read-only: VOD vs our live recording of it
 docker compose up -d --build controller chat-ingest recorder
 docker compose up -d --build transcriber    # GPU (profile gpu, enabled by naming it); first start
                                             # downloads ~2 GB of weights into the `models` volume

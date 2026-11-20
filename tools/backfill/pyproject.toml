@@ -1,12 +1,13 @@
 [project]
 name = "clipper-backfill"
 version = "0.1.0"
-description = "Backfills past Twitch broadcasts (VOD media now; chat replay and clips next) in the live format."
+description = "Backfills past Twitch broadcasts (VOD media, chat replay, viewer clips) in the live format."
 requires-python = ">=3.12"
 dependencies = [
     "clipper-core",
     "clipper-twitch[vod]",
     "httpx>=0.27",
+    "numpy>=2.1",  # calibrate: audio cross-correlation
 ]
 
 [project.scripts]

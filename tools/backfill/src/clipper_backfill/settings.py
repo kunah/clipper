@@ -20,5 +20,10 @@ class BackfillSettings(BaseSettings):
     http_timeout_s: float = 30.0
     chunk_seconds: float = Field(default=60.0, gt=0, le=120)  # a chunk is built in memory
     t0_chat_pages: int = Field(default=6, ge=0)  # chat pages sampled for the T0 cross-check
+    chat_batch_pages: int = Field(default=20, ge=1)  # chat replay pages per commit (~1000 msgs)
+    # guard 2: skip a VOD's chat when the channel has at least this many seconds of other (live)
+    # chat_metrics_1s rows in its range; fewer are left alone and flagged (chat_foreign_seconds)
+    chat_guard_min_s: int = Field(default=60, ge=1)
+    clips_top: int = Field(default=100, ge=1, le=1000)  # viewer clips per broadcast, by views
     lease_ttl_s: float = Field(default=120.0, ge=10)  # renewed every third of it
     temp_dir: Path | None = None  # parent of the per-run temp dir (default: the system's)

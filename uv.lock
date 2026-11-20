@@ -327,6 +327,7 @@ dependencies = [
     { name = "clipper-core" },
     { name = "clipper-twitch", extra = ["vod"] },
     { name = "httpx" },
+    { name = "numpy" },
 ]
 
 [package.metadata]
@@ -334,6 +335,7 @@ requires-dist = [
     { name = "clipper-core", editable = "libs/core" },
     { name = "clipper-twitch", extras = ["vod"], editable = "libs/twitch" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "numpy", specifier = ">=2.1" },
 ]
 
 [[package]]
