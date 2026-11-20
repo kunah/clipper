@@ -120,15 +120,28 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   in the outage window only). Dockerfile + compose service `detector` (profile `detector`, not
   built, not started). 752 tests.
 
+- Judge (§19, proposed) unit 6a (commit "Judge contract"): migration 0005 (`clips`,
+  `clip_plans`, `judge_calls`, `media_requests.clip_id` FK), the versioned `EditPlan` contract
+  (UTC, ordered non-touching segments, hook/teaser/zooms inside segments, hashtags, word fixes),
+  `PlanPatch` for review edits, job kinds RENDER/REVIEW/REVISE_PLAN/NOTIFY + payloads,
+  `clipper_core.lifecycle` (derived §7 clip state), storage key for judge I/O. 880 tests.
+
+## Blocked / waiting for you
+
+- Detector unit 4 (backtest CLI): needs ground truth = viewer clips (Twitch app credentials in
+  this checkout's `.env`) and some backfilled VODs on a migrated DB.
+- Judge unit 6d (real LLM adapters + `clipper-judge eval`): your provider/model choice, API key
+  and the eval spend.
+
 ## In progress
 
-- (paused) Next: detector unit 4 (backtest CLI over backfilled/live streams) needs real data:
-  migrations 0002–0004 on the live DB + some backfilled VODs.
+- Judge unit 6b: input builder + resolver (pure: transcript/chat/audio window → LLM input;
+  LLM answer → validated EditPlan with recorded repairs).
 
 ## Next
 
-- Phase 2 in roadmap order (detector §18 next units: pure scorer + fake-spike filter + lexicon,
-  then the live service with provisional defaults; then judge §19 contracts + fakes).
+- Judge 6c (service with the fake model), then renderer §20 (contracts, pure graph builder,
+  NVENC smoke test), review §21 and publisher §22 contracts + fakes.
 
 ## How to deploy the transcriber (your call, in the morning)
 
@@ -152,8 +165,9 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 - 2026-11-20 02:31 local: restarted at your OK with `docker start` on the same five containers
   (postgres, objectstore, controller, chat-ingest, recorder; same images, no `compose up`, so no
   migration ran and nothing was rebuilt). All three services logged in normally; ohnepixel was
-  offline. Tests keep using the separate throwaway Postgres `clipper-orch-testpg` on
-  127.0.0.1:5434 (removed at the end of the run).
+  offline. The throwaway test Postgres `clipper-orch-testpg` (127.0.0.1:5434) was removed on
+  2026-11-20 (memory was tight while you used the PC); tests use per-checkout throwaway
+  databases on the compose Postgres again.
 - Disk: the live recordings volume `clipper_objectdata` is at 24.5 GB (ohnepixel at source
   quality; video retention (~48 h) isn't implemented yet, see DESIGN §14 open items). E: had
   ~108 GB free on 2026-11-19.

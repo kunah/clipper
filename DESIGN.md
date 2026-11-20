@@ -13,7 +13,8 @@ judges, edits and publishes short vertical clips.
 > migration 0004, §18) built 2026-11-20, not on the live DB yet; build item 2 (scorer, stage 2,
 > lexicon, merge: pure code in `services/detector`, synthetic tests) built 2026-11-20; build item 3
 > (live service `clipper-detector`, compose profile `detector`, judge jobs off) built 2026-11-20,
-> not deployed (needs 0004 on the live DB).
+> not deployed (needs 0004 on the live DB). Judge build item 6a (contracts + migration 0005 +
+> `clipper_core.lifecycle`, §19) built 2026-11-20, not on the live DB yet; no judge service yet.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -160,7 +161,7 @@ Services talk only through Postgres and object storage.
 | recorder | HLS segments → ~60 s `.ts` + `.aac` (local spool first, crash-safe), gaps, enqueue transcription. Claims channels itself via leases. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
 | detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
-| judge | LLM verdict + edit plan, context requests | clips (later) | slim |
+| judge | LLM verdict + edit plan, context requests (§19; contract + 0005 built, service not yet) | clips, clip_plans, judge_calls, own media_requests | slim |
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Telegram bot | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
@@ -268,7 +269,8 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
 analytics loop. Then Kick/YouTube. Detector build items 1–3 (contracts, scorer, live service)
-built 2026-11-20, see §18.10. Designs (all proposed 2026-11-19, not yet agreed):
+built 2026-11-20, see §18.10; judge build item 6a (contracts, migration 0005, lifecycle helper)
+built 2026-11-20, see §19. Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -1655,8 +1657,9 @@ No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
 
 ## 19. Judge (phase 2) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal, nothing built. Contracts, input builder, plan repair and the service can be
-built now with a deterministic fake model; provider and model are the **user's decision** (cost),
+**Status:** proposal (not yet agreed); build item 6a (contracts + migration 0005 +
+`clipper_core.lifecycle`) built 2026-11-20, not on the live DB yet; the rest not built. Input
+builder, plan repair and the service can be built now with a deterministic fake model; provider and model are the **user's decision** (cost),
 made with the eval harness (6d). Prompt, thresholds and clip lengths get tuned on real candidates.
 
 **Ownership (§19–§22; replaces §8's "later" rows once agreed).** One writer per table; `jobs` is
@@ -1729,6 +1732,12 @@ renderer, review and publisher read. **Resolve + repair** (pure; each change a c
   T, or trim the side farther from T.
 - Emphasis resolved to real words (≤ 1 per 3 words); zooms clipped and merged, ≤ 1.5×; SFX tags must
   exist in the asset manifest (§20), ≥ 2 s apart, ≤ 6; title ≤ 100 chars, blocklist → `sensitive`.
+- Whatever `EditPlan` would reject is repaired, not failed: touching segments merged; hashtags
+  stripped of `#`, tags with whitespace dropped, capped at 5; hook text trimmed to 40 chars (empty →
+  mode `none`); a teaser clamped into its segment to ≤ 3 s, else mode `none`; points (emphasis, word
+  fixes, SFX, thumbnail) at/after the out point or outside the segments dropped (the thumbnail
+  falls back to the default); zooms split at cuts (pieces < 0.5 s dropped); a blank title → the
+  first sentence of the core, cut to 100 chars.
 - Invalid JSON or an unrepairable plan: one retry with the error stated, then `failed`.
 
 **`JudgeModel` Protocol**: `name`; `async judge(JudgeRequest) -> JudgeResponse` (system prompt, user
@@ -1766,10 +1775,57 @@ Batch APIs (−50 %, hours) suit only backfill; a cascade (small screens, large 
 rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + `viewer_clips` + labels.
 
 **Build plan.**
-1. **6a Contracts + 0005 + `clipper_core.lifecycle`.** *Done:* `test_migrations` passes; `EditPlan`
-   rejects naive times, unordered segments, bad durations/versions; lifecycle table-tested.
+1. ✅ **6a Contracts + 0005 + `clipper_core.lifecycle`** (built 2026-11-20; not on the live DB yet).
+   *Done:* `test_migrations` passes; `EditPlan` rejects naive times, unordered segments, bad
+   durations/versions; lifecycle table-tested. Built as the contract block below: migration
+   `0005_judge` (+ `db/tests/test_migration_judge.py`: links, uniques, downgrade to 0004 drops the
+   tables and the `media_requests.clip_id` FK), contracts, models, `storage.keys.judge_io`,
+   `clipper_core.lifecycle`, controller `STALE_AFTER[REVISE_PLAN] = 10 min`; tests
+   `libs/core/tests/test_judge_contract.py`, `test_lifecycle.py`. Deviations and details (folded
+   into the block below where they change it):
+   - **Two extra CHECKs**: `clips.anchor_in_context` (`anchor_utc BETWEEN context_from AND
+     context_to`) and `clip_plans.context_request` (`(verdict = 'need_context') = (context_request
+     IS NOT NULL)`). `clips.reject_reason` values have no CHECK (like `suppress_reason`). Columns
+     not marked "null" are NOT NULL without defaults unless given (`waiting_since`, `priority`, the
+     `judge_calls` usage/cost/latency columns: an error row writes 0).
+   - `MediaRequest.clip_id` is `ForeignKey("clips.id", use_alter=True)`: clips → candidates →
+     media_requests → clips is a cycle, so `create_all` adds the FK after the tables, as 0005 does.
+   - **§21's code-only contract, the part judge and renderer need**, is in now: `JobKind.REVIEW`,
+     `REVISE_PLAN`, `NOTIFY`, `NoticeKind` (`revision_refused`, `render_failed`), `PlanPatch`,
+     `ReviewPayload`, `RevisePlanPayload`, `NotifyPayload`. Left for 21a: `ReviewStatus`,
+     `ReviewAction`, `ReviewLabel`, `PostMetadata`, `REVIEW_TELEGRAM_LEASE`; `STALE_AFTER` for
+     `render`/`review`/`notify` comes with 7a/21a.
+   - **`EditPlan` validator details**: points (emphasis, word fixes, SFX, thumbnail) lie in a
+     segment's half-open `[start, end)`; zooms and a teaser lie inside *one* segment; segments
+     must not touch (the resolver merges them, 6b); one word fix per word; hashtags are bare words
+     (no `#`, no whitespace); the title and a text hook's text are not blank; `TEASER_MAX = 3 s`
+     (a teaser needs `start_utc`/`end_utc`; fields of other modes are not rejected, for forward
+     compatibility); `duration` = the segments (a teaser plays on top); non-UTC offsets are
+     converted, naive times and offset-less ISO strings rejected (`contracts.UtcDatetime`).
+   - **`PlanPatch` is operator input, not a stored file**: a plain frozen model with
+     `extra="forbid"`, unknown fields also rejected inside `hook`, `word_fixes`, `layout`, `music`
+     (an older judge refuses a newer patch: revision refused + notice); title 1–100 chars, not
+     blank; `music` and `no_music` not both.
+   - `judge_calls` also has INDEX (`clip_id`). `storage.keys.judge_io(request_hash, clip_id=None)`
+     → `clips/{clip_id}/judge/{request_hash}.json` (`judge/{request_hash}.json` outside a clip,
+     evals): keyed on the request hash, so the I/O is uploaded before the `judge_calls` row exists.
+   - `contracts.judge_round_key(candidate, round)` = `dedupe_key(JUDGE, candidate, f"r{round}")`.
+   - **Lifecycle**: `lifecycle_state()` already takes all four facts (review status and
+     publication statuses too), and `lifecycle_states()` already reads `renders`, `clip_reviews`
+     and `publications` when they exist (catalog lookup with `to_regclass`, then one query): 7a,
+     21a and 22a only need tests against their real tables, as long as they keep the columns read
+     (`renders.id/clip_id/status/created_at`, `clip_reviews.clip_id/status`,
+     `publications.clip_id/status`). Latest render = `created_at DESC, id DESC`. Statuses are
+     matched as text (the enums come with 7a/21a/22a); a value added later matches nothing, so the
+     earlier stages decide. An unknown `clips.status` (a newer judge) raises in the pure
+     `lifecycle_state()`; `lifecycle_states()` logs a warning and leaves that clip out, as it does
+     ids without a clip row (`candidate` only from the pure function). A bare string where a
+     collection is expected (`publication_statuses`, `clip_ids`) is a `TypeError`.
 2. **6b Input builder + resolver (pure).** *Done:* byte-stable input for a fixture candidate (golden
-   file); ≥ 20 repair cases (snap, gap split, durations, no mid-word cut, unknown SFX dropped).
+   file); ≥ 20 repair cases (snap, gap split, durations, no mid-word cut, unknown SFX dropped,
+   touching segments merged, `#`/whitespace hashtags and > 5 tags, long/empty hook text, teaser
+   out of its segment or > 3 s, points at the out point or in a cut, a zoom across a cut, blank
+   title); every resolver output validates as `EditPlan`.
 3. **6c Service with the fake.** *Done (integration):* partial transcripts → waiting; transcript +
    NOTIFY → `planned` + render job in one transaction; `need_context` → `request_media(100)` bumps
    queued transcribe jobs, round 2 must decide; crash between call and commit → no second call;
@@ -1919,6 +1975,10 @@ class LayoutHint(StoredModel):
 EDIT_PLAN_VERSION = 1
 CLIP_MIN = timedelta(seconds=3)
 CLIP_MAX = timedelta(seconds=180)
+TEASER_MAX = timedelta(seconds=3)
+
+def judge_round_key(candidate_id: int, round_: int) -> str:  # "judge:{cand}:r{round}"
+    return dedupe_key(JobKind.JUDGE, candidate_id, f"r{round_}")
 
 class EditPlan(StoredModel):
     """What to render. Written by the judge (resolved, snapped to words, clamped to video); read
@@ -1960,7 +2020,7 @@ class EditPlan(StoredModel):
   IN ('waiting_for_media','judging','rejected','planned','failed'); `reject_reason` text null
   (CHECK `(status = 'rejected') = (reject_reason IS NOT NULL)`); `round` int default 0 (CHECK ≥ 0);
   `anchor_utc` timestamptz; `context_from`, `context_to` timestamptz (CHECK `context_to >
-  context_from`); `priority` int (of its judge/render jobs); `waiting_since` timestamptz (wall clock,
+  context_from`; CHECK `anchor_in_context`: `anchor_utc BETWEEN context_from AND context_to`); `priority` int (of its judge/render jobs); `waiting_since` timestamptz (wall clock,
   deadlines); `plan_version` int null (latest non-shadow `clip` plan, revisions included); `flags`
   jsonb default '{}'; `error` text null; `judged_at` null; `created_at`, `updated_at`. INDEX
   (`stream_id`, `anchor_utc`); partial INDEX `ix_clips_waiting` (`stream_id`) WHERE `status =
@@ -1968,7 +2028,8 @@ class EditPlan(StoredModel):
 - **`ClipPlan`** (`clip_plans`), writer: judge, rows immutable. `id` bigint PK; `clip_id` FK clips;
   `version` int; `round` int; `verdict` text CHECK IN ('clip','reject','need_context'); `plan` jsonb
   null (`EditPlan`; CHECK `(verdict = 'clip') = (plan IS NOT NULL)`); `context_request` jsonb null
-  (`{"before_s", "after_s", "why"}`); `confidence` float null; `reasons`, `repairs` jsonb default
+  (`{"before_s", "after_s", "why"}`; CHECK `(verdict = 'need_context') = (context_request IS NOT
+  NULL)`); `confidence` float null; `reasons`, `repairs` jsonb default
   '[]'; `model`, `prompt_version` text; `shadow` bool default false; `judge_call_id` FK judge_calls
   null; `author` text default 'judge' CHECK IN ('judge','operator'); `parent_id` FK clip_plans null
   (the plan a revision changed); `review_event_id` bigint null (FK added by 0007, §21);
@@ -1977,24 +2038,28 @@ class EditPlan(StoredModel):
   `stream_id` FK streams; `model`, `prompt_version`, `request_hash` text; `input_tokens`,
   `cached_input_tokens`, `output_tokens` int; `cost_usd`, `latency_s` float; `answer` jsonb null;
   `error` text null; `io_key` text null; `provider_request_id` text null; `shadow` bool default
-  false; `created_at`. INDEX (`request_hash`); INDEX (`stream_id`, `created_at`); INDEX
-  (`created_at`).
-- `MediaRequest.clip_id`: `ForeignKey("clips.id")` (migration: `create_foreign_key`, the "FK added
-  when clips table exists" of 0001). Docstring: detector rows link from `candidates`, judge rows
+  false; `created_at`. INDEX (`request_hash`); INDEX (`clip_id`); INDEX (`stream_id`,
+  `created_at`); INDEX (`created_at`).
+- `MediaRequest.clip_id`: `ForeignKey("clips.id", use_alter=True)` (migration: `create_foreign_key`,
+  the "FK added when clips table exists" of 0001; `use_alter` breaks the FK cycle for `create_all`). Docstring: detector rows link from `candidates`, judge rows
   carry `clip_id`.
 
 **New `clipper_core.lifecycle`** (the one §7 helper; §20–§22 read it, nobody stores the result):
 `lifecycle_state(clip_status, render_status=None, review_status=None, publication_statuses=())
 -> LifecycleState` (pure) and `async lifecycle_states(session, clip_ids) -> dict[int,
-LifecycleState]` (one query). First match wins: any publication `live` → `published`; any
+LifecycleState]` (two round trips: a catalog lookup of which later tables exist yet, then one
+query; clips without a row or with a status this code doesn't know are left out, the latter with
+a warning). First match wins: any publication `live` → `published`; any
 `scheduled|uploading|processing|unknown` → `publishing`; review `approved` → `approved`,
 `rejected|expired|withdrawn` → `discarded`, `pending|revising` → `in_review`; the clip's latest
 render `rendering` → `rendering`, `done` → `in_review` (review job queued), `failed` → `failed`,
-`unrenderable` → `unrenderable`; else `clips.status` (no clip row → `candidate`). 6a reads `clips` +
-`renders`; 21a adds the review argument, 22a the publications.
+`unrenderable` → `unrenderable`; else `clips.status` (no clip row → `candidate`). Built in 6a with
+all four arguments; `lifecycle_states()` reads `renders`, `clip_reviews` and `publications` as
+soon as their migrations ran (7a, 21a, 22a only add tests against the real tables).
 
-**`storage.keys`**: `judge_io(clip_id, call_id)` → `clips/{clip_id}/judge/{call_id:08d}.json`
-(request + raw response; kept for evals and prompt work).
+**`storage.keys`**: `judge_io(request_hash, clip_id=None)` → `clips/{clip_id}/judge/{request_hash}.json`
+(`judge/{request_hash}.json` outside a clip; request + raw response, uploaded before the call's row;
+kept for evals and prompt work).
 
 **Outside core.** `services/judge` (`CLIPPER_JUDGE_*`: provider, model, api key `SecretStr`, prices
 per 1M, `budget_usd_per_stream_hour`, `daily_usd`, `soft_wait_s` 240, `hard_wait_s` 1800,
@@ -2226,7 +2291,8 @@ null; `warnings` jsonb default '[]'; `error` text null; `created_at`; `finished_
 models of `manifest.toml` (licence fields required), `load_manifest(path)`, `tags()`, `moods()`;
 `pick(entries, tag, clip_id, cue_index)` (deterministic). No DB table: the library is files.
 
-**`clipper_core.lifecycle`**: the render mapping is part of §19's helper (6a).
+**`clipper_core.lifecycle`**: the render mapping is part of §19's helper (built in 6a; it reads
+`renders.id/clip_id/status/created_at`, served by INDEX (`clip_id`, `created_at`)).
 
 **Outside core.** `services/renderer` (`CLIPPER_RENDERER_*`: encoder, layouts path, assets path,
 fonts dir, temp dir, `pin_margin_s` 30); compose service with the GPU reservation, `assets` and
@@ -2357,7 +2423,8 @@ BotFather. Previews sit on Telegram's servers (private chat). Telegram down → 
 Migration **`0007_review`** (after `0006_renderer`; additive: two new tables, FKs to `clips` (0005)
 and `renders` (0006), and the FK `clip_plans.review_event_id → review_events` that 0005 left out).
 The enums and payloads below are code only (no DDL): whichever of 6a, 7a, 21a is built first adds
-them, since the judge and renderer enqueue these jobs before review exists.
+them, since the judge and renderer enqueue these jobs before review exists. (6a, 2026-11-20, added
+the job kinds, `NoticeKind`, `PlanPatch` and the three payloads; the rest is left for 21a.)
 
 **`contracts.py`**
 ```python
@@ -2395,7 +2462,9 @@ class PostMetadata(StoredModel):  # jsonb; review overrides (None = keep) and pu
     description: str | None = None
     hashtags: list[str] | None = None
 
-class PlanPatch(StoredModel):  # review_events.details.patch; None = keep, lists replace whole
+class PlanPatch(BaseModel):  # review_events.details.patch; None = keep, lists replace whole
+    # operator input (built in 6a): frozen, extra="forbid" also in the nested models, title not
+    # blank, music and no_music not both
     in_utc: UtcDatetime | None = None  # moves segments[0].start_utc
     out_utc: UtcDatetime | None = None  # moves segments[-1].end_utc
     hook: Hook | None = None
@@ -2440,7 +2509,9 @@ render, review event, publication or account; account notices add the UTC date a
   UNIQUE null; `created_at`. INDEX (`clip_id`, `created_at`); INDEX (`action`, `created_at`).
 - `ClipPlan.review_event_id`: `ForeignKey("review_events.id")` (migration: `create_foreign_key`).
 
-**`clipper_core.lifecycle`**: `lifecycle_state()` gains `review_status` (mapping in §19).
+**`clipper_core.lifecycle`**: the review mapping is already in §19's helper (6a: `review_status`
+argument, `lifecycle_states()` reads `clip_reviews.clip_id/status` once 0007 ran); 21a adds tests
+against the real table.
 
 **Outside core**: controller `STALE_AFTER` += `REVIEW: 5 min`, `NOTIFY: 5 min` (`REVISE_PLAN` with
 §19); `services/review` (pyproject, Dockerfile, workspace member), compose `review` with
@@ -2707,7 +2778,10 @@ async def defer(session: AsyncSession, job: ClaimedJob, until: datetime, reason:
   `views`, `likes`, `comments`, `shares` bigint null; `extra` jsonb default '{}' (watch time,
   engaged views, saves).
 
-**`clipper_core.lifecycle`**: `lifecycle_state()` gains `publication_statuses` (mapping in §19).
+**`clipper_core.lifecycle`**: the publication mapping is already in §19's helper (6a:
+`publication_statuses` argument, `lifecycle_states()` reads `publications.clip_id/status` once 0008
+ran); 22a adds tests against the real table. **0008 needs INDEX (`clip_id`) on `publications`** for
+lifecycle's per-clip subquery (the partial unique index leaves out failed/cancelled/deleted rows).
 
 **Outside core**: controller `STALE_AFTER` += `PUBLISH: 30 min` (the lease protects a slow upload),
 `SYNC_PUBLICATION: 10 min`, `PUBLICATION_ACTION: 10 min`; `services/publisher` (deps `httpx`,

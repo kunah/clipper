@@ -67,6 +67,10 @@ def test_check_constraints_match_models(db_url, fresh_database):
         assert ("candidates", f"ck_candidates_{name}") in declared
     for name in ("events", "valid_has_delay"):
         assert ("chat_delay_estimates", f"ck_chat_delay_estimates_{name}") in declared
+    for name in ("status", "reject_reason", "round", "context_range", "anchor_in_context"):
+        assert ("clips", f"ck_clips_{name}") in declared
+    for name in ("verdict", "plan", "context_request", "author"):
+        assert ("clip_plans", f"ck_clip_plans_{name}") in declared
     assert migrated == declared
 
 

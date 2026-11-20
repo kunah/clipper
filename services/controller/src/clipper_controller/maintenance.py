@@ -19,6 +19,7 @@ STALE_AFTER = {
     JobKind.TRANSCRIBE: timedelta(minutes=15),
     JobKind.JUDGE: timedelta(minutes=10),  # LLM calls; the judge commits each call right after it
     JobKind.DETECT_OFFLINE: timedelta(minutes=30),  # a whole stream's offline pass
+    JobKind.REVISE_PLAN: timedelta(minutes=10),  # one judge call at most (an instruction)
 }
 
 

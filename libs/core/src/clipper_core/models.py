@@ -557,6 +557,150 @@ class ChatDelayEstimate(Base):
     computed_at: Mapped[datetime] = _created_at()
 
 
+# --------------------------------------------------------------------------- judge
+
+
+class Clip(Base):
+    """A candidate the judge works on (DESIGN §19), one per candidate. Writer: judge.
+
+    `status`: `contracts.ClipStatus` (`waiting_for_media -> judging -> rejected | planned`, or
+    `failed` with `error`); `reject_reason` (`contracts.ClipRejectReason`) is set iff `rejected`.
+    §7's later states are derived from the renderer's, review's and publisher's tables by
+    `clipper_core.lifecycle`, never stored here. Times:
+    - `anchor_utc` = T (the candidate's `peak_utc`, video time), inside the context.
+    - `context_from`..`context_to`: the media the judge reads; starts as the candidate's window,
+      grows per context round (`round`, 0-based), clamped to [T - 10 min, T + 2 min] and the
+      stream.
+    - `waiting_since`: wall clock when it last started waiting for media (soft/hard deadlines).
+    `priority`: of its judge/render jobs. `plan_version`: the latest non-shadow `clip` plan
+    (`clip_plans.version`, revisions included), NULL before the first. `flags`: e.g.
+    `{"partial_context": true}`. Score and moment type are read from the candidate.
+    """
+
+    __tablename__ = "clips"
+    __table_args__ = (
+        Index(None, "stream_id", "anchor_utc"),
+        # the waiter's sweep: waiting clips per stream
+        Index(
+            "ix_clips_waiting",
+            "stream_id",
+            postgresql_where=sql_text("status = 'waiting_for_media'"),
+        ),
+        CheckConstraint(
+            "status IN ('waiting_for_media', 'judging', 'rejected', 'planned', 'failed')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(status = 'rejected') = (reject_reason IS NOT NULL)", name="reject_reason"
+        ),
+        CheckConstraint("round >= 0", name="round"),
+        CheckConstraint("context_to > context_from", name="context_range"),
+        CheckConstraint("anchor_utc BETWEEN context_from AND context_to", name="anchor_in_context"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), unique=True)
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    status: Mapped[str] = mapped_column(Text, server_default="waiting_for_media")
+    reject_reason: Mapped[str | None] = mapped_column(Text)  # contracts.ClipRejectReason
+    round: Mapped[int] = mapped_column(Integer, server_default="0")
+    anchor_utc: Mapped[datetime]
+    context_from: Mapped[datetime]
+    context_to: Mapped[datetime]
+    priority: Mapped[int] = mapped_column(Integer)
+    waiting_since: Mapped[datetime]  # wall clock
+    plan_version: Mapped[int | None] = mapped_column(Integer)
+    flags: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text)
+    judged_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class JudgeCall(Base):
+    """One model call (DESIGN §19). Writer: judge; committed alone, right after the call, so a
+    crash or retry reuses the paid answer (lookup by `request_hash` = sha256 of model, prompt
+    version, schema version and the rendered request).
+
+    `cost_usd` from the price table in the judge's settings; `answer`: the parsed JSON answer,
+    `error`: what went wrong (provider error, invalid JSON); full request + raw response in
+    object storage at `io_key` (`storage.keys.judge_io`, keyed on the request hash, so it can be
+    uploaded before this row exists). `clip_id` NULL for calls outside a clip (evals).
+    `shadow`: an extra model/prompt pair on the same input, never rendered.
+    """
+
+    __tablename__ = "judge_calls"
+    __table_args__ = (
+        Index(None, "request_hash"),
+        Index(None, "clip_id"),  # a clip's calls (analytics, revisions)
+        Index(None, "stream_id", "created_at"),  # cost guard: spend per stream-hour
+        Index(None, "created_at"),  # cost guard: daily spend
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    clip_id: Mapped[int | None] = mapped_column(ForeignKey("clips.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    model: Mapped[str] = mapped_column(Text)
+    prompt_version: Mapped[str] = mapped_column(Text)
+    request_hash: Mapped[str] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(Integer)
+    cached_input_tokens: Mapped[int] = mapped_column(Integer)
+    output_tokens: Mapped[int] = mapped_column(Integer)
+    cost_usd: Mapped[float] = mapped_column(Float)
+    latency_s: Mapped[float] = mapped_column(Float)
+    answer: Mapped[dict[str, Any] | None]
+    error: Mapped[str | None] = mapped_column(Text)
+    io_key: Mapped[str | None] = mapped_column(Text)
+    provider_request_id: Mapped[str | None] = mapped_column(Text)
+    shadow: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class ClipPlan(Base):
+    """One judge round or revision of a clip (DESIGN §19). Writer: judge; rows are immutable.
+
+    `version` counts per clip (UNIQUE `clip_id, version`; shadow plans take versions too);
+    `round`: the clip's context round it answered. `verdict` (`contracts.Verdict`): `clip` rows
+    carry `plan` (a `contracts.EditPlan`), `need_context` rows `context_request`
+    (`{"before_s", "after_s", "why"}`), both enforced by CHECKs. `reasons`, `repairs`: copies of
+    the plan's lists (also for rejects). `author` (`contracts.PlanAuthor`): `judge` (the model)
+    or `operator` (a review PlanPatch); revisions set `parent_id` (the plan they changed),
+    `review_event_id` (its FK comes with review's migration, 0007) and `instruction`.
+    """
+
+    __tablename__ = "clip_plans"
+    __table_args__ = (
+        UniqueConstraint("clip_id", "version"),
+        CheckConstraint("verdict IN ('clip', 'reject', 'need_context')", name="verdict"),
+        CheckConstraint("(verdict = 'clip') = (plan IS NOT NULL)", name="plan"),
+        CheckConstraint(
+            "(verdict = 'need_context') = (context_request IS NOT NULL)", name="context_request"
+        ),
+        CheckConstraint("author IN ('judge', 'operator')", name="author"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    clip_id: Mapped[int] = mapped_column(ForeignKey("clips.id"))
+    version: Mapped[int] = mapped_column(Integer)
+    round: Mapped[int] = mapped_column(Integer)
+    verdict: Mapped[str] = mapped_column(Text)
+    plan: Mapped[dict[str, Any] | None]
+    context_request: Mapped[dict[str, Any] | None]
+    confidence: Mapped[float | None] = mapped_column(Float)
+    reasons: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    repairs: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    model: Mapped[str] = mapped_column(Text)
+    prompt_version: Mapped[str] = mapped_column(Text)
+    shadow: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    judge_call_id: Mapped[int | None] = mapped_column(ForeignKey("judge_calls.id"))
+    author: Mapped[str] = mapped_column(Text, server_default="judge")
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("clip_plans.id"))
+    review_event_id: Mapped[int | None] = mapped_column(BigInteger)  # FK added by 0007 (§21)
+    instruction: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+
+
 # --------------------------------------------------------------------------- coordination
 
 
@@ -601,8 +745,9 @@ class MediaRequest(Base):
     """A request: "I need transcripts for this time range at this priority."
 
     Raises the priority of matching queued jobs, and of chunks recorded later inside the range.
-    Writers: detector, judge (anyone who needs a window), each for its own rows. Detector rows
-    are linked from `candidates.media_request_id`; `clip_id` stays for the judge's rows.
+    Writers: detector, judge (anyone who needs a window), each for its own rows (and each marks
+    only its own rows fulfilled). Detector rows are linked from `candidates.media_request_id`;
+    judge rows carry `clip_id` (FK clips, from 0005).
     """
 
     __tablename__ = "media_requests"
@@ -623,7 +768,9 @@ class MediaRequest(Base):
     to_utc: Mapped[datetime]
     priority: Mapped[int] = mapped_column(Integer)
     requested_by: Mapped[str] = mapped_column(Text)
-    clip_id: Mapped[int | None] = mapped_column(BigInteger)  # FK added when clips table exists
+    # use_alter: clips -> candidates -> media_requests -> clips is a cycle, so create_all adds
+    # this FK after the tables (as migration 0005 does)
+    clip_id: Mapped[int | None] = mapped_column(ForeignKey("clips.id", use_alter=True))
     created_at: Mapped[datetime] = _created_at()
     fulfilled_at: Mapped[datetime | None]
 

@@ -123,10 +123,11 @@ async def test_maintenance_creates_partitions_and_requeues_stale_jobs(sessions):
 
 
 async def test_maintenance_requeues_detector_and_judge_jobs_after_their_own_limits(sessions):
-    """judge jobs are stale after 10 min, detect_offline after 30 min (DESIGN §18)."""
+    """judge and revise_plan jobs are stale after 10 min, detect_offline after 30 min (DESIGN
+    §18, §19)."""
     ids = {}
     async with sessions.begin() as s:
-        for kind in (JobKind.JUDGE, JobKind.DETECT_OFFLINE):
+        for kind in (JobKind.JUDGE, JobKind.DETECT_OFFLINE, JobKind.REVISE_PLAN):
             ids[kind] = await jobs.enqueue(s, kind, ref_id=1)
     async with sessions.begin() as s:
         for kind in ids:
@@ -135,7 +136,7 @@ async def test_maintenance_requeues_detector_and_judge_jobs_after_their_own_limi
     await run_maintenance(sessions)
     async with sessions() as s:
         rows = (await s.execute(text("SELECT kind, status FROM jobs"))).all()
-    assert dict(rows) == {"judge": "queued", "detect_offline": "running"}
+    assert dict(rows) == {"judge": "queued", "detect_offline": "running", "revise_plan": "queued"}
 
 
 async def test_channels_cli_commands(sessions):
