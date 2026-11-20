@@ -3,8 +3,9 @@
 Engines are synchronous and blocking (GPU/CPU work); the pipeline runs them in a worker thread.
 They get 16 kHz mono float32 PCM (`audio.Pcm`) and return times in seconds relative to the
 start of the array they were given. Adapters for real models implement these protocols
-(`whisper.WhisperEngine`, `ced.CedTagger`; their libraries are optional extras of the package,
-imported only when the adapter is built); `fakes` has deterministic test engines.
+(`whisper.WhisperEngine`, `ced.CedTagger`; their libraries are imported only when the adapter is
+built, faster-whisper is an optional extra of the package); `fakes` has deterministic test
+engines.
 """
 
 from __future__ import annotations

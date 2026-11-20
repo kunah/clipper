@@ -41,6 +41,9 @@ from clipper_transcriber.gpu import OOM_WAIT_S, oom_delays, retry_on_oom
 
 log = get_logger(__name__)
 
+# faster-whisper's default temperatures (the fallback, off by default); 0.0 alone without it.
+FALLBACK_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
 # Hub revisions of the models we benchmarked: weights never change under a stored model id.
 WHISPER_REVISIONS = {
     # mobiuslabsgmbh/faster-whisper-large-v3-turbo, as in tools/asr-bench (2026-11-19)
@@ -63,6 +66,13 @@ class WhisperOptions:
     # faster-whisper's own Silero VAD inside each stretch, on top of our gate in front: no
     # difference on the benchmark audio, slightly slower (DESIGN.md §16, 4b-3).
     vad_filter: bool = False
+    # faster-whisper's temperature fallback: a stretch whose decode looks bad (compression ratio
+    # > 2.4, avg_logprob < -1) is decoded again with sampling at rising temperatures. Off (beam
+    # search at temperature 0 only): the same text on every run (retries, re-plans), and on the
+    # benchmark audio the same words, 3-5 % faster; the fallback's sampled decodes only made
+    # some runs differ (DESIGN.md §16, 2026-11-20). Without it, a low-scoring segment that
+    # isn't a repetition loop is kept as decoded; the loop filter only drops repetition runs.
+    temperature_fallback: bool = False
     cpu_threads: int = 0  # CTranslate2 CPU threads (0 = its default); matters on device "cpu"
     oom_wait_s: float = OOM_WAIT_S  # how long a call waits for GPU memory before failing
 
@@ -155,6 +165,7 @@ class WhisperEngine(BaseSpeechEngine):
                 word_timestamps=True,
                 vad_filter=vad_filter,
                 condition_on_previous_text=False,
+                temperature=list(FALLBACK_TEMPERATURES) if o.temperature_fallback else 0.0,
             )
             # A generator: decoding happens while it is consumed, so consume it under the lock.
             return result_from_segments(list(segments))

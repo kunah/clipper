@@ -243,9 +243,11 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    sentence of a chunk that runs into the cut is *provisional* and is re-transcribed and taken
    over by the next contiguous chunk (no sentence is ever cut, no added latency).
    Models from `tools/asr-bench`: Whisper large-v3-turbo (faster-whisper), CED-base
-   (provisional). Silero VAD gate (onnxruntime), CUDA image, compose service (profile `gpu`).
-   `clipper_core.transcripts.words()/coverage()` for consumers. E2e on 20 real chunks: 13×
-   realtime (CED on CPU is the slowest stage), 2.35 GB GPU. 313 tests.
+   (provisional; ONNX fp16 on onnxruntime-gpu since 2026-11-20, no torch in the image). Silero
+   VAD gate (onnxruntime, CPU), CUDA image, compose service (profile `gpu`).
+   `clipper_core.transcripts.words()/coverage()` for consumers. E2e on 20 real chunks: 29×
+   realtime overall (Whisper ~34×, CED ~1,470×, VAD ~270×), 2.60 GB GPU peak, Whisper at
+   temperature 0 (deterministic).
    Full design: [§16](#16-transcriber-design-step-4).
 5. ✅ backfill tool (`tools/backfill`, `clipper-backfill vod|channel|clips|status|calibrate`):
    past VODs written in the live format. Media: `audio_only` ~60 s chunks, T0 from the playlist's
@@ -312,12 +314,15 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-19 | Sound classifier: CED-base (`mispeech/ced-base`), **provisional, not yet confirmed by the user** | 666× realtime, 0.5 GB, works on 2 s windows (per-second resolution); AST needs 10 s windows. Neither could be judged for accuracy: the sample had little laughter/screaming |
 | 2026-11-19 | Voice-activity gate: Silero VAD v6.2 run by onnxruntime on the CPU (pinned model URL + sha256), numpy port of `get_speech_timestamps`; no torch in the transcriber for it | gate is model-independent (§16 step 4); ~185× realtime on one CPU thread; onnxruntime is small, torch would be ~GBs |
 | 2026-11-19 | Transcriber runtime (4b-3): faster-whisper's `vad_filter` **off**; **sequential** decoding of the gated stretches; model libraries as **optional extras** of clipper-transcriber (`whisper`, `ced`; only the CUDA image installs them); CED on the **CPU build of torch** | measured on the 20 benchmark chunks: `vad_filter` gave identical words and was 3 % slower (our Silero gate already runs in front); the batched pipeline was 1.2× faster but changed 1–2 % of the words; extras keep the dev env and tests free of torch/CUDA; the CPU build keeps the image ~5 GB smaller (CED speed is open, §16) |
+| 2026-11-20 | **CED runs on the GPU**: ONNX fp16 on onnxruntime-gpu (CUDA 12 build, ORT's own feed), exported at image build time from the pinned weights (build fails unless the sha256 matches); no torch in the image. Supersedes 4b-3's CED on CPU torch, the `ced` extra and the PyTorch CPU index. CED itself stays **provisional** (the user decided only where it runs) | on the CPU CED was the slowest stage (24× realtime, ~2.4 s per chunk). Measured on the idle 4060 (20 bench chunks, 2 s windows / 1 s hop): ORT fp16 849× realtime, 505 MB GPU, 1.1 s load, venv 0.77 GB vs torch CUDA fp16 751×, 509 MB, 3.8 s, 5.4 GB; ONNX vs torch outputs: max group-score diff 0.0022, top-1 agreement 100 % of 1170 windows. The Hub's own `model.onnx` (int8 incl. the mel frontend, no −120 dB floor) is off by up to 0.075. In the pipeline: CED ~1,000–1,500× realtime, overall 13× → 29×, per-second classes within 0.003 of the CPU run (§16) |
+| 2026-11-20 | Whisper decodes at **temperature 0 only** (faster-whisper's temperature fallback off; setting `whisper_temperature_fallback`) | measured on the 20 bench chunks: same words and benchmark agreement either way, the fallback re-decoded 4 of 190 segments per pass and made 2 of 20 chunks differ between two runs (once an invented "we'll be right back"); temperature 0 is identical run to run (retries, re-plans) and 3–5 % faster; no repetition loops either way. Trade-off: a low-scoring segment that isn't a repetition loop is now kept as decoded instead of re-decoded (the loop filter only drops repetition runs) (§16) |
 
 ## 16. Transcriber design (step 4)
 
 **Status:** design agreed 2026-11-18. Models (2026-11-19, see decision log): speech **Whisper
 large-v3-turbo** (faster-whisper) decided; sound classifier **CED-base** provisional until the user
-confirms. Both sit behind the engine interfaces, so either can be swapped later.
+confirms (where it runs is decided: on the GPU as ONNX, 2026-11-20). Both sit behind the engine
+interfaces, so either can be swapped later.
 
 **Benchmark** (`tools/asr-bench`, 2026-11-19; 20 × 60 s chunks from 5 English channels, idle
 RTX 4060, each chunk transcribed on its own):
@@ -497,7 +502,8 @@ Details decided while building it (step 4b-3, model adapters, image, compose):
   adds ~5 GB, PyPI's torchaudio loads `libcudart.so.13` at import) + transformers 5.23.0.
   `uv sync --all-packages` leaves them out (dev env and tests need no torch/CUDA; adapter tests
   fake the libraries). A missing extra raises `engines.MissingDependency`; the entry logs it and
-  exits 1.
+  exits 1. *(2026-11-20: the `ced` extra and the PyTorch CPU index are gone, CED runs on
+  onnxruntime-gpu; see "CED on the GPU" below.)*
 - **Whisper**: loaded once at start plus a 1 s warm-up decode (a broken CUDA setup fails at start,
   not on the first job); calls serialised; float32 arrays in; word probability → confidence,
   segments keep avg_logprob / no_speech_prob / compression_ratio. **Revision pinned** to the
@@ -522,12 +528,13 @@ Details decided while building it (step 4b-3, model adapters, image, compose):
   24× realtime on 2 threads** (13× on 1, 34× on 4, 50× on 8) — below the 30× aimed for: ~2.4 s per
   60 s chunk, more than Whisper's ~2 s. Not yet decided (CED is provisional anyway): more threads,
   the repo's `model.onnx` on onnxruntime, a smaller CED, or the tagger running alongside the speech
-  engine.
+  engine. *(2026-11-20: replaced by CED on the GPU, see below.)*
 - **Speed in the pipeline**: speech 31× realtime on window audio, slower than the benchmark's 49×
   because every gated stretch costs a full 30 s Whisper window (79 stretches in 20 min); overall
   13× with the tagger (VAD 4.6 s + speech 39 s + tagger 49 s for 1223 s of window audio). GPU: models
   take 2.2 GB (heartbeat `gpu`: device-wide used/total MB and utilisation via NVML, plus
-  `tagger_device`; start log `gpu_memory_for_models_mb`).
+  `tagger_device`; start log `gpu_memory_for_models_mb`). *(2026-11-20, CED on the GPU: overall
+  29×, see below.)*
 - **Logging**: every line is JSON. `faster_whisper` and `httpx2` (the hub's HTTP client) log at
   WARNING by default (core `DEFAULT_LEVELS`; one INFO line per call/request); transformers and
   huggingface_hub log through our handler (their own stderr handlers removed, no progress bars,
@@ -541,7 +548,8 @@ Details decided while building it (step 4b-3, model adapters, image, compose):
   --checksum=sha256:…` (`/opt/silero_vad.onnx`, `CLIPPER_TRANSCRIBER_VAD_MODEL_PATH`; a test keeps
   URL + hash equal to `vad.py`'s pin): no GitHub access at runtime. `HF_HOME=/models/hf`. Size 10.3 GB as Docker counts it (7.3 GB shared
   with asr-bench, 3.0 GB unique; CUDA base ~4.5 GB unpacked). A read-only models volume needs
-  `HF_MODULES_CACHE` on a writable path (transformers copies CED's Hub code there).
+  `HF_MODULES_CACHE` on a writable path (transformers copies CED's Hub code there). *(2026-11-20:
+  CED baked in as ONNX, no Hub code and no `HF_MODULES_CACHE` any more; see below.)*
 - **Compose** `transcriber`: profile `gpu` (a bare `docker compose up -d` leaves it out;
   `docker compose up -d transcriber` enables it by name), `x-app-env`, `CLIPPER_WORKER_ID:
   transcriber-1`, GPU reservation (nvidia, 1, `[gpu]`), `models` volume at `/models`, after
@@ -549,13 +557,95 @@ Details decided while building it (step 4b-3, model adapters, image, compose):
   start** (checked on an empty volume, online): the first start downloads ~1.8 GB (turbo at the
   pinned commit, CED, the label CSV) and writes CED's code to `/models/hf/modules`; the first jobs
   then ran as usual. Unauthenticated Hub requests only log a warning (set `HF_TOKEN` for higher rate
-  limits).
+  limits). *(2026-11-20: only Whisper is downloaded now, ~1.5 GB.)*
 - **End-to-end check** (throwaway DB + bucket, the bench image's weights mounted read-only and
   offline): 20/20 jobs done in one attempt; coverage complete; owned ranges tile; 8 takeovers
   (0.8–7.4 s lead-in), no duplicate or lost words at the boundaries; 180 segments (none > 30 s, none
   overlapping), provisional tails only at stream ends; 240 metric rows per 4-minute stream
   (speech_ratio 0.0 and `music` top class on the music-only channel); words agree 93.7 % per chunk
   (87–96 % per stream) with the benchmark's turbo output of the same chunks.
+
+Details decided while building it (2026-11-20, **CED on the GPU**, decision log; replaces the
+CED-on-CPU parts of 4b-3 above: the `ced` extra, `tagger_device`, the label CSV, `HF_MODULES_CACHE`):
+- **Evaluation** (main session, idle 4060, 20 bench chunks, 2 s windows / 1 s hop, batches of 32):
+  ORT fp16 849× realtime, 505 MB GPU, 1.1 s load, 0.77 GB venv; torch CUDA fp16 751×, 509 MB,
+  3.8 s, 5.4 GB. ONNX vs torch: max group-score diff 0.0022, top-1 agreement 100 % of 1170
+  windows. The Hub's `model.onnx` is int8 (incl. STFT/mel), has no −120 dB floor and is off by up to
+  0.075, so the graph is exported ourselves.
+- **Model file**: exported at image build time (Dockerfile stage `ced-export`) from
+  `mispeech/ced-base` @ db3e14a `model.safetensors` by `services/transcriber/ced_export/export_onnx.py`
+  (the evaluation's script) with the pinned CPU toolchain of `ced_export/requirements.txt` (Python
+  3.12.15, torch 2.15.0+cpu, torchaudio 2.11.0+cpu, transformers 5.23.0, onnxscript 0.7.2, onnx
+  1.23.2): fp16 transformer, fp32 mel frontend inside the graph, opset 18, 172,665,049 bytes, sha256
+  `76cbe72e…6a6dc6` (reproduced exactly by the first build). The build fails on any other sha256,
+  `CedTagger.load` checks it again (`ced.CED_ONNX_SHA256`; a test keeps Dockerfile and code
+  equal). Only the .onnx is in the image (`/opt/ced/ced-base-fp16.onnx`, setting
+  `tagger_model_path`). The output sha256 also covers the weights (not checked on their own).
+  The build stage needs Hub access (~345 MB). CED's Hub code there also downloads
+  `topel/ConvNeXt-Tiny-AT`'s label CSV from its unpinned `main` (names only, not in the graph), so
+  the build depends on that repo; `ced_export/check_labels.py` fails the build unless the 23 group
+  labels sit at their `AUDIOSET_INDEX` positions (`group_labels.json`, kept equal to the table by a
+  test). At runtime CED needs nothing from the Hub (no `trust_remote_code`, no label CSV, no
+  `HF_MODULES_CACHE`).
+- **Graph**: `waveform` float32 [batch, samples], 16 kHz mono, ≤ 161,760 samples (10.11 s; the
+  graph itself only fails well above that, so the scorer refuses longer input with a ValueError) →
+  `probs` float32 [batch, 527], already probabilities, index i = AudioSet class i.
+  The −120 dB floor is batch-wide, as torchaudio's was (batches of 16, as before). The graph has no
+  label names; they come from the pinned `AUDIOSET_INDEX` table (`config.json` has short names for
+  75 labels), and `load` checks the output width (527) and the groups against it.
+- **Packages**: onnxruntime-gpu 1.29.0 from ORT's CUDA 12 feed (built for CUDA 12.8; PyPI's ≥ 1.27
+  are CUDA 13 builds whose CUDA provider can't load on the 12.8 base, and ORT then silently runs on
+  the CPU). The transcriber depends on `onnxruntime==1.31.1; sys_platform != 'linux'` and
+  `onnxruntime-gpu==1.29.0; sys_platform == 'linux'` (explicit index); the root pyproject's
+  `override-dependencies = ["onnxruntime==1.31.1; sys_platform != 'linux'"]` drops faster-whisper's
+  CPU `onnxruntime` on Linux (both packages write the same module). So the Windows dev env and the
+  tests keep the CPU package for Silero, and the image has only onnxruntime-gpu (Silero's session
+  stays on `CPUExecutionProvider`). The base image's CUDA 12.8 runtime, cuBLAS and cuDNN 9.8 serve
+  CTranslate2 and ORT in one process.
+- **Session**: CUDA provider first (`device_id` 0; `arena_extend_strategy` kSameAsRequested: the
+  default power-of-two growth peaked at 633 MB instead of 505; `cudnn_conv_algo_search` HEURISTIC;
+  `use_tf32` 0, which keeps the fp32 frontend exact), then CPU; `intra_op_num_threads` 2
+  (`tagger_threads`; ORT keeps a dozen int64 shape ops on the CPU). **Guard**: `get_providers()[0]`
+  must be CUDA, else `MissingDependency` (the entry exits 1), since a CUDA provider that can't load
+  only logs a warning. `disable_cpu_ep_fallback` can't be the guard: those shape ops trip it.
+  **GPU only**, no CPU mode: fp16 runs at ~6× on the CPU, and a CPU mode would need the fp32 export
+  (344 MB more). One warm-up batch at load, as for Whisper. ORT logs errors only, for the session
+  and process-wide (1.29 warns "No registered plugin EP device found for 'CUDAExecutionProvider'"
+  at every start, harmless and not JSON); a provider that can't load is still logged as an error
+  with the reason.
+- **GPU out of memory**: ORT raises its own `onnxruntime_pybind11_state.Fail` (parent `Exception`).
+  `gpu.is_out_of_memory` also accepts ORT's exception types and matches their messages ("Available
+  memory of X is smaller than requested bytes of Y", "Failed to allocate memory", "CUDA failure 2:
+  out of memory", "…_ALLOC_FAILED"), so the 4b-3 in-process wait covers CED unchanged.
+- **Image**: venv 1.69 → 1.25 GB (no torch/torchaudio/transformers; onnxruntime-gpu 0.71 GB) plus
+  the 173 MB model. Size as Docker counts it is unchanged (10.31 → 10.33 GB): the CUDA provider
+  library is about as big as CPU torch was. A cold start downloads only Whisper (~1.5 GB).
+- **End-to-end rerun** (as in 4b-3: throwaway DB and bucket, the 20 bench chunks as 5 contiguous
+  streams, Whisper weights read-only and offline; the old CPU-CED image was rerun first as the
+  reference): 20/20 jobs in one attempt, coverage complete, owned ranges tile, 8 takeovers (same
+  lead-ins), 180 segments, words identical to the CPU run (1747; 93.7 % per-chunk agreement with
+  the benchmark's turbo output). Speed on 1223 s of window audio: CED 48.3 s (25×) → 0.84 s
+  (~1,470×; ~1,000× before the warm-up was added, when the first job paid for the arena), overall
+  13.1× → 29.3× (VAD 4.5 s, speech 36.3 s). GPU: Whisper + CED peak 2.60 GB above the idle baseline
+  (2.32 GB with CED on the CPU), 2.48 GB after loading. Per-second classes vs the CPU run: max
+  difference 0.003 over 12,000 values, none above 0.01, the top class equal in all 1200 seconds.
+  Every log line is JSON.
+- **Whisper temperature**: faster-whisper's fallback re-decodes a stretch with sampling at
+  temperatures 0.2 … 1.0 when its decode looks bad (compression ratio > 2.4 or avg_logprob < −1).
+  Measured in the image on the 20 bench chunks (each on its own through the pipeline, two passes
+  per setting, alternating): with the fallback, 4 of 190 segments per pass went through all
+  temperatures (faster-whisper then keeps the best decode, mostly the temperature-0 one); per-chunk
+  agreement with the benchmark was 94.0 % both ways, with 1755–1759 words vs 1755. With the
+  fallback, 2 of 20 chunks differed between two passes (once an inserted "we'll be right back",
+  once a spelling); at temperature 0 all 20 were identical. Speech took 35.0–36.5 s vs 34.2–34.6 s
+  (3–5 % faster), and the raw output had no repetition loops either way. In the e2e both settings
+  gave the same 1747 words, with speech 37.6 s vs 36.6 s. **Default: temperature 0 only**
+  (`whisper_temperature_fallback` = false): the same text on every run (retries, re-plans,
+  rebuilt words files) at no measured cost. Trade-off: the fallback re-decodes every
+  bad-looking segment (compression ratio > 2.4 or avg_logprob < −1). The loop filter only drops
+  repetition runs, so a low-scoring segment that isn't a loop is now kept as decoded (its
+  avg_logprob is stored for consumers to filter). Caveat: the sample had no looping audio, so a
+  loop the fallback would have rescued couldn't be observed.
 
 **Contract changes (libs/core, additive migration 0002):**
 - `chunk_transcripts`: + `owned_from`, `owned_to`, `tail_from` (timestamptz; tail nullable),

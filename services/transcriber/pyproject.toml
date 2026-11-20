@@ -6,26 +6,26 @@ requires-python = ">=3.12"
 dependencies = [
     "clipper-core",
     "numpy>=2.1",
-    "onnxruntime==1.31.1",
+    # ONNX Runtime runs Silero VAD (CPU) and CED (GPU, the model file is baked into the image).
+    # Linux (the CUDA image): onnxruntime-gpu, the CUDA 12 build from ORT's own feed. PyPI's
+    # onnxruntime-gpu >= 1.27 is a CUDA 13 build: on the image's CUDA 12.8 its CUDA provider
+    # can't load and ORT silently runs on the CPU. Its CPU provider serves Silero.
+    # Elsewhere (the Windows dev env, tests): the CPU package. faster-whisper requires the CPU
+    # package too; the root pyproject's override keeps it out on Linux (both packages install
+    # the same `onnxruntime` module and break each other). Keep the pin equal to the override's.
+    "onnxruntime==1.31.1; sys_platform != 'linux'",
+    "onnxruntime-gpu==1.29.0; sys_platform == 'linux'",
 ]
 
-# Real model adapters (the CUDA image installs both: --extra whisper --extra ced). A plain
-# `uv sync --all-packages` leaves them out, so the dev env and the tests need no torch/CUDA.
+# Speech engine library (the CUDA image installs it: --extra whisper). A plain
+# `uv sync --all-packages` leaves it out, so the dev env and the tests need no CUDA.
 [project.optional-dependencies]
-# Speech: Whisper via faster-whisper (CTranslate2 on CUDA 12 + cuDNN 9, from the base image).
+# Whisper via faster-whisper (CTranslate2 on CUDA 12 + cuDNN 9, from the base image).
 # Versions as in tools/asr-bench. nvidia-ml-py: GPU memory/utilisation in the heartbeat.
 whisper = [
     "faster-whisper==1.2.1",
     "ctranslate2==4.9.0",
     "nvidia-ml-py==13.615.71",
-]
-# Sound classes: CED-base (transformers + the model's Hub code, which needs torchaudio). torch
-# and torchaudio from the PyTorch CPU index: the CUDA builds add ~5 GB to the image (PyPI's
-# torchaudio wheel loads libcudart.so.13 at import, so it can't pair with the CPU torch).
-ced = [
-    "torch==2.15.0",
-    "torchaudio==2.11.0",
-    "transformers==5.23.0",
 ]
 
 [project.scripts]
@@ -33,12 +33,12 @@ clipper-transcriber = "clipper_transcriber.main:main"
 
 [tool.uv.sources]
 clipper-core = { workspace = true }
-torch = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }
+onnxruntime-gpu = { index = "onnxruntime-cuda-12" }
 
+# ORT's feed of CUDA 12 builds (1.29.0: built for CUDA 12.8, the image's base).
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "onnxruntime-cuda-12"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
 explicit = true
 
 [build-system]

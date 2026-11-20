@@ -7,6 +7,7 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from clipper_core.contracts import CHUNK_JITTER
+from clipper_transcriber.ced import CED_ONNX_PATH
 from clipper_transcriber.pipeline import PipelineConfig
 from clipper_transcriber.vad import VadParams
 from clipper_transcriber.whisper import WhisperOptions
@@ -35,10 +36,16 @@ class TranscriberSettings(BaseSettings):
     # faster-whisper's own Silero VAD inside each stretch our gate sends: same words on the
     # benchmark audio, 3 % slower (4b-3 e2e), so off.
     whisper_vad_filter: bool = False
+    # faster-whisper's temperature fallback (re-decodes bad-looking stretches with sampling).
+    # Off: temperature 0 only, the same text on every run; same words, 3-5 % faster on the
+    # benchmark audio (DESIGN.md §16).
+    whisper_temperature_fallback: bool = False
 
-    # Sound tagger "ced" (CED-base). CPU by default: the image has the CPU build of torch.
-    tagger_device: Literal["cpu", "cuda"] = "cpu"
-    tagger_threads: int = Field(default=2, ge=0)  # torch CPU threads; 0 = torch's default
+    # Sound tagger "ced" (CED-base as ONNX on onnxruntime's CUDA provider; GPU only). The image
+    # bakes the exported model in at the default path; `load` checks its sha256.
+    tagger_model_path: Path = CED_ONNX_PATH
+    # onnxruntime intra-op CPU threads (a few shape ops stay on the CPU); 0 = one per core.
+    tagger_threads: int = Field(default=2, ge=0)
     tagger_batch_size: int = Field(default=16, ge=1)  # 2 s windows per forward pass
 
     # A GPU out-of-memory error (a game holding the VRAM) is retried in-process for this long
@@ -101,6 +108,7 @@ class TranscriberSettings(BaseSettings):
             compute_type=self.whisper_compute_type,
             beam_size=self.whisper_beam_size,
             vad_filter=self.whisper_vad_filter,
+            temperature_fallback=self.whisper_temperature_fallback,
             oom_wait_s=self.gpu_oom_wait_s,
         )
 

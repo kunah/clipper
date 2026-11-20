@@ -1,27 +1,39 @@
-"""Sound tagger: CED-base (AudioSet, 527 labels) through transformers. PROVISIONAL choice (§15).
+"""Sound tagger: CED-base (AudioSet, 527 labels) as an ONNX graph on onnxruntime's CUDA provider.
+The model is a PROVISIONAL choice (§15); that it runs on the GPU without torch is decided
+(2026-11-20).
 
-    tagger = CedTagger.load(device="cpu", threads=2)
+    tagger = CedTagger.load()            # /opt/ced/ced-base-fp16.onnx (the image's), on CUDA
     scores = tagger.classify(pcm)        # one {SoundGroup: 0..1} per (partial) second of pcm
 
 2 s windows starting every second; a second's score is the max over the windows covering it,
 and a group's score the max over its AudioSet labels (`engines.AUDIOSET_GROUPS`), as in
-tools/asr-bench/run_tagger.py. The model's Hub code already ends in a sigmoid: its "logits" are
-probabilities. That code runs with `trust_remote_code`, so the repo revision is pinned.
+tools/asr-bench/run_tagger.py.
 
-Its config reads the label names from `topel/ConvNeXt-Tiny-AT` (class_labels_indices.csv) on that
-repo's main branch, which the pinned revision doesn't cover and the remote code can't pin, so
-`load` checks the labels the groups use against the AudioSet ontology (`AUDIOSET_INDEX`) and
-refuses a model whose labels moved.
+The model file is exported at image build time from the pinned Hub weights of
+`mispeech/ced-base` (services/transcriber/ced_export/export_onnx.py; the build checks
+`CED_ONNX_SHA256`, and so does `load`). Graph: `waveform` float32 [batch, samples], 16 kHz mono,
+at most `CED_MAX_SAMPLES` (the scorer refuses longer input: the graph itself only fails well
+above the bound) -> `probs` float32 [batch, 527], already
+probabilities (the model's sigmoid is in the graph), index i = AudioSet class i. The mel frontend
+is in the graph too (float32; the transformer runs in float16); its -120 dB floor is relative to
+the loudest frame of the whole batch, like torchaudio's AmplitudeToDB in the model's Hub code.
+The graph has no label names: they come from the pinned AudioSet index table (`AUDIOSET_INDEX`),
+which `load` checks against the model's output width and the groups.
 
-torch/torchaudio/transformers are the optional `ced` extra, imported only in `load`. On the CPU
-(default) torch comes from the PyTorch CPU index, which keeps the image ~5 GB smaller.
+On Linux the transcriber's onnxruntime is onnxruntime-gpu (the CUDA 12 build). `load` refuses a
+session whose first provider isn't CUDA: when the CUDA provider can't load (wrong CUDA build,
+missing libraries, no GPU), ORT only logs a warning and runs on the CPU, where the float16 graph
+is ~6x realtime. A GPU out-of-memory error (ORT's arena or CUDA itself, e.g. a game holding the
+VRAM) is waited out in-process (`gpu.retry_on_oom`).
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,28 +42,43 @@ import numpy.typing as npt
 from clipper_core.contracts import SoundGroup
 from clipper_core.logs import get_logger
 from clipper_transcriber.audio import SAMPLE_RATE, Pcm
-from clipper_transcriber.engines import (
-    AUDIOSET_GROUPS,
-    MissingDependency,
-    SecondScores,
-    require,
-    route_hf_logging,
-)
+from clipper_transcriber.engines import AUDIOSET_GROUPS, MissingDependency, SecondScores
 from clipper_transcriber.gpu import OOM_WAIT_S, oom_delays, retry_on_oom
 
 log = get_logger(__name__)
 
+# The weights the ONNX file is exported from (the benchmarked revision, 2026-11-19).
 CED_MODEL = "mispeech/ced-base"
-CED_REVISION = "db3e14a8db4c21b56b165261c39649741a900e7f"  # the benchmarked one (2026-11-19)
+CED_REVISION = "db3e14a8db4c21b56b165261c39649741a900e7f"
+# The exported file: where the image puts it, and its sha256 (the Dockerfile's build check uses
+# the same value; a test keeps them equal).
+CED_ONNX_PATH = Path("/opt/ced/ced-base-fp16.onnx")
+CED_ONNX_SHA256 = "76cbe72ec8aa39d1291fcdb1bbd722cfa3be5b99a932ba7d85428478c46a6dc6"
+CED_INPUT = "waveform"
+CED_OUTPUT = "probs"
+# Longest input the graph is exported for: the encoder splits longer inputs (> 1012 frames) on a
+# data-dependent branch, so the export is bounded (10.11 s). The graph doesn't fail right above
+# the bound (only far above it), so the scorer checks it.
+CED_MAX_SAMPLES = 161_760
 WINDOW_S = 2
 HOP_S = 1
+
+# CUDA provider options (measured in the evaluation, DESIGN.md §16): the default power-of-two
+# arena growth peaked at 633 MB instead of 505; the cuDNN conv search modes made no difference;
+# TF32 off keeps the float32 mel frontend exact at no measurable cost.
+CUDA_PROVIDER_OPTIONS: Mapping[str, str] = {
+    "device_id": "0",
+    "arena_extend_strategy": "kSameAsRequested",
+    "cudnn_conv_algo_search": "HEURISTIC",
+    "use_tf32": "0",
+}
 
 # [n, WINDOW_S * 16000] float32 windows -> [n, labels] probabilities
 Scorer = Callable[[npt.NDArray[np.float32]], npt.NDArray[np.floating]]
 
 AUDIOSET_LABELS = 527
 # Index of every label the groups use in AudioSet's class_labels_indices.csv (as cached from
-# topel/ConvNeXt-Tiny-AT e3eaf4c, 2026-11-19).
+# topel/ConvNeXt-Tiny-AT e3eaf4c, 2026-11-19). CED's output i is AudioSet class i.
 AUDIOSET_INDEX: Mapping[str, int] = {
     "Speech": 0,
     "Shout": 8,
@@ -83,6 +110,10 @@ class LabelMismatch(RuntimeError):
     """The model's label list isn't the AudioSet one the groups were built for."""
 
 
+class ModelMismatch(RuntimeError):
+    """The model file isn't the pinned export (other bytes, inputs or outputs)."""
+
+
 def check_audioset_labels(id2label: Mapping[Any, str]) -> None:
     """527 labels, and every label of every group at its AudioSet index; else LabelMismatch."""
     labels = {int(i): str(label) for i, label in id2label.items()}
@@ -96,6 +127,13 @@ def check_audioset_labels(id2label: Mapping[Any, str]) -> None:
     unknown = [lbl for ls in AUDIOSET_GROUPS.values() for lbl in ls if lbl not in AUDIOSET_INDEX]
     if wrong or unknown:
         raise LabelMismatch(f"labels not at their AudioSet index: {wrong}; unchecked: {unknown}")
+
+
+def audioset_id2label(outputs: int = AUDIOSET_LABELS) -> dict[int, str]:
+    """Output index -> label for a model with `outputs` AudioSet outputs, from the pinned index
+    table: the groups' labels by name, the others as "AudioSet class <i>" (unused)."""
+    names = {index: label for label, index in AUDIOSET_INDEX.items()}
+    return {i: names.get(i, f"AudioSet class {i}") for i in range(outputs)}
 
 
 def label_groups(id2label: Mapping[Any, str]) -> dict[SoundGroup, list[int]]:
@@ -133,6 +171,27 @@ def per_second_max(
     return out
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def check_io(session: Any) -> int:
+    """The pinned graph's interface: input `waveform` [batch, samples], output `probs`
+    [batch, labels]. Returns the number of labels; ModelMismatch otherwise."""
+    inputs, outputs = session.get_inputs(), session.get_outputs()
+    names = ([i.name for i in inputs], [o.name for o in outputs])
+    if names[0][:1] != [CED_INPUT] or names[1][:1] != [CED_OUTPUT]:
+        raise ModelMismatch(f"expected input {CED_INPUT!r} and output {CED_OUTPUT!r}, got {names}")
+    width = outputs[0].shape[-1]
+    if not isinstance(width, int):
+        raise ModelMismatch(f"output {CED_OUTPUT!r} has no fixed label count: {outputs[0].shape}")
+    return width
+
+
 class CedTagger:
     """CED as a `SoundTagger`. Build it with `load`; the constructor takes any scorer (tests)."""
 
@@ -142,7 +201,7 @@ class CedTagger:
         id2label: Mapping[Any, str],
         *,
         name: str = "ced-base",
-        device: str = "cpu",
+        device: str = "cuda",
         window_s: int = WINDOW_S,
         batch_size: int = 16,
         oom_wait_s: float = OOM_WAIT_S,
@@ -162,54 +221,82 @@ class CedTagger:
     @classmethod
     def load(
         cls,
+        model_path: Path | str = CED_ONNX_PATH,
         *,
-        model: str = CED_MODEL,
-        revision: str | None = CED_REVISION,
-        device: str = "cpu",
+        sha256: str | None = CED_ONNX_SHA256,
         threads: int = 2,
         batch_size: int = 16,
         oom_wait_s: float = OOM_WAIT_S,
+        warm_up: bool = True,
     ) -> CedTagger:
-        """Load the model (into the Hugging Face cache on first use). `threads` = torch CPU
-        threads (0 = torch's default); on CUDA the model runs in float16. Raises
-        MissingDependency for device "cuda" with a CPU-only torch, LabelMismatch for labels
-        that aren't AudioSet's."""
-        torch = require("torch", "ced")
-        transformers = require("transformers", "ced")
-        route_hf_logging()
-        half = device.startswith("cuda")
-        if half and not torch.cuda.is_available():
+        """An onnxruntime session on the CUDA provider for the exported model file, warmed up
+        with one batch of silence (a CUDA setup that can't run the graph fails at start, not on
+        the first job). `sha256` None skips the file check (another export); `threads` = ORT's
+        intra-op CPU threads for the few shape ops it keeps on the CPU (0 = one per core).
+        Raises MissingDependency when the file is missing or the CUDA provider isn't active,
+        ModelMismatch for another file or interface, LabelMismatch for an output width that
+        isn't AudioSet's."""
+        path = Path(model_path)
+        if not path.is_file():
             raise MissingDependency(
-                f"sound tagger device {device!r}, but torch {torch.__version__} has no CUDA"
-                " (the image has the CPU build): set CLIPPER_TRANSCRIBER_TAGGER_DEVICE=cpu"
+                f"CED model file {path} not found: the transcriber image has it at"
+                f" {CED_ONNX_PATH} (exported at build time); natively export it with"
+                " services/transcriber/ced_export/export_onnx.py and set"
+                " CLIPPER_TRANSCRIBER_TAGGER_MODEL_PATH, or set CLIPPER_TRANSCRIBER_TAGGER=none"
             )
-        log.info("loading sound tagger", model=model, revision=revision, device=device)
-        kwargs: dict[str, Any] = {"trust_remote_code": True, "revision": revision}
-        fe = transformers.AutoFeatureExtractor.from_pretrained(model, **kwargs)
-        net = transformers.AutoModelForAudioClassification.from_pretrained(model, **kwargs)
-        check_audioset_labels(net.config.id2label)
-        net = net.to(device).eval()
-        if half:
-            net = net.half()
+        if sha256 is not None and (digest := file_sha256(path)) != sha256:
+            raise ModelMismatch(f"CED model file {path} has sha256 {digest}, expected {sha256}")
+
+        import onnxruntime as ort
+
+        log.info(
+            "loading sound tagger",
+            model=CED_MODEL,
+            revision=CED_REVISION,
+            path=str(path),
+            onnxruntime=ort.__version__,
+        )
+        # ORT logs to stderr, not JSON: errors only, for the process ("No registered plugin EP
+        # device found for 'CUDAExecutionProvider'" at every start is a harmless warning of 1.29)
+        # and for the session (shape ops kept on the CPU, memcpy nodes). A CUDA provider that
+        # can't load is still logged, as an error with the reason (a missing library).
+        ort.set_default_logger_severity(3)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = threads
+        options.log_severity_level = 3
+        providers = [("CUDAExecutionProvider", dict(CUDA_PROVIDER_OPTIONS)), "CPUExecutionProvider"]
+        session = ort.InferenceSession(str(path), sess_options=options, providers=providers)
+        # Not `session.disable_cpu_ep_fallback`: ORT keeps a dozen int64 shape ops on the CPU on
+        # purpose, which trips it.
+        active = list(session.get_providers())
+        if active[:1] != ["CUDAExecutionProvider"]:
+            raise MissingDependency(
+                f"the sound tagger needs onnxruntime's CUDA provider, but the session runs on"
+                f" {active} (onnxruntime {ort.__version__}, available:"
+                f" {ort.get_available_providers()}): it needs onnxruntime-gpu's CUDA 12 build,"
+                " the CUDA 12 + cuDNN 9 libraries of the image and a GPU (ORT logged the reason)"
+            )
+        width = check_io(session)
+        if width != AUDIOSET_LABELS:
+            raise LabelMismatch(f"model has {width} outputs, expected {AUDIOSET_LABELS} (AudioSet)")
+        id2label = audioset_id2label(width)
+        check_audioset_labels(id2label)
 
         def scorer(windows: npt.NDArray[np.float32]) -> npt.NDArray[np.floating]:
-            if threads > 0:
-                # Per call: with OpenMP the setting belongs to the calling (worker) thread.
-                torch.set_num_threads(threads)
-            inputs = fe(torch.from_numpy(windows), sampling_rate=SAMPLE_RATE, return_tensors="pt")
-            moved = {}
-            for key, value in inputs.items():
-                value = value.to(device)
-                moved[key] = value.half() if half and value.is_floating_point() else value
-            with torch.inference_mode():
-                probs = net(**moved).logits  # already sigmoid-ed by the Hub model code
-            return probs.float().cpu().numpy()
+            batch = np.ascontiguousarray(windows, dtype=np.float32)
+            if batch.ndim != 2 or batch.shape[1] > CED_MAX_SAMPLES:
+                raise ValueError(
+                    f"CED takes [batch, <= {CED_MAX_SAMPLES}] samples, got {batch.shape}"
+                )
+            return session.run([CED_OUTPUT], {CED_INPUT: batch})[0]
 
+        if warm_up:
+            scorer(np.zeros((max(1, batch_size), WINDOW_S * SAMPLE_RATE), dtype=np.float32))
         return cls(
             scorer,
-            net.config.id2label,
-            name=model.rsplit("/", 1)[-1],
-            device=device,
+            id2label,
+            name=path.stem,
+            device="cuda",
             batch_size=batch_size,
             oom_wait_s=oom_wait_s,
         )

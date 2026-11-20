@@ -118,9 +118,10 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s   # close open chunks and upload them
 
-  # GPU worker: transcribes chunks (faster-whisper large-v3-turbo on CUDA, CED sound classes on
-  # the CPU, Silero VAD baked into the image). Model weights (~2 GB) are downloaded into the
-  # `models` volume on first start. One per GPU; SIGTERM finishes the job in progress.
+  # GPU worker: transcribes chunks (faster-whisper large-v3-turbo and CED sound classes, ONNX on
+  # onnxruntime-gpu, both on CUDA; Silero VAD and CED baked into the image). Whisper's weights
+  # (~1.5 GB) are downloaded into the `models` volume on first start. One per GPU; SIGTERM
+  # finishes the job in progress.
   # Profile `gpu`: a bare `docker compose up -d` leaves it out; start it by name (see the header).
   transcriber:
     profiles: [gpu]

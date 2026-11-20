@@ -6,9 +6,10 @@
     await service.run(stop)                             # until `stop`; finishes the current job
 
 Engines are picked by name from `SPEECH_ENGINES` / `SOUND_TAGGERS` (`CLIPPER_TRANSCRIBER_ENGINE`,
-`CLIPPER_TRANSCRIBER_TAGGER`): "whisper" (default) and "ced" (default) are the real adapters,
-whose libraries are the package's optional extras (`engines.MissingDependency` without them);
-"fake" (the sine-tone test engines) is only used when configured explicitly.
+`CLIPPER_TRANSCRIBER_TAGGER`): "whisper" (default) and "ced" (default) are the real adapters;
+whisper's library is the package's optional extra, ced needs the model file baked into the image
+and onnxruntime's CUDA provider (`engines.MissingDependency` without them); "fake" (the
+sine-tone test engines) is only used when configured explicitly.
 """
 
 from __future__ import annotations
@@ -62,7 +63,7 @@ def _ced(settings: TranscriberSettings) -> SoundTagger:
     from clipper_transcriber.ced import CedTagger
 
     return CedTagger.load(
-        device=settings.tagger_device,
+        settings.tagger_model_path,
         threads=settings.tagger_threads,
         batch_size=settings.tagger_batch_size,
         oom_wait_s=settings.gpu_oom_wait_s,
@@ -78,7 +79,7 @@ SPEECH_ENGINES: dict[str, Callable[[TranscriberSettings], SpeechEngine]] = {
 
 # Sound taggers by `CLIPPER_TRANSCRIBER_TAGGER`; "none" = no `classes` in audio_metrics_1s.
 SOUND_TAGGERS: dict[str, Callable[[TranscriberSettings], SoundTagger | None]] = {
-    "ced": _ced,  # CED-base AudioSet tagger, CPU by default (extra "ced"); provisional
+    "ced": _ced,  # CED-base AudioSet tagger, ONNX on the GPU (file baked into the image)
     "none": lambda settings: None,
     "fake": _fake_tagger,  # loudness-based scores for tests
 }

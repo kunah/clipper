@@ -293,7 +293,7 @@ def test_silero_is_loaded_at_build_time(silero_model):
         ({"CLIPPER_TRANSCRIBER_ENGINE": "nope"}, "unknown engine"),
         ({"CLIPPER_TRANSCRIBER_ENGINE": "fake", "CLIPPER_TRANSCRIBER_TAGGER": "x"}, "unknown"),
         ({"CLIPPER_TRANSCRIBER_ENGINE": "fake", "CLIPPER_TRANSCRIBER_FFMPEG": "nope"}, "ffmpeg"),
-        ({}, "engine libraries not installed"),  # defaults: whisper + ced, extras missing
+        ({}, "engine libraries not installed"),  # defaults: whisper + ced, extra missing
     ],
 )
 async def test_entry_point_refuses_to_start_without_a_usable_config(
@@ -302,8 +302,7 @@ async def test_entry_point_refuses_to_start_without_a_usable_config(
     from clipper_transcriber import main
 
     monkeypatch.chdir(tmp_path)  # no .env
-    for module in ("faster_whisper", "torch", "transformers"):
-        monkeypatch.setitem(sys.modules, module, None)  # as on the dev env: extras not installed
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)  # as on the dev env: no extra
     for name in ("ENGINE", "TAGGER", "FFMPEG"):
         monkeypatch.delenv(f"CLIPPER_TRANSCRIBER_{name}", raising=False)
     for name, value in env.items():

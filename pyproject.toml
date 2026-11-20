@@ -5,6 +5,16 @@
 [tool.uv.workspace]
 members = ["libs/*", "db", "services/*", "tools/backfill"]  # not tools/*: asr-bench stays out
 
+[tool.uv]
+# faster-whisper requires the CPU package `onnxruntime`. On Linux (the transcriber's CUDA image)
+# the transcriber has onnxruntime-gpu instead, which installs the same `onnxruntime` module: with
+# both, uninstalling or upgrading either breaks the other. An override replaces every
+# requirement on the package (the transcriber's own pin too), so it keeps the CPU package where
+# it is wanted (Windows dev env, tests) at the transcriber's version, and drops CPU onnxruntime
+# on Linux for EVERY workspace member (a member that needs it on Linux must use onnxruntime-gpu
+# or change this). A test keeps the pin equal to the transcriber's.
+override-dependencies = ["onnxruntime==1.31.1; sys_platform != 'linux'"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",

@@ -82,17 +82,26 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   live, to confirm the PDT T0. Real chat run: 2426 messages / 905 chatters / 215 metric seconds
   from 4 min of an xqc VOD, hard kill + resume without duplicates. **Step 5 done.** 531 tests.
 
+- Transcriber: **CED on the GPU** (commit "Transcriber: CED on the GPU via ONNX fp16"; your
+  decision, recipe from the main session): CED-base exported to ONNX fp16 in a Docker build
+  stage from pinned weights (sha256 of the output checked; reproduced byte-identically twice;
+  label table checked in the build), onnxruntime-gpu 1.29 (CUDA-12 build) in the image, CPU
+  onnxruntime natively for Silero/tests, no torch in the image. Rerun of the GPU e2e (20 chunks):
+  identical 1747 words, 93.7 % agreement, per-second classes within 0.003 of the CPU run; CED
+  48 s → 0.84 s; **overall 13× → 29× realtime**; 2.60 GB GPU peak (Whisper + CED). Whisper now
+  defaults to **temperature 0** (deterministic: 20/20 chunks identical across passes vs 2/20
+  differing with the fallback, which once invented "we'll be right back"; same agreement,
+  3–5 % faster; the fallback stays a setting). Image still 10.3 GB (venv smaller, but ORT's CUDA
+  provider ≈ CPU torch in size). 539 tests.
+
 ## In progress
 
-- Transcriber: CED on the GPU (your decision, recipe from the main session: CED-base exported to
-  ONNX fp16 at image build time, onnxruntime-gpu 1.29 from ORT's CUDA-12 index, no torch), then
-  rerun the GPU end-to-end test.
+- Phase 2: detector (§18) unit 1: contracts + migration 0004.
 
 ## Next
 
-- Phase 2 in roadmap order (detector §18 first): the parts that are safe to build before the
-  designs are agreed (contracts + migration 0004, pure scorer + fake-spike filter + lexicon,
-  live service with provisional defaults).
+- Phase 2 in roadmap order (detector §18 next units: pure scorer + fake-spike filter + lexicon,
+  then the live service with provisional defaults; then judge §19 contracts + fakes).
 
 ## How to deploy the transcriber (your call, in the morning)
 
@@ -117,6 +126,9 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
   migration ran and nothing was rebuilt). All three services logged in normally; ohnepixel was
   offline. Tests keep using the separate throwaway Postgres `clipper-orch-testpg` on
   127.0.0.1:5434 (removed at the end of the run).
+- Disk: the live recordings volume `clipper_objectdata` is at 24.5 GB (ohnepixel at source
+  quality; video retention (~48 h) isn't implemented yet, see DESIGN §14 open items). E: had
+  ~108 GB free on 2026-11-19.
 - Seen in the live recorder logs: `"level": "info"` in lowercase (importing streamlink renames
   the stdlib level names); fixed in core logs by step 5d (takes effect on the next rebuild).
 

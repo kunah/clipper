@@ -62,15 +62,34 @@ def gpu_status(index: int = 0) -> dict[str, Any] | None:
     }
 
 
+# GPU allocation failures by message (lower case):
+# - CTranslate2: "CUDA failed with error out of memory"; cuBLAS / cuDNN: "..._ALLOC_FAILED"
+# - onnxruntime's CUDA provider: its arena ("BFCArena::AllocateRawInternal Available memory of X
+#   is smaller than requested bytes of Y", "Failed to allocate memory for requested buffer of
+#   size N") or CUDA itself ("CUDA failure 2: out of memory")
+OOM_MESSAGES = (
+    "out of memory",
+    "alloc_failed",
+    "failed to allocate memory",
+    "smaller than requested bytes",
+)
+
+
+def is_onnxruntime_error(exc: BaseException) -> bool:
+    """onnxruntime's own exception types (`onnxruntime.capi.onnxruntime_pybind11_state.Fail`,
+    `RuntimeException`, ...) derive from Exception only, not RuntimeError."""
+    return type(exc).__module__.startswith("onnxruntime")
+
+
 def is_out_of_memory(exc: BaseException) -> bool:
-    """CUDA allocation failures: CTranslate2 ("CUDA failed with error out of memory", cuBLAS /
-    cuDNN "..._ALLOC_FAILED") and torch (`torch.cuda.OutOfMemoryError`, "CUDA out of memory")."""
-    if not isinstance(exc, RuntimeError | MemoryError):
+    """A GPU allocation failure of CTranslate2 (Whisper: RuntimeError) or onnxruntime (CED: its
+    own exception types), told apart from other errors by `OOM_MESSAGES`."""
+    if not (isinstance(exc, RuntimeError | MemoryError) or is_onnxruntime_error(exc)):
         return False
     if type(exc).__name__ == "OutOfMemoryError":
         return True
     message = str(exc).lower()
-    return "out of memory" in message or "alloc_failed" in message
+    return any(m in message for m in OOM_MESSAGES)
 
 
 def oom_delays(
