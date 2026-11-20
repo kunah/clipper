@@ -15,7 +15,9 @@
   emitted. Suppressed rows don't block (a real moment right after a raid must not vanish into
   the raid's row).
 - **Budget**: at most 8 emitted per stream in a rolling hour (by chat peak); beyond that only
-  above the lowest of them, else `suppressed` with reason `budget`.
+  above the lowest of them, else `suppressed` with reason `budget`. Only candidates of the same
+  trigger count (chat): a signal-only candidate's score is just its boost, it would make every
+  chat candidate "above the lowest" (signal-only candidates have their own cap, `explicit`).
 """
 
 from __future__ import annotations
@@ -64,13 +66,27 @@ def resolve_delay(
 
 @dataclass(frozen=True, slots=True)
 class PriorCandidate:
-    """A candidate already decided for the stream (cooldown and budget look at these)."""
+    """A candidate already decided for the stream (cooldown, budget and the replay dedupe look
+    at these). `chat_start`..`chat_end` is its chat span, extended by the episodes folded into
+    it (`followup_peaks`)."""
 
     candidate_id: int | None
     status: CandidateStatus
     chat_peak: datetime
     chat_end: datetime
     score: float
+    trigger: str = "chat"
+    chat_start: datetime | None = None  # the episode's onset; None: the chat peak
+    followup_peaks: tuple[datetime, ...] = ()
+
+    def covers(self, ts: datetime) -> bool:
+        """`ts` lies in the candidate's (extended) chat span."""
+        return (self.chat_start or self.chat_peak) <= ts <= self.chat_end
+
+    def near_peak(self, ts: datetime, within_s: float) -> bool:
+        """`ts` is within +- `within_s` of its chat peak or one of its follow-ups' peaks."""
+        within = timedelta(seconds=within_s)
+        return any(abs(ts - p) <= within for p in (self.chat_peak, *self.followup_peaks))
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +112,7 @@ class CandidateDraft:
     features: dict[str, Any]
     detector_version: str
     chat_end_utc: datetime | None = None  # not a column: the episode end (cooldown)
+    chat_onset_utc: datetime | None = None  # not a column: the episode onset (span)
 
     @property
     def emitted(self) -> bool:
@@ -135,6 +152,8 @@ class CandidateDraft:
             self.chat_peak_utc or self.peak_utc,
             self.chat_end_utc or self.moment_to,
             self.score,
+            self.trigger,
+            self.chat_onset_utc,
         )
 
 
@@ -279,7 +298,11 @@ def plan_candidate(
             if stage2.score <= prev.score:
                 return FoldIn(
                     prev,
-                    replace(prev, chat_end=max(prev.chat_end, episode.end)),
+                    replace(
+                        prev,
+                        chat_end=max(prev.chat_end, episode.end),
+                        followup_peaks=(*prev.followup_peaks, episode.peak),
+                    ),
                     {
                         "opened_at": episode.opened_at.isoformat(),
                         "peak": episode.peak.isoformat(),
@@ -291,7 +314,11 @@ def plan_candidate(
                 )
             features["prev_candidate_id"] = prev.candidate_id
         hour = timedelta(seconds=p.budget_window_s)
-        in_hour = [c for c in emitted if episode.peak - hour < c.chat_peak <= episode.peak]
+        in_hour = [
+            c
+            for c in emitted
+            if c.trigger == trigger and episode.peak - hour < c.chat_peak <= episode.peak
+        ]
         lowest = min((c.score for c in in_hour), default=0.0)
         if len(in_hour) >= p.budget_per_hour and stage2.score <= lowest:
             status, reason = CandidateStatus.SUPPRESSED, SuppressReason.BUDGET
@@ -318,4 +345,5 @@ def plan_candidate(
         features=features,
         detector_version=detector_version,
         chat_end_utc=episode.end,
+        chat_onset_utc=episode.onset,
     )

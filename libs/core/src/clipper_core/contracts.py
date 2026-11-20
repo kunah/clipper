@@ -144,7 +144,10 @@ class CandidateStatus(StrEnum):
     """`candidates.status` (writer: detector). The lifecycle after that lives in the judge's
     `clips` (DESIGN §7, §19)."""
 
-    EMITTED = "emitted"  # judge job enqueued
+    # a media request was made for its window; a judge job comes with it in the same
+    # transaction, except while the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=0 (until
+    # the judge exists): then emitted rows have no judge job
+    EMITTED = "emitted"
     SUPPRESSED = "suppressed"  # fake-spike rule or budget; see `candidates.suppress_reason`
 
 

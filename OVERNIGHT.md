@@ -110,11 +110,20 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   (`data/lexicon.toml`, to be tuned). Decisions beyond the §18 draft are listed as proposed rows
   in §18 (e.g. no scoring before ~6 min of own baseline). 717 tests.
 
+- Detector unit 3 (commit "Detector live service"): `clipper-detector` follows
+  chat_metrics_1s every second (final cutoff 10 s behind + data watermark, late rows re-checked),
+  per-channel leases, stage 2 on raw chat, one transaction per candidate (row + TRIGGER media
+  request + judge job when `CLIPPER_DETECTOR_JUDGE_JOBS=1`, off by default until the judge
+  exists), explicit signals ("clip it", clip links by ≥ 2 posters, Helix clips with
+  credentials), restart replay without double emits (3 review rounds; a seeded property test
+  compares restarts/handover with an uninterrupted run: identical; a 240 s outage may differ
+  in the outage window only). Dockerfile + compose service `detector` (profile `detector`, not
+  built, not started). 752 tests.
+
 ## In progress
 
-- Detector unit 3: the live service (follows chat_metrics_1s each second, leases per channel,
-  candidate + media request + judge job in one transaction; Dockerfile + compose entry, not
-  started).
+- (paused) Next: detector unit 4 (backtest CLI over backfilled/live streams) needs real data:
+  migrations 0002–0004 on the live DB + some backfilled VODs.
 
 ## Next
 

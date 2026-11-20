@@ -88,8 +88,10 @@ class DetectorParams(BaseModel):
     onset_lookback_s: int = Field(default=10, ge=0)
     onset_fraction: float = Field(default=0.25, gt=0, le=1)
 
-    # ------------------------------------------------------------------ live loop (unit 3)
-    final_lag_s: int = Field(default=8, ge=0)  # a second is final at ts < now - final_lag_s
+    # ------------------------------------------------------------------ live loop (build item 3)
+    # A second is final at ts < now - final_lag_s: chat-ingest's 5 s grace + 1 s flush + margin
+    # (8 s left ~1 s; the live loop also stops at the newest row it has seen, `service`).
+    final_lag_s: int = Field(default=10, ge=0)
     restart_replay_s: int = Field(default=1260, gt=0)  # replay [now - 21 min, final]
     restart_emit_s: int = Field(default=900, gt=0)  # ...emitting episodes peaking in the last 15
     dedupe_s: int = Field(default=60, ge=0)  # against any candidate of the stream within +- this
@@ -116,6 +118,33 @@ class DetectorParams(BaseModel):
     score_reaction_cap: float = Field(default=0.5, ge=0, le=1)
     boost_clip_mentions: float = 2.0
     boost_viewer_clip: float = 1.0
+    # ------------------------------------------------------------------ explicit signals (§18.4)
+    # "Clip it": >= max(mention_min_users, mention_min_share x clean uniques) users mention a clip
+    # within mention_window_s -> a signal at the first mention - mention_lead_s (chat time).
+    mention_window_s: int = Field(default=30, gt=0)
+    mention_min_users: int = Field(default=3, gt=0)
+    mention_min_share: float = Field(default=0.03, ge=0, le=1)
+    mention_lead_s: int = Field(default=5, ge=0)
+    # Viewer clips: moment ~ [created_at - duration - latency, created_at - latency] (video time);
+    # >= clip_min_creators creators whose moments lie within clip_cluster_s of each other
+    # (clip_busy_creators when the channel made more than clip_busy_per_hour clips in the last
+    # hour) -> a signal. A clip link in chat counts as a clip made when it was posted, this long.
+    clip_latency_s: float = Field(default=5.0, ge=0)
+    clip_cluster_s: float = Field(default=90.0, ge=0)
+    clip_min_creators: int = Field(default=2, gt=0)
+    clip_busy_creators: int = Field(default=3, gt=0)
+    clip_busy_per_hour: int = Field(default=20, gt=0)
+    clip_link_duration_s: float = Field(default=30.0, gt=0)
+    # A signal within this distance of a candidate (chat time) is attached to it: boost, features,
+    # and a suppressed candidate is re-emitted. Without one it becomes a candidate of its own once
+    # the scorer is this far past it and no episode is open.
+    signal_attach_s: int = Field(default=60, ge=0)
+    # Signal-only candidates (no chat episode claimed the signal) per stream in a rolling hour;
+    # more are stored suppressed (`budget`). The chat budget doesn't count them (`merge`).
+    signal_budget_per_hour: int = Field(default=4, ge=0)
+    # A Helix clip whose vod_offset is set but further than this from where a live clip would
+    # sit (created_at - stream start - duration) was cut from the VOD later: not a live signal.
+    clip_vod_tolerance_s: float = Field(default=120.0, ge=0)
     # Moment type: top category share >= moment_top_share, else mixed; < moment_min_votes votes:
     # unknown.
     moment_min_votes: float = Field(default=5.0, ge=0)

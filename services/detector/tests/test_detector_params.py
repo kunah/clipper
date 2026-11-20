@@ -37,7 +37,7 @@ def test_defaults_are_the_design_values():
     assert (p.window_before_s, p.window_after_s, p.window_max_s) == (90, 30, 300)
     assert (p.window_onset_pad_s, p.window_close_pad_s) == (30, 15)
     assert (p.cooldown_s, p.budget_per_hour, p.budget_window_s) == (60, 8, 3600)
-    assert (p.final_lag_s, p.restart_replay_s, p.restart_emit_s, p.dedupe_s) == (8, 1260, 900, 60)
+    assert (p.final_lag_s, p.restart_replay_s, p.restart_emit_s, p.dedupe_s) == (10, 1260, 900, 60)
 
 
 def test_toml_overrides_and_rejects_typos(tmp_path):

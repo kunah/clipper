@@ -136,8 +136,11 @@ def test_cooldown_folds_a_weaker_followup():
     folded = plan(ep, stage2(8.0), [prev])
     assert isinstance(folded, FoldIn) and folded.into is prev
     assert folded.followup["score"] == 8.0 and folded.followup["peak"] == ep.peak.isoformat()
-    # the cooldown now runs from the follow-up's close
+    # the cooldown now runs from the follow-up's close; its span and peaks grow (replay dedupe)
     assert folded.extended.chat_end == ep.end and folded.extended.score == prev.score
+    assert folded.extended.followup_peaks == (ep.peak,)
+    assert folded.extended.covers(ep.peak) and not prev.covers(ep.peak)
+    assert folded.extended.near_peak(ep.peak + s(30), 60) and not prev.near_peak(ep.peak, 30)
     nxt = episode(T0 + s(190))  # opens 192 s: 86 s after the first close, 42 s after the second
     assert isinstance(plan(nxt, stage2(8.0), [folded.extended]), FoldIn)
     assert isinstance(plan(nxt, stage2(8.0), [prev]), CandidateDraft)
@@ -172,6 +175,21 @@ def test_budget_per_rolling_hour():
         for i, c in enumerate(recent)
     ]
     assert plan(ep, stage2(1.0), suppressed).emitted  # suppressed rows don't count
+
+
+def test_budget_counts_only_chat_candidates():
+    """Signal-only candidates (score = a boost of 1-3) neither fill the chat budget nor set
+    its lowest score."""
+    recent = [prior(100 + 400 * i, score=10.0 + i, cid=i) for i in range(7)]
+    own = PriorCandidate(
+        50, CandidateStatus.EMITTED, T0 + s(3000), T0 + s(3005), 2.0, "clip_mentions"
+    )
+    ep = episode(T0 + s(3400))
+    assert plan(ep, stage2(9.0), [*recent, own]).emitted  # 7 chat candidates: room left
+    full = [*recent, prior(3100, score=12.0, cid=8), own]
+    over = plan(ep, stage2(9.0), full)
+    assert over.suppress_reason is SuppressReason.BUDGET
+    assert over.features["budget"] == {"in_window": 8, "lowest": 10.0}  # not the mention's 2.0
 
 
 def test_as_prior_round_trip():

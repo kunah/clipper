@@ -5,10 +5,15 @@ description = "Finds candidate moments: chat spikes scored against the channel's
 requires-python = ">=3.12"
 dependencies = [
     "clipper-core",
+    "clipper-twitch",
 ]
+
+[project.scripts]
+clipper-detector = "clipper_detector.main:main"
 
 [tool.uv.sources]
 clipper-core = { workspace = true }
+clipper-twitch = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

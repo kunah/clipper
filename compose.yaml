@@ -3,6 +3,7 @@
 #
 #   docker compose up -d            # postgres + object storage + migrate + CPU services
 #   docker compose up -d transcriber   # the GPU worker (profile `gpu`; naming it enables it)
+#   docker compose up -d detector      # live detector (profile `detector`)
 #   docker compose run --rm backfill vod <id> --dry-run   # one-off tool (profile `tools`)
 #   docker compose logs -f migrate
 #
@@ -147,6 +148,32 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     stop_grace_period: 30s
+
+  # Live detector (DESIGN §18): chat spikes -> candidates + media requests (+ judge jobs once
+  # CLIPPER_DETECTOR_JUDGE_JOBS=1, i.e. when the judge exists). Needs migration 0004.
+  # Profile `detector`: a bare `docker compose up -d` leaves it out; start it by name.
+  # Viewer clips (Helix Get Clips) are polled only with Twitch credentials.
+  detector:
+    profiles: [detector]
+    build:
+      context: .
+      dockerfile: services/detector/Dockerfile
+    image: clipper/detector:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: detector
+      # Stable id: a restart takes its channel leases right back. Leases are per worker id, so
+      # `--scale detector=2` would make two processes share one owner (both score every
+      # channel): run more detectors as separate services, each with its own id.
+      CLIPPER_WORKER_ID: detector-1
+      CLIPPER_DETECTOR_MODE: live
+      CLIPPER_DETECTOR_JUDGE_JOBS: "0"
+      CLIPPER_TWITCH_CLIENT_ID: ${CLIPPER_TWITCH_CLIENT_ID:-}
+      CLIPPER_TWITCH_CLIENT_SECRET: ${CLIPPER_TWITCH_CLIENT_SECRET:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   # Backfill tool (one-off, profile `tools`): past VODs in the live format (DESIGN §17).
   #   docker compose run --rm backfill vod 2932113307 --dry-run

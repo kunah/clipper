@@ -35,13 +35,18 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   torch in the image (only the export build stage uses CPU torch). Natively the service needs
   `CLIPPER_TRANSCRIBER_ENGINE=fake` and `CLIPPER_TRANSCRIBER_TAGGER=none` (or `fake`) set
   explicitly, and tests use the fakes.
-  `services/detector/` (`clipper_detector`, DESIGN §18): so far the pure part, no DB, no clock:
-  `params` (`DetectorParams`, optional TOML, `detector_version`), `lexicon` + versioned
+  `services/detector/` (`clipper_detector`, DESIGN §18). Pure part (no DB, no clock): `params`
+  (`DetectorParams`, optional TOML, `detector_version`), `lexicon` + versioned
   `data/lexicon.toml` (emote/word categories, bots, per-channel overrides), `scorer` (stage 1:
   `ChannelScorer.step(second)` -> suspects/episodes), `stage2` (raw chat -> shares, clean uniques,
   moment type, fake-spike rules), `merge` (episode -> candidate draft: delay, window, cooldown,
-  budget), `pipeline` (the three over in-memory rows), `synthetic` (seeded test chat). No
-  Dockerfile/compose service yet (build item 3).
+  budget), `explicit` ("clip it" mentions, viewer clips -> signals), `pipeline` (scorer + stage 2
+  + merge over in-memory rows), `synthetic` (seeded test chat). Live service `clipper-detector`:
+  `service.LiveDetector` (loops with an injectable clock, leases `detect:channel:{id}`, restart
+  replay), `reads`/`writes` (one transaction per candidate: row + media request + judge job),
+  `settings` (`CLIPPER_DETECTOR_*`: `MODE` live|offline|all, offline not built yet; `JUDGE_JOBS`
+  default 0 until the judge exists). Viewer clips only with `CLIPPER_TWITCH_*` credentials.
+  Compose service `detector` (profile `detector`). Needs migration 0004.
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
   (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then
@@ -71,6 +76,8 @@ uv run clipper-backfill calibrate <id>                # read-only: VOD vs our li
 docker compose up -d --build controller chat-ingest recorder
 docker compose up -d --build transcriber    # GPU (profile gpu, enabled by naming it); first start
                                             # downloads ~1.5 GB of weights into the `models` volume
+uv run clipper-detector                     # live detector natively (CLIPPER_DETECTOR_JUDGE_JOBS=0)
+docker compose up -d --build detector       # profile detector, enabled by naming it
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).

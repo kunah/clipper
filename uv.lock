@@ -403,10 +403,14 @@ version = "0.1.0"
 source = { editable = "services/detector" }
 dependencies = [
     { name = "clipper-core" },
+    { name = "clipper-twitch" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "clipper-core", editable = "libs/core" }]
+requires-dist = [
+    { name = "clipper-core", editable = "libs/core" },
+    { name = "clipper-twitch", editable = "libs/twitch" },
+]
 
 [[package]]
 name = "clipper-recorder"

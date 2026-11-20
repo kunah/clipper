@@ -11,7 +11,9 @@ judges, edits and publishes short vertical clips.
 > done 2026-11-20; it needs migration 0003 on the live DB before a real backfill.
 > Phase 2 designs §18–§22 are proposed, not yet agreed; detector build item 1 (contracts +
 > migration 0004, §18) built 2026-11-20, not on the live DB yet; build item 2 (scorer, stage 2,
-> lexicon, merge: pure code in `services/detector`, synthetic tests) built 2026-11-20.
+> lexicon, merge: pure code in `services/detector`, synthetic tests) built 2026-11-20; build item 3
+> (live service `clipper-detector`, compose profile `detector`, judge jobs off) built 2026-11-20,
+> not deployed (needs 0004 on the live DB).
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -157,7 +159,7 @@ Services talk only through Postgres and object storage.
 | chat-ingest | IRC, raw chat, events, per-second stats. **Rarely redeployed** (restart = lost chat) | chat_messages, chat_events, chat_metrics_1s | slim |
 | recorder | HLS segments → ~60 s `.ts` + `.aac` (local spool first, crash-safe), gaps, enqueue transcription. Claims channels itself via leases. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
-| detector | live (reads per-second stats, ~1 s behind) + offline. Separate so tuning never restarts chat logging | candidates (later) | slim |
+| detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
 | judge | LLM verdict + edit plan, context requests | clips (later) | slim |
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Telegram bot | clip decisions (later) | slim |
@@ -265,7 +267,8 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
-analytics loop. Then Kick/YouTube. Designs (all proposed 2026-11-19, not yet agreed):
+analytics loop. Then Kick/YouTube. Detector build items 1–3 (contracts, scorer, live service)
+built 2026-11-20, see §18.10. Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -1174,8 +1177,9 @@ model (code defaults, optional TOML); `detector_version` = code + params hash + 
 
 **1. Live scoring (stage 1: per-second stats).**
 - **Input**: chat_metrics_1s of held channels by `channel_id` (`stream_id` is null until
-  chat-ingest's 30 s sync; assign the stream by time); no row = 0. Final at `ts < now() − 8 s`
-  (5 s grace + 1 s flush): ~8 s behind chat, not ~1 s as §8 says; harmless for the budget.
+  chat-ingest's 30 s sync; assign the stream by time); no row = 0. Final at `ts < now() − 10 s`
+  (5 s grace + 1 s flush + margin; 8 s as first proposed left ~1 s; built: build item 3): ~10 s
+  behind chat, not ~1 s as §8 says; harmless for the budget.
 - **Activity** `A(t)` = Σ `unique_chatters` over the last 10 s. **Baseline** `B(t)` = median of `A`
   over `[t − 20 min, t − 60 s]` (not EWMA, which a long moment drags up; the last minute is left out
   so a moment doesn't raise its own bar); scale `S = max(1.4826·MAD, √B, 2)` (Poisson floor).
@@ -1238,19 +1242,30 @@ redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` k
 `clip_mentions`, jsonb `emote_messages`: stage 1 filters without raw reads at scale; `NOTIFY` too.
 
 **4. Explicit signals.**
-- **"Clip it"**: every 5 s, scan new raw messages of held channels for `\bclip(ped| it| that|
-  this)?\b|^!clip`; ≥ max(3, 3 % of clean uniques) users within 30 s → trigger (chat peak = first
-  mention − 5 s). Clip URLs in chat (bot replies, viewer links) count as viewer clips.
+- **"Clip it"**: every 5 s, scan new raw messages of held channels for a request to clip: "clip
+  it/that/this" (also "clipit", "clip_it", stretched "CLIIIP IT"), "clipped", a message that is
+  only "clip" ("CLIP", "clip?") or starts with `!clip`; not after a negation ("don't clip that",
+  "not clipped"); links (with a scheme, `www.` or a bare domain with a path) removed first; a bare
+  "clip" in a sentence ("nice clip", "watch the clip", "Clip of the week") is no request (build
+  item 3 review). ≥ max(3, 3 % of clean uniques) users (no bots, no deleted messages) within 30 s
+  → trigger (chat peak = first mention − 5 s). Clip links in chat (`clips.twitch.tv/<slug>`,
+  `[m.|www.]twitch.tv/[<login>/]clip/<slug>`; not `/embed`, `/create`) count as viewer clips of
+  their poster; bots' links (replies to `!clip`) and deleted messages don't, so two people must
+  post.
 - **Viewer clips**: the **detector** polls Helix Get Clips per held live channel every 60 s
   (`started_at = now − 10 min`; 1 point per call of the client id's 800/min, shared with the
   controller's ~2/min). Only it needs fresh clips: kept in memory + `candidates.features`, so
   `viewer_clips` stays backfill-only (§17). Live clips lack `vod_offset` for minutes → moment ≈
   `[created_at − duration − 5 s, created_at − 5 s]`. ≥ 2 creators overlapping within 90 s (3 above
-  20 clips/h) → trigger.
+  20 clips/h) → trigger. Clips cut from the VOD later (a `vod_offset` more than 120 s from where a
+  live clip would sit, `created_at − started_at − duration`) or from another VOD (a `video_id`
+  other than the one consistent live clips carry) don't count.
 - **Boosts** +2 (clip mentions), +1 (viewer clip). A signal within ±60 s of a candidate is attached
   to it; a *suppressed* one is then re-emitted (a viewer thought it was real): an in-place UPDATE
   to `emitted` that keeps `suppress_reason` (audit), with its media request and judge job in the
-  same transaction.
+  same transaction. A signal nobody claims becomes a candidate of its own; at most 4 such per
+  stream-hour (`signal_budget_per_hour`; more: suppressed `budget`, and further signals don't lift
+  that).
 
 **5. Merge, delay, media request.**
 - **Emit at episode close** (≤ ~20 s after the peak): stable peak/window; the judge waits for
@@ -1263,7 +1278,8 @@ redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` k
   (§7) `[min(T − 90 s, onset − d − 30 s), max(T + 30 s, close − d + 15 s)]`, at most 5 min.
 - **Cooldown 60 s**: a weaker episode opening < 60 s after a candidate closed folds into it
   (`features.followups`); a stronger one is emitted with `features.prev_candidate_id`. **Budget**:
-  ≤ 8 emitted per stream per rolling hour, then only above the lowest of them (caps LLM cost).
+  ≤ 8 emitted per stream per rolling hour, then only above the lowest of them (caps LLM cost); it
+  counts chat candidates only (a signal-only candidate's score is just its boost).
 - **One transaction per candidate**: insert → `media.request_media(stream, window, Priority.TRIGGER,
   requested_by="detector")` → `jobs.enqueue(JUDGE, ref_id=id, dedupe_key=dedupe_key(JUDGE, id),
   priority=TRIGGER)` → commit. A 60 s sweep marks its requests fulfilled once `coverage(window)`
@@ -1316,8 +1332,10 @@ reason; §17's exclusions apply (muted, `timeline_uncertain`). `clipper-detector
 12 | --channel x --since 2026-11-01 [--params p.toml] [--grid z_on=3,4,5]`: read-only, a table.
 
 **9. Service shape.** Loops: live 1 s (one query `channel_id = ANY(:held) AND ts > :last AND
-ts < now() − 8 s` on the PK → scorers in ts order); explicit 5 s; streams/leases 10 s; sweeps 60 s /
-5 min; offline `jobs.JobRunner` (CPU work in a thread); heartbeat 15 s. **Polling, not LISTEN**:
+ts < now() − 10 s` on the PK → scorers in ts order); explicit 5 s; streams/leases 10 s; sweeps 60 s /
+5 min; offline `jobs.JobRunner` (CPU work in a thread); heartbeat 15 s (built: each live tick
+also re-reads the 30 s before the cursor to count late rows, ~31× the rows, ≈ 3k rows/s at 100
+channels; `late_check_s` = 0 turns it off). **Polling, not LISTEN**:
 chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates latency. **Leases**
 `detect:channel:{id}` (TTL 60 s, renewed every 20 s; a stable `CLIPPER_WORKER_ID` retakes them).
 **Heartbeat**: versions, channels held, max lag, emitted/suppressed by reason (1 h), offline jobs.
@@ -1413,9 +1431,110 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
    - Open (for build item 4): with these defaults pure Poisson noise at 0.3–1 unique chatters/s
      (A ≈ 3–10) opens 0.5–0.9 episodes/h (0.1/h at 2/s); stage 2 emits them. Real chat is
      burstier than Poisson; check on backfilled quiet channels before changing the floor.
-3. **Live service** (now; defaults provisional). *Done:* integration test: stats + raw chat →
-   candidate + media request + bumped transcribe jobs + judge job in one transaction; restart → no
-   duplicate; a live run decides ≤ 10 s after a second is final.
+3. ✅ **Live service** (built 2026-11-20; defaults provisional, not deployed). *Done:* integration
+   tests (Postgres, injected clock, ~2 s each): stats + raw chat → candidate + media request +
+   bumped transcribe jobs + judge job with one `xmin` (one transaction); raid → suppressed, no
+   media request or job; restart (same worker id) and lease handover → no duplicate; a restart
+   emits a missed burst once and nothing outside its emit window; decision 0 s after the closing
+   second is final (≤ 10 s required); backfilled stream (events/viewers unknown); "clip it" →
+   own candidate; mentions after a suppressed raid → in-place re-emit (UPDATE + media request +
+   job, one transaction); viewer clips (fake Helix) attach (+1); learned delay/override and prior;
+   the real loops (`run`) with a clock offset into the data. Built as `clipper_detector.service`
+   (`LiveDetector`), `reads`, `writes`, `explicit`, `settings`, `main` (`clipper-detector`);
+   `services/detector/Dockerfile` (slim); compose service `detector` (profile `detector`,
+   `CLIPPER_DETECTOR_JUDGE_JOBS=0`, `CLIPPER_WORKER_ID=detector-1`). Settings
+   `CLIPPER_DETECTOR_*`: `MODE` live|offline|all (offline/all log "not built yet" and run no
+   jobs), `JUDGE_JOBS` (default 0: candidates and media requests are still written),
+   `PARAMS_PATH`, `LEXICON_PATH`, `MAX_CHANNELS`, loop intervals, `LEASE_TTL_S` 60 /
+   `LEASE_RENEW_S` 20 (validated: renew < TTL and sync interval + renew < TTL), `FULFIL_AFTER_S`
+   900, `LATE_CHECK_S` 30, `WATERMARK_SLACK_S` 10, `SIGNAL_MAX_AGE_S` 900. Review (2026-11-20)
+   added: fold-ins through the DB, a restart after a fold chain (the replay scores the follow-ups
+   above their candidate: nothing new), a late stream row, chat clip links (two posters), a
+   deactivated channel releasing its lease, late metric rows + the watermark, two writers at once,
+   a retaken channel not widening the others' reads, signals surviving a failed decision;
+   re-review: restarts mid fold chain and after a follow-up = the uninterrupted run, plus the
+   restart property test. 191 detector tests, ~1.6 min. Decisions and deviations (all provisional):
+   - **Final seconds** = `ts < ceil(now − 10 s)` from the service's clock (injectable), not the
+     DB's `now()` (`final_lag_s` 8 → 10: the margin was ~1 s), and no further than the newest
+     `chat_metrics_1s` row of the held channels + 1 s (chat-ingest writes a second of every
+     channel in one flush) unless that is more than 10 s behind (all quiet or chat-ingest down:
+     the clock decides, zeros as before). Each tick also re-reads the 30 s before the cursor: a row
+     for a second already fed with other values is counted (`late_rows`, heartbeat) and logged.
+     The re-read is the price of `late_check_s`: ~31 rows per channel per tick instead of 1
+     (≈ 3k rows/s at 100 channels, on the PK); of `event_counts` only the roomstate count is
+     selected (decoding every row's JSON cost more than the scorer). One query per tick with per-channel ranges
+     (`JOIN unnest(:ids, :sinces)`: §18.9's
+     `ts > :last` per channel), the same for raw chat and viewer snapshots, so a channel retaken
+     with a 15 min rescan doesn't widen the others' reads.
+   - **Streams by time**: each second goes to the stream whose `[started_at, ended_at)` holds it
+     (any source); seconds outside a stream are skipped; leaving a stream flushes its scorer
+     (an open episode is decided as truncated); a stream row that turns up after its start (the
+     controller polls every 30 s) rebuilds the channel (replay). Viewers: the latest snapshot at
+     or before the second, fed per second (the scorer takes the median itself).
+   - **Prior** only when the scorer sees the stream from its start: the scorer counts "20 min of
+     history" from its first second, so a prior during a restart replay of an old stream would
+     raise the bar where the backtest doesn't.
+   - **Suspects** don't prefetch raw chat (not needed: stage 2 at close is one indexed read).
+   - **Failure = rebuild**: a channel whose scoring or decision failed is replayed on the next
+     sync; the emit window and the dedupe make that idempotent. One asyncio lock serialises the
+     loops (no signal resolution between an episode's close and its decision).
+   - **Writes**: one transaction per episode under a transaction-level advisory lock per stream
+     (a handover can leave two processes on a stream for up to one lease renewal): the stream's
+     candidates re-read, the replay dedupe, then the fold-in, the candidate (+ its ± 60 s video
+     peak dedupe, the insert, media request, judge job) or the signals onto a duplicate. **Replay
+     dedupe** (review blocker: a restart re-emitted folded follow-ups, whose replay scored above
+     their candidate with a shorter baseline): an episode is a candidate's duplicate when its
+     chat peak lies in the candidate's chat span (onset to end, extended by its follow-ups), or,
+     for a replayed episode (peak before the replay's end), an *unclaimed* peak (a candidate's
+     or a follow-up's) that an earlier process decided lies in the episode's own burst
+     `[onset − 10 s, end + 10 s]`. Earlier peaks are matched one to one (a dedupe claims the
+     nearest one in the burst) and dropped as the replay passes them (before the current
+     episode's burst), so an episode the earlier process never decided (the next burst of a fold
+     chain, a stronger burst right after a follow-up, also after a follow-up the replay doesn't
+     reproduce) goes through `plan_candidate` as without the restart (re-reviews: a plain ± 60 s
+     test, then ± 60 s against unclaimed peaks, swallowed those). Tests compare restarts with the
+     uninterrupted run: at several points of a chain, after a follow-up, and a seeded property
+     test (`test_detector_restart_property`: 30 random fold chains with weak/strong follow-ups,
+     raids, busier chat before the first burst; immediate restarts, an outage, a handover; time
+     windows scaled down, ~18 s): every uninterrupted candidate exists after the restart with
+     its status or is folded into the candidate it followed, no moment exists twice, other
+     differences only where the replay's baseline differed. Measured: 67 candidates per run;
+     immediate restarts and the handover identical; the outage run 66 identical, 1 missed and 2
+     new, all in the replay's short-baseline region (the ± 60 s versions fail it). A live episode peaks after
+     every earlier episode's end, so the span test never hits a new moment. Fold-ins append to
+     `features.followups` idempotently (by chat peak). Accepted risk (§18.1's in-memory state):
+     a replay's shorter baseline can open episodes the first run never opened (seen with a
+     raised early baseline: a restart 1000 s after a chain found 3 bursts the first run hadn't);
+     those are new detections, not duplicates.
+   - **Explicit signals** (§18.4, needed here; tunables added to `DetectorParams`, hashed:
+     `mention_*`, `clip_*`, `signal_attach_s`): a signal attaches to a candidate or episode
+     within ± 60 s (chat time), boosting once per kind; an episode decided with a signal that
+     stage 2 or the budget suppressed is **emitted with its reason kept** (the decision-time form
+     of the re-emit); a signal nothing claims becomes a candidate of its own (`trigger` =
+     `clip_mentions`/`viewer_clips`, score = the boost, moment type `unknown`, no cooldown, own
+     cap of 4 per stream-hour) once the scorer is 60 s past it with no episode open; the chat
+     budget counts chat candidates only (`PriorCandidate.trigger`). One mention signal per 60 s
+     per channel; the mention rule and clip links as in §18.4 (review); a chat link is a clip made
+     when posted, 30 s long, by its poster; a viewer-clip signal sits at the middle of the clips'
+     common span. Helix Get Clips: per held channel in a live stream with a `platform_user_id`,
+     every 60 s, clips created in the last 10 min, without clips cut from the VOD later or from
+     another VOD (§18.4). Raw chat is scanned from the emit window (now − 15 min) on a channel's
+     first build. Signals taken by a decision that fails go back to pending (the replay decides
+     again with them); between streams they wait up to 15 min.
+   - **Sweep**: every detector process sweeps all detector requests (idempotent; no leader).
+   - **Heartbeat** `info`: versions (detector, scorer, params, lexicon), channels held with stream
+     and lag (incl. the 10 s final lag), `max_lag_s`, `late_rows`, `last_hour` (emitted,
+     suppressed by reason, re-emitted, folded, duplicate, late rows, signals by kind),
+     `viewer_clips`, `offline: "not built"`. With `JUDGE_JOBS=0` emitted rows have no judge job.
+   - **Scaling**: leases are per worker id; `--scale detector=2` with the compose service's fixed
+     `CLIPPER_WORKER_ID` would make both share one owner: one service (and id) per process.
+   - Open: the draft dedupe (± 60 s on the video peak, §18.5) also drops a *stronger* live
+     episode within 60 s of an emitted candidate that `plan_candidate` would emit with
+     `prev_candidate_id`; explicit-signal timing and thresholds are guesses (tune with build
+     items 4/5); the
+     raw-chat scan reads every message of held channels every 5 s (fine at 10 channels; at
+     hundreds, chat-ingest's proposed `clip_mentions` column); the Helix poll is untested against
+     the real API (no credentials in tests).
 4. **Backtest CLI** (needs step 5 data). *Done:* hit rate/recall@k for ≥ 10 streams, < 1 min each;
    then tune the defaults (**depends on real data**) and log them with their numbers.
 5. **Offline pass, delay learning, explicit signals** (needs the transcriber running, the tagger
@@ -1444,6 +1563,12 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
 | 2026-11-20 | Rule order raid, subs, bits, mode_toggle, spam_wave, commands, vote, copypasta, bots, greeting (first = `suppress_reason`, all in `features.rules`) | event causes are the clearest explanation; "1"/"2" floods are polls, not copypasta |
 | 2026-11-20 | `SuppressReason` and `DelaySource` in `clipper_core.contracts` (columns stay plain text) | shared value sets of `candidates` that the judge, review and backtest read (§19, §21) |
 | 2026-11-20 | `detector_version` = scorer + scoring-params hash + lexicon version and file hash; live-loop fields not hashed | an edited but unbumped lexicon shows; tuning the live loop doesn't start a new offline pass |
+| 2026-11-20 | Live service: the final cutoff comes from the service's clock; seconds are assigned to streams by time; a failed channel is replayed (rebuilt), never patched | one code path for live, restart and tests (injected clock); replay + the ± 60 s dedupe are idempotent |
+| 2026-11-20 | An explicit signal attached at decision time emits a candidate that stage 2 or the budget suppressed (reason kept); an unclaimed signal becomes its own candidate 60 s later | the re-emit rule of §18.4, whichever comes first; a "clip it" wave without a chat spike is still a moment |
+| 2026-11-20 | Candidate writes of a stream are serialised by a transaction-level advisory lock | a lease handover can leave two processes deciding the same stream for up to one sync |
+| 2026-11-20 | Replay dedupe: an episode inside a candidate's chat span (extended by its follow-ups), or a replayed one whose burst `[onset − 10 s, end + 10 s]` holds an unclaimed peak or follow-up peak an earlier process decided (matched one to one, passed peaks dropped), is that candidate's | a restart's shorter baseline scored folded follow-ups above their candidate and re-emitted them (review probe: 2 extra candidates); a plain ± 60 s test swallowed bursts the earlier process never decided (re-review: chains split, a stronger burst lost) |
+| 2026-11-20 | Final lag 10 s plus a data watermark (newest row + 1 s, within 10 s), late rows counted | 8 s left ~1 s of margin over chat-ingest's grace and flush; a lagging flush must not turn chat into zeros |
+| 2026-11-20 | The chat budget counts chat candidates only; signal-only candidates have their own cap (4 per stream-hour) | a signal-only candidate's score is just its boost: as the budget's "lowest" it let every chat candidate through |
 
 ### Contract changes
 
