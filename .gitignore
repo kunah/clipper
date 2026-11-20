@@ -10,4 +10,6 @@ build/
 
 .env
 data/
+# ...except package data that belongs in git (the detector's versioned lexicon)
+!services/detector/src/clipper_detector/data/
 *.log

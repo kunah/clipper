@@ -148,6 +148,33 @@ class CandidateStatus(StrEnum):
     SUPPRESSED = "suppressed"  # fake-spike rule or budget; see `candidates.suppress_reason`
 
 
+class SuppressReason(StrEnum):
+    """`candidates.suppress_reason` (plain text, no CHECK; DESIGN §18.3). Written by the detector,
+    read by the backtest, the judge and review (§19, §21). The first matching rule, in this order
+    (raid ... greeting), is stored; `features.rules` lists every match."""
+
+    RAID = "raid"  # a raid notice from onset - 30 s (unless a strong reaction follows)
+    SUBS = "subs"  # a mass gift (submysterygift >= 5) or >= 10 sub/resub/subgift notices
+    BITS = "bits"  # cheering messages >= 30 %
+    MODE_TOGGLE = "mode_toggle"  # a roomstate change (emote-/subs-only, slow...) from onset - 10 s
+    SPAM_WAVE = "spam_wave"  # >= 30 % deleted, timed-out/banned users' or cleared messages
+    COMMANDS = "commands"  # `!command` messages >= 30 % (giveaways, bot games)
+    VOTE = "vote"  # one number/letter or believe/doubt >= 40 % (polls, predictions)
+    COPYPASTA = "copypasta"  # the most common free-text message >= 40 %
+    BOTS = "bots"  # bot accounts' messages >= 30 %
+    GREETING = "greeting"  # greetings that aren't reactions >= 40 % ("hi"/"bye" floods)
+    WEAK = "weak"  # no rule, but z_clean below the emit bar (bots/commands/deleted mixed)
+    BUDGET = "budget"  # over the per-stream-hour budget of emitted candidates
+
+
+class DelaySource(StrEnum):
+    """`candidates.delay_source` (plain text): where the chat delay of a candidate came from."""
+
+    OVERRIDE = "override"  # channels.chat_delay_s, set by the operator
+    LEARNED = "learned"  # median of recent valid chat_delay_estimates
+    DEFAULT = "default"  # the detector's default (8 s)
+
+
 class MomentType(StrEnum):
     """`candidates.moment_type`: dominant emote/word category of a moment (DESIGN §18). Also the
     edit plan's moment type (§19)."""

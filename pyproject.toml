@@ -41,6 +41,7 @@ known-first-party = [
     "clipper_recorder",
     "clipper_transcriber",
     "clipper_backfill",
+    "clipper_detector",
 ]
 
 [tool.pytest.ini_options]

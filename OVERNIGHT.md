@@ -101,10 +101,20 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   *parts)` (backwards compatible), `detect_lease`; controller stale limits for the new job kinds.
   560 tests. Needs migration 0004 on the live DB before a detector runs.
 
+- Detector unit 2 (commit "Detector scorer"): new `services/detector` package, pure code:
+  `ChannelScorer` (10 s unique-chatter activity vs a 20-min rolling median, robust z + ratio,
+  viewer normalisation, episodes; 16 µs per channel-second), stage 2 on raw chat (clean
+  uniques, reaction/greeting/command/bot/vote/dup/deleted shares, fake-spike rules: raid, subs,
+  bits, mode toggle, spam wave, commands, votes, copypasta, bots, greetings, `weak`), merge
+  (chat delay, windows, cooldown fold-in, budget), versioned emote lexicon v1
+  (`data/lexicon.toml`, to be tuned). Decisions beyond the §18 draft are listed as proposed rows
+  in §18 (e.g. no scoring before ~6 min of own baseline). 717 tests.
+
 ## In progress
 
-- Detector unit 2: the pure scorer (baseline, episodes, stage-2 raw-chat confirmation, fake-spike
-  rules, emote lexicon), tested on synthetic data.
+- Detector unit 3: the live service (follows chat_metrics_1s each second, leases per channel,
+  candidate + media request + judge job in one transaction; Dockerfile + compose entry, not
+  started).
 
 ## Next
 

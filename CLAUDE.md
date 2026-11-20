@@ -35,6 +35,13 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   torch in the image (only the export build stage uses CPU torch). Natively the service needs
   `CLIPPER_TRANSCRIBER_ENGINE=fake` and `CLIPPER_TRANSCRIBER_TAGGER=none` (or `fake`) set
   explicitly, and tests use the fakes.
+  `services/detector/` (`clipper_detector`, DESIGN §18): so far the pure part, no DB, no clock:
+  `params` (`DetectorParams`, optional TOML, `detector_version`), `lexicon` + versioned
+  `data/lexicon.toml` (emote/word categories, bots, per-channel overrides), `scorer` (stage 1:
+  `ChannelScorer.step(second)` -> suspects/episodes), `stage2` (raw chat -> shares, clean uniques,
+  moment type, fake-spike rules), `merge` (episode -> candidate draft: delay, window, cooldown,
+  budget), `pipeline` (the three over in-memory rows), `synthetic` (seeded test chat). No
+  Dockerfile/compose service yet (build item 3).
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
   (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then

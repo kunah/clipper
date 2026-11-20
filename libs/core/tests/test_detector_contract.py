@@ -14,11 +14,13 @@ from clipper_core import jobs, media
 from clipper_core.contracts import (
     CandidateSource,
     CandidateStatus,
+    DelaySource,
     DetectOfflinePayload,
     JobKind,
     JudgePayload,
     MomentType,
     Priority,
+    SuppressReason,
     backfill_lease,
     dedupe_key,
     detect_lease,
@@ -56,6 +58,25 @@ def test_candidate_enums_match_the_check_constraints():
         "unknown",
     }
     assert table.c.moment_type.server_default.arg == MomentType.UNKNOWN
+
+
+def test_suppress_reasons_and_delay_sources():
+    """Plain-text columns (no CHECK): the value sets other services read (§18, §19, §21)."""
+    assert {r.value for r in SuppressReason} == {
+        "raid",
+        "subs",
+        "bits",
+        "mode_toggle",
+        "spam_wave",
+        "commands",
+        "vote",
+        "copypasta",
+        "bots",
+        "greeting",
+        "weak",
+        "budget",
+    }
+    assert {d.value for d in DelaySource} == {"override", "learned", "default"}
 
 
 def test_dedupe_key_stays_compatible_and_takes_extra_parts():

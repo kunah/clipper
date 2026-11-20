@@ -1,0 +1,111 @@
+# Clipper detector lexicon (DESIGN §18.2). Format: see clipper_detector/lexicon.py.
+#
+# v1 (2026-11-20): a first hand-made list of common Twitch / 7TV / BTTV / FFZ emotes and chat
+# words, NOT tuned yet. Tune it with backtests (`clipper-detector lexicon --unknown` will list the
+# most used unknown emotes) and bump `version` with every change: it is part of the
+# detector_version stored on each candidate.
+#
+# Categories: funny, hype, shock, tense, sad, cringe, wholesome (emotions = "reactions"),
+# greeting. Emotes not listed here count as "uncategorised". A name may appear once per section.
+
+version = 1
+
+# Exact, case-sensitive emote names.
+[emotes]
+funny = [
+    "KEKW", "KEKL", "KEK", "KEKWW", "OMEGALUL", "LUL", "LULW", "LuL", "LULE", "ICANT",
+    "pepeLaugh", "PepeLaugh", "pepeLaughing", "4Head", "EleGiggle", "LOL", "LMAO", "xdd", "XD",
+    "Clueless", "forsenLaughingAtYou", "😂", "🤣", "💀",
+]
+hype = [
+    "Pog", "PogChamp", "POGGERS", "Poggers", "PogU", "POGGIES", "PagMan", "PagChomp", "POGCRAZY",
+    "EZ", "EZClap", "Clap", "LETSGO", "HYPERS", "Kreygasm", "GIGACHAD", "Gigachad", "catJAM",
+    "pepeD", "peepoClap", "SeemsGood", "🔥",
+]
+shock = [
+    "D:", "NOWAYING", "NOWAY", "Aware", "WutFace", "WAYTOODANK", "monkaOMEGA", "O_o", "o_O",
+    "WHAT", "😱", "😳",
+]
+tense = [
+    "monkaS", "monkaW", "monkaGIGA", "monkaSTEER", "PauseChamp", "PauseShake", "Prayge",
+]
+sad = [
+    "Sadge", "PepeHands", "BibleThump", "FeelsBadMan", "widepeepoSad", "peepoSad", "PoroSad",
+    "NotLikeThis", "Deadge", "COPIUM", "o7", "😢",
+]
+cringe = [
+    "DansGame", "haHAA", "Cringe", "WeirdChamp", "Weirdge", "Stare", "FeelsWeirdMan", "BRUH",
+    "Bruh", "😬",
+]
+wholesome = [
+    "<3", "peepoHappy", "widepeepoHappy", "FeelsOkayMan", "FeelsGoodMan", "FeelsStrongMan",
+    "peepoLove", "VirtualHug", "bleedPurple", "TwitchUnity", "peepoBlush", "❤", "💜", "🥰",
+]
+greeting = [
+    "peepoHey", "HeyGuys", "VoHiYo", "peepoWave", "peepoBye", "o/", "👋",
+]
+
+# Case-insensitive words and phrases (apostrophes ignored, stretched letters folded:
+# "LMAOOOO" finds "lmao", "WWWW" finds "w", "YOOOO" finds "yoo", "LETS GOOOO" finds "lets go").
+# Only words that are a reaction on their own: a match anywhere makes the message a reaction, so
+# everyday words ("what", "please", "huge") stay out.
+# "yo" is in no category: it is a greeting ("yo chat") as often as a shout ("YO WHAT").
+[words]
+funny = [
+    "lol", "lmao", "lmfao", "rofl", "haha", "hahaha", "xd", "kek", "kekw", "omegalul", "lul",
+    "im dead", "im crying", "hilarious",
+]
+hype = ["w", "pog", "poggers", "gg", "ez", "yoo", "lets go", "letsgo", "clutch", "goated", "insane"]
+shock = ["omg", "wtf", "no way", "holy", "wait what", "bruh what"]
+tense = ["monka", "scary", "spooky"]
+sad = ["f", "rip", "noo", "unlucky", "sadge"]
+cringe = ["l", "cringe", "yikes", "ew", "awkward", "bruh"]
+wholesome = ["aww", "aw", "cute", "wholesome", "love you", "ily"]
+greeting = [
+    "hi", "hello", "hey", "heya", "hiya", "sup", "hai", "gm", "good morning",
+    "bye", "gn", "good night", "goodnight", "cya", "byebye",
+]
+
+# Case-insensitive regexes, each anchored; weight 0.5 (DetectorParams.pattern_weight).
+# Anchored at one end: emote variants (KEKWait, OMEGALULiguess, PogTasty, peepoLove), tried only on
+# emote-like tokens (a recognised emote, or a token with an inner capital), so plain words like
+# glove, unhappy, microwave, telescope, lullaby or pogo never match.
+# Anchored at both ends: word shapes (lmaooo, hahaha, loool), tried on every token.
+[patterns]
+funny = [
+    "^kek", "^lul", "^omegalul", "^icant", "laugh(ing)?$",
+    "^l+m+f*a+o+$", "^(?:ha){2,}h?$", "^lo+l$",
+]
+hype = ["^pog", "^pag(man|chomp|bounce)", "^hype", "^letsgo", "^ezclap"]
+shock = ["^noway", "^wtf", "^omg"]
+tense = ["^monka", "^pause(champ|shake|fish|rs|ge|wait)"]
+sad = ["^sadg", "^pepehands", "^cope"]
+cringe = ["^cringe", "^weird", "^dansgame"]
+wholesome = ["love$", "hug(s|gies)?$", "happy$", "blush$"]
+greeting = ["^peepohey", "^peepohi", "wave$"]
+
+# Chat bots: their messages are left out of clean uniques and make the "bots" share.
+[bots]
+logins = [
+    "nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot", "sery_bot",
+    "botrixoficial", "soundalerts", "kofistreambot", "pokemoncommunitygame", "blerp",
+    "streamlootsbot", "lumiastream", "own3d", "tangiabot", "creatisbot", "deepbot", "phantombot",
+    "coebot", "ankhbot", "vivbot", "mixitupbot", "songlistbot", "pretzelrocks", "streamstickers",
+    "frostytoolsdotcom", "commanderroot", "supibot", "potatbotat",
+]
+
+# Transcript phrases for the offline pass (§18.6c): categories plus "clip".
+[transcript]
+clip = ["clip that", "clip it", "clip this", "somebody clip that", "someone clip that"]
+funny = ["that's so funny", "i'm dying", "i can't breathe"]
+hype = ["let's go", "let's gooo", "we did it"]
+shock = ["oh my god", "what the", "no way", "are you kidding me"]
+sad = ["that's so sad", "i'm so sad"]
+
+# Per-channel overrides (logins in lowercase): a listed name takes that category in the channel,
+# `ignore = [...]` removes a global entry there, `bots` adds the channel's own bots.
+[channels.xqc]
+bots = ["xqcbot"]
+
+[channels.xqc.emotes]
+wholesome = ["xqcL"]

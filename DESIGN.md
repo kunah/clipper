@@ -10,7 +10,8 @@ judges, edits and publishes short vertical clips.
 > `transcriber` compose service, profile `gpu`). Step 5 (backfill tool, design §17 proposed)
 > done 2026-11-20; it needs migration 0003 on the live DB before a real backfill.
 > Phase 2 designs §18–§22 are proposed, not yet agreed; detector build item 1 (contracts +
-> migration 0004, §18) built 2026-11-20, not on the live DB yet.
+> migration 0004, §18) built 2026-11-20, not on the live DB yet; build item 2 (scorer, stage 2,
+> lexicon, merge: pure code in `services/detector`, synthetic tests) built 2026-11-20.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -1168,7 +1169,8 @@ deliver data. v1 needs no chat-ingest change.
 rows and `judge`/`detect_offline` jobs. **One scorer, three callers:** `ChannelScorer.step(second)`
 is a pure, clock-free state machine (time comes from the rows) run by the live loop, the offline
 job and the backtest CLI, so a backtest reproduces live exactly. Tunables in one `DetectorParams`
-model (code defaults, optional TOML); `detector_version` = code + params hash + lexicon version.
+model (code defaults, optional TOML); `detector_version` = code + params hash + lexicon version
+(and file hash; build item 2).
 
 **1. Live scoring (stage 1: per-second stats).**
 - **Input**: chat_metrics_1s of held channels by `channel_id` (`stream_id` is null until
@@ -1194,8 +1196,8 @@ model (code defaults, optional TOML); `detector_version` = code + params hash + 
 `detector_version`; ships with a cheap detector redeploy), applied to names at read time (§15).
 `[emotes]` exact name → category: funny (KEKW, OMEGALUL), hype (Pog, EZ), shock (NOWAYING, D:),
 tense (monkaS), sad (Sadge), cringe, wholesome (<3), greeting (peepoHey); `[words]` case-insensitive
-(lmao, w, f, no way, hi, clip it); `[patterns]` regexes at weight 0.5 for 7TV variants (`kek|lul` →
-funny); `[bots]`; `[transcript]` phrases; `[channels.<login>]` overrides. Unknown emotes count as
+(lmao, w, f, no way, hi, clip it); `[patterns]` anchored regexes at weight 0.5 for 7TV variants
+(`^kek`, `^lul` → funny; only on emote-like tokens, build item 2); `[bots]`; `[transcript]` phrases; `[channels.<login>]` overrides. Unknown emotes count as
 `uncategorised`; `clipper-detector lexicon --unknown` lists the most used (a table only once
 non-developers edit it). **Moment type** = dominant category of per-message votes (one per message
 and category, one per user; `emote_counts` counts tokens, so it's used only where raw chat isn't
@@ -1211,7 +1213,9 @@ clean_fraction`; emitting needs `z_clean ≥ 4` (warm-up 6). **Shares**: `reacti
 word), `greeting`, `command`, `bot`, `vote` (message = one number/letter or believe/doubt), `dup`
 (top normalised text among *non-reaction* messages: mass "KEKW" is real, a copypasta is not),
 `deleted`. **Score** (first guess): `z_clean · (0.6 + 0.8·min(reaction, 0.5))` + boosts (§4). A
-matching rule stores the candidate as `suppressed` + reason (no judge job), to audit the filter:
+matching rule stores the candidate as `suppressed` + reason (no judge job), to audit the filter
+(no rule, but `z_clean` below the emit bar: reason `weak`; build item 2 changed windows and
+details, see there):
 
 | Reason | Rule (window `[onset − 20 s, peak]`) | Data stored today |
 |---|---|---|
@@ -1330,9 +1334,85 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
    without defaults unless given; `delay_source` and `suppress_reason` are plain text. §19's
    per-round keys (`judge:{cand}:r{n}`) use the same `dedupe_key`. Needs 0004 on the live DB
    before the detector runs.
-2. **Scorer, stage 2, lexicon** (now; pure, synthetic fixtures). *Done:* noise → nothing; 15 s ×4
-   burst → one candidate, peak ± 2 s; start ramp → nothing; raid, mass gift, copypasta, `!enter`,
-   "1/2" votes, greeting flood → suppressed with the right reason; replay from a later start → same.
+2. ✅ **Scorer, stage 2, lexicon** (built 2026-11-20, review fixes the same day; pure, synthetic
+   fixtures). *Done:* noise → nothing; 15 s ×4 burst → one candidate, peak ± 2 s; start ramp →
+   nothing; raid, mass gift, copypasta, `!enter`, "1/2" votes, greeting flood → suppressed with
+   the right reason; replay from a later start → same. Built as `services/detector`
+   (`clipper_detector`, no Dockerfile/compose yet): `params.DetectorParams` (every tunable above,
+   flat TOML overrides, unknown keys rejected), `lexicon` + `data/lexicon.toml` v1 (first
+   hand-made list, to be tuned), `scorer.ChannelScorer`, `stage2.evaluate`,
+   `merge.plan_candidate`, `pipeline.run_stream` (the three over in-memory rows: the reference for
+   the live service and the backtest), `synthetic` (seeded chat through the real
+   `SecondAggregator`). `detector_version` = `d<SCORER_VERSION>-p<8 hex of the scoring
+   params>-l<lexicon version>.<6 hex of the lexicon file>` (no `:`), e.g. `d1-p3f9a0c1d-l1.dea5e8`:
+   the file hash shows a lexicon edited without a bump; live-loop fields (`final_lag_s`,
+   `restart_replay_s`, `restart_emit_s`, `dedupe_s`) are left out of the params hash. The root
+   `.gitignore` ignores `data/`: the lexicon's directory is re-included there and is a hatch
+   `artifact` (else the wheel/image would lack it). 156 tests, ~9 s; the scorer runs a 2 h stream
+   in ~0.1 s; the exact-series scorer tests fail when `close_after_s`, `z_stay`, `floor_activity`
+   (upwards), `ratio_min_baseline` or `baseline_exclude_s` change (checked by mutating the
+   defaults). Decisions and deviations from the text above (all provisional, like the defaults):
+   - **Own baseline required**: no scoring until the own baseline holds `min_baseline_values` =
+     300 values (≈ 6 min after the stream start or a > 20 min outage), prior or not; the prior
+     only raises the bar. Measured: with 60 values a 5 min start ramp without viewers or prior
+     (a first backfilled stream) opened an episode in 5 of 10 seeds, with 120 in 2, with 180+ in
+     none; a prior far below the chat (a quieter previous stream) standing in for the missing own
+     baseline made the first seconds of the stream a spike.
+   - **In-stream only**: seconds before `streams.started_at` are neither scored nor fed to the
+     baseline, and zero runs there are no missing chat (offline chat is another regime); "20 min
+     of history" for the prior counts from `max(started_at, first row)`.
+   - **Scaling**: the viewer ratio scales the own baseline and its MAD (S uses √B'); the prior has
+     its own ratio (V_now / previous stream's median viewers, same clamp), so nothing is scaled
+     twice. The suspect needs the floor too and re-arms only after z < 2. The floor of 8 never
+     binds with these defaults: z ≥ 4 with S ≥ 2 already needs A ≥ B + 8; only the viewer part
+     (0.005·V) does.
+   - **Missing chat** detection marks the run retroactively and drops every A whose 10 s window
+     touches it; the scorer reports `MissingChat(start, end)`.
+   - **Stage-2 shares and votes count the burst `[onset, peak + 5 s]`** (`shares_before_onset_s`
+     = 0), not the table's `[onset − 20 s, peak]`: a 15 s ×4 burst of one copypasta has a dup
+     share of 0.28–0.42 there (median 0.34 over 10 seeds; 0.36–0.49 over `[onset − 20 s, peak +
+     5 s]`), so the 0.4 threshold was a coin flip; on the burst it is 0.60–0.73. The 20 s before
+     the onset still feed the events. Raw messages are read over `[min(onset − 20 s, strongest −
+     9 s), max(peak + 5 s, strongest) + 1 s)`: the strongest-z second comes 4–8 s after the peak
+     (plateaus), and `clean_fraction` uses its whole 10 s window.
+   - **Clean uniques** in A's unit: per second, distinct users with a message that is no bot's,
+     no `!command`, not deleted; a user's repeats across seconds stay (removing them made real
+     mass-KEKW moments, many users typing KEKW every second, look weak).
+   - **Rule order** (first = `suppress_reason`, all in `features.rules`): raid, subs, bits,
+     mode_toggle, spam_wave, commands, vote, copypasta, bots, greeting. Vote before copypasta
+     ("1"/"2" floods are polls). A command is `!` + a letter/digit ("!enter", not "!!!" or "!!!
+     LETS GO"). Dup ignores messages without free text: only emotes (known or not: Kappa,
+     pokiShock floods), lexicon words, greetings, emoticons (":D", "xD", a lone "D") or
+     punctuation ("???"). Greeting counts only
+     messages that aren't reactions ("YO WTF", "hi KEKW" are reactions); "yo" is in no category
+     (greeting and shout alike). A vote is one number/letter or believe/doubt with only trailing
+     punctuation dropped, not a lexicon word (W/L/F are reactions) and not an emoticon letter
+     (D/O/P/X: ":D", "xD"). spam_wave = moderated share ≥ 0.3: deleted, or by a user timed
+     out/banned in the window, or sent before a `clearchat` (timeouts don't mark rows deleted).
+     Bits: bits events (live) or `Cheer100`-style text (events unknown); ≥ 1000 bits sets
+     `features.bits_big` only.
+   - **New suppress reason `weak`**: no rule matched but z_clean is below the emit bar (bots,
+     commands and deleted messages mixed, each under its share). Stored for the audit like the
+     others (no CHECK on the column).
+   - **Lexicon matching**: patterns must be anchored; one anchored at one end (`^kek`, `love$`) is
+     tried only on emote-like tokens (a recognised emote, or a token with an inner capital such as
+     KEKWait, peepoLove), so plain words (glove, unhappy, microwave, telescope, lullaby, pogo) never
+     match; one anchored at both ends is a word shape (`^(?:ha){2,}h?$`) tried on every token. An
+     emote is found with punctuation around it ("monkaS,"). Moment-type ties go to the first
+     category in lexicon order; pattern matches vote 0.5.
+   - **Cooldown** only against *emitted* candidates (a real moment right after a raid must not
+     fold into the raid's suppressed row); a fold-in is `merge.FoldIn` (the live service appends
+     it to the earlier candidate's `features.followups`) and moves that candidate's chat end to
+     the folded episode's end (`FoldIn.extended`), so the cooldown runs from the last close: a
+     burst every ~45 s stays one candidate instead of every other burst being emitted. **Window
+     clamp**: the side reaching further beyond `[T − 90 s, T + 30 s]` is trimmed first, then both
+     equally, the moment is clamped into the window. Budget counts emitted candidates by chat peak
+     in `(peak − 1 h, peak]`; suppressed ones don't count.
+   - `SuppressReason` and `DelaySource` are in `clipper_core.contracts` (shared value sets of
+     `candidates` that the judge and review read, §19/§21); the columns stay plain text.
+   - Open (for build item 4): with these defaults pure Poisson noise at 0.3–1 unique chatters/s
+     (A ≈ 3–10) opens 0.5–0.9 episodes/h (0.1/h at 2/s); stage 2 emits them. Real chat is
+     burstier than Poisson; check on backfilled quiet channels before changing the floor.
 3. **Live service** (now; defaults provisional). *Done:* integration test: stats + raw chat →
    candidate + media request + bumped transcribe jobs + judge job in one transaction; restart → no
    duplicate; a live run decides ≤ 10 s after a second is final.
@@ -1358,6 +1438,12 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
 | 2026-11-19 | Backfilled streams are read as "events and viewers unknown": no viewer scaling, event rules off | §17 writes no `chat_events`/`viewer_snapshots`; "unknown" must not look like "none" |
 | 2026-11-19 | Detector follows chat_metrics_1s by 1 s polling, no NOTIFY from chat-ingest | chat-ingest is rarely redeployed; its 5 s grace dominates latency |
 | 2026-11-19 | Offline pass v1 = chat replay + audio events + transcript phrases; story/rant finder deferred | simple first; the finder needs labels from judge/review |
+| 2026-11-20 | No scoring until the own baseline holds 300 values (≈ 6 min); the prior only raises the bar, it never stands in for the own baseline | a median of the first seconds of a start ramp, or a prior from a quieter stream alone, made ordinary chat a spike (5 of 10 synthetic ramps at 60 values, 0 at 180+) |
+| 2026-11-20 | Stage-2 shares and moment-type votes count the burst `[onset, peak + 5 s]`, not `[onset − 20 s, peak]`; raw chat is read through the strongest second's activity window | with 20 s of ordinary chat a 15 s ×4 copypasta burst had a dup share of 0.28–0.42 (threshold 0.4), on the burst 0.60–0.73; `clean_fraction` needs the whole 10 s window of the strongest second |
+| 2026-11-20 | New suppress reason `weak`: no fake-spike rule matched, but `z_clean` is below the emit bar | such spikes (bots, commands, deleted messages mixed) are stored for the audit like the others instead of vanishing |
+| 2026-11-20 | Rule order raid, subs, bits, mode_toggle, spam_wave, commands, vote, copypasta, bots, greeting (first = `suppress_reason`, all in `features.rules`) | event causes are the clearest explanation; "1"/"2" floods are polls, not copypasta |
+| 2026-11-20 | `SuppressReason` and `DelaySource` in `clipper_core.contracts` (columns stay plain text) | shared value sets of `candidates` that the judge, review and backtest read (§19, §21) |
+| 2026-11-20 | `detector_version` = scorer + scoring-params hash + lexicon version and file hash; live-loop fields not hashed | an edited but unbumped lexicon shows; tuning the live loop doesn't start a new offline pass |
 
 ### Contract changes
 
@@ -1413,11 +1499,12 @@ def detect_lease(channel_id: int) -> str:
 - **`Candidate`** (`candidates`), writer: detector. `id` bigint PK; `stream_id` FK streams,
   `channel_id` FK channels (not null); `source` text CHECK IN ('live','offline'); `status` text
   CHECK IN ('emitted','suppressed'); `suppress_reason` text null (raid, subs, bits, commands,
-  copypasta, vote, bots, greeting, mode_toggle, spam_wave, budget; CHECK `suppress_reason`:
+  copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget: `contracts.SuppressReason`,
+  added with `weak` in build item 2; CHECK `suppress_reason`:
   `status <> 'suppressed' OR suppress_reason IS NOT NULL`, one-way so a re-emitted row keeps it);
   `trigger` text (chat, clip_mentions, viewer_clips, audio, transcript; no CHECK, it grows);
   `peak_utc` timestamptz (video time); `chat_peak_utc` timestamptz null; `chat_delay_s` float;
-  `delay_source` text (override, learned, default); `moment_from`, `moment_to` timestamptz (CHECK
+  `delay_source` text (override, learned, default: `contracts.DelaySource`); `moment_from`, `moment_to` timestamptz (CHECK
   `moment_to >= moment_from`); `window_from`, `window_to` timestamptz (CHECK `window_to >
   window_from`; CHECK `nesting`: `window_from <= moment_from AND moment_to <= window_to AND
   peak_utc BETWEEN window_from AND window_to`); `score` float; `moment_type` text default

@@ -447,20 +447,21 @@ class Candidate(Base):
     peak lie inside the window):
     - `peak_utc` = T, the moment in **video** time (= `chat_peak_utc - chat_delay_s` for chat
       triggers); `chat_peak_utc` = the chat peak (NULL for triggers without chat, e.g. audio).
-    - `chat_delay_s` + `delay_source` (`override` = `channels.chat_delay_s`, `learned` = the
-      median of recent `chat_delay_estimates`, `default`): the delay used, fixed per stream.
+    - `chat_delay_s` + `delay_source` (`contracts.DelaySource`: `override` =
+      `channels.chat_delay_s`, `learned` = the median of recent `chat_delay_estimates`,
+      `default`): the delay used, fixed per stream.
     - `moment_from`..`moment_to`: the moment itself (video time); `window_from`..`window_to`: the
       media window requested for it (§7), linked through `media_request_id`.
     `status`: `contracts.CandidateStatus`. `suppressed` rows carry `suppress_reason` (raid, subs,
-    bits, commands, copypasta, vote, bots, greeting, mode_toggle, spam_wave, budget) and get no
-    judge job. Re-emitting one (a viewer clip or clip mentions arrived) is an in-place UPDATE to
-    `emitted` that keeps the reason (audit), with its media request and judge job in the same
-    transaction. `trigger`: chat, clip_mentions, viewer_clips, audio, transcript (no CHECK: it
-    grows). `moment_type`: a `contracts.MomentType` (CHECK); the scorer maps other lexicon
-    categories (greeting, uncategorised) to `mixed`/`unknown`. `features`: what the scorer saw
-    (z, ratio, baseline, uniques, viewers, shares, categories, top emotes, events, explicit
-    signals, audio, transcript hits, followups, prev_candidate_id). `detector_version` = code +
-    params hash + lexicon version.
+    bits, commands, copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget:
+    `contracts.SuppressReason`) and get no judge job. Re-emitting one (a viewer clip or clip
+    mentions arrived) is an in-place UPDATE to `emitted` that keeps the reason (audit), with its
+    media request and judge job in the same transaction. `trigger`: chat, clip_mentions,
+    viewer_clips, audio, transcript (no CHECK: it grows). `moment_type`: a `contracts.MomentType`
+    (CHECK); the scorer maps other lexicon categories (greeting, uncategorised) to
+    `mixed`/`unknown`. `features`: what the scorer saw (z, ratio, baseline, uniques, viewers,
+    shares, categories, top emotes, events, explicit signals, audio, transcript hits, followups,
+    prev_candidate_id). `detector_version` = code + params hash + lexicon version.
 
     Idempotency: the detector inserts with `ON CONFLICT DO NOTHING` (UNIQUE `stream_id, peak_utc,
     source`) and creates the media request and the judge job only when a row was inserted, all in
@@ -499,12 +500,12 @@ class Candidate(Base):
     channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
     source: Mapped[str] = mapped_column(Text)  # contracts.CandidateSource
     status: Mapped[str] = mapped_column(Text)  # contracts.CandidateStatus
-    suppress_reason: Mapped[str | None] = mapped_column(Text)
+    suppress_reason: Mapped[str | None] = mapped_column(Text)  # contracts.SuppressReason
     trigger: Mapped[str] = mapped_column(Text)
     peak_utc: Mapped[datetime]  # video time (T)
     chat_peak_utc: Mapped[datetime | None]  # chat time
     chat_delay_s: Mapped[float] = mapped_column(Float)
-    delay_source: Mapped[str] = mapped_column(Text)  # override | learned | default
+    delay_source: Mapped[str] = mapped_column(Text)  # contracts.DelaySource
     moment_from: Mapped[datetime]
     moment_to: Mapped[datetime]
     window_from: Mapped[datetime]
