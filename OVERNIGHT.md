@@ -146,7 +146,8 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 ## How to deploy the transcriber (your call, in the morning)
 
 1. `docker compose up --build migrate` — applies migrations 0002 (transcriber), 0003
-   (backfill tables + `streams` CHECKs) and 0004 (detector tables) to the live `clipper` DB.
+   (backfill tables + `streams` CHECKs), 0004 (detector tables) and 0005 (judge tables) to the
+   live `clipper` DB.
    Additive: new columns/tables;
    `chunk_transcripts` is empty so its NOT NULL columns are safe; all existing streams are
    `source='live'`, so the new CHECKs hold.
