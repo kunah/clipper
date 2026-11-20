@@ -55,6 +55,18 @@ def test_check_constraints_match_models(db_url, fresh_database):
     migrated, declared = checks
     assert ("audio_metrics_1s", "ck_audio_metrics_1s_ranges") in declared
     assert ("chunk_transcripts", "ck_chunk_transcripts_owned_range") in declared
+    for name in (
+        "source",
+        "status",
+        "suppress_reason",
+        "moment_type",
+        "moment_range",
+        "window_range",
+        "nesting",
+    ):
+        assert ("candidates", f"ck_candidates_{name}") in declared
+    for name in ("events", "valid_has_delay"):
+        assert ("chat_delay_estimates", f"ck_chat_delay_estimates_{name}") in declared
     assert migrated == declared
 
 

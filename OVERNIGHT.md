@@ -94,9 +94,17 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   3–5 % faster; the fallback stays a setting). Image still 10.3 GB (venv smaller, but ORT's CUDA
   provider ≈ CPU torch in size). 539 tests.
 
+- Detector (§18, proposed) unit 1 (commit "Detector contract: migration 0004"): tables
+  `candidates` (UNIQUE stream/peak/source; CHECKs: source, status, one-way suppress reason,
+  moment type, moment ⊂ window ∋ peak) and `chat_delay_estimates` (nullable delay unless valid);
+  contracts `JobKind.JUDGE` / `DETECT_OFFLINE`, candidate enums, payloads, `dedupe_key(kind, id,
+  *parts)` (backwards compatible), `detect_lease`; controller stale limits for the new job kinds.
+  560 tests. Needs migration 0004 on the live DB before a detector runs.
+
 ## In progress
 
-- Phase 2: detector (§18) unit 1: contracts + migration 0004.
+- Detector unit 2: the pure scorer (baseline, episodes, stage-2 raw-chat confirmation, fake-spike
+  rules, emote lexicon), tested on synthetic data.
 
 ## Next
 
@@ -105,8 +113,9 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 
 ## How to deploy the transcriber (your call, in the morning)
 
-1. `docker compose up --build migrate` — applies migrations 0002 (transcriber) and 0003
-   (backfill tables + `streams` CHECKs) to the live `clipper` DB. Additive: new columns/tables;
+1. `docker compose up --build migrate` — applies migrations 0002 (transcriber), 0003
+   (backfill tables + `streams` CHECKs) and 0004 (detector tables) to the live `clipper` DB.
+   Additive: new columns/tables;
    `chunk_transcripts` is empty so its NOT NULL columns are safe; all existing streams are
    `source='live'`, so the new CHECKs hold.
 2. `docker compose up -d transcriber` (naming it enables its `gpu` profile) — first start

@@ -122,6 +122,22 @@ async def test_maintenance_creates_partitions_and_requeues_stale_jobs(sessions):
     assert status == "queued" and part is not None
 
 
+async def test_maintenance_requeues_detector_and_judge_jobs_after_their_own_limits(sessions):
+    """judge jobs are stale after 10 min, detect_offline after 30 min (DESIGN §18)."""
+    ids = {}
+    async with sessions.begin() as s:
+        for kind in (JobKind.JUDGE, JobKind.DETECT_OFFLINE):
+            ids[kind] = await jobs.enqueue(s, kind, ref_id=1)
+    async with sessions.begin() as s:
+        for kind in ids:
+            await jobs.claim(s, [kind], "dead-worker")
+        await s.execute(text("UPDATE jobs SET locked_at = now() - interval '20 minutes'"))
+    await run_maintenance(sessions)
+    async with sessions() as s:
+        rows = (await s.execute(text("SELECT kind, status FROM jobs"))).all()
+    assert dict(rows) == {"judge": "queued", "detect_offline": "running"}
+
+
 async def test_channels_cli_commands(sessions):
     async with sessions.begin() as s:
         assert await channels_cli.add(s, ["@XQC", "kai"], "audio_only") == [

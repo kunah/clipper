@@ -9,7 +9,8 @@ judges, edits and publishes short vertical clips.
 > is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
 > `transcriber` compose service, profile `gpu`). Step 5 (backfill tool, design §17 proposed)
 > done 2026-11-20; it needs migration 0003 on the live DB before a real backfill.
-> Phase 2 designs §18–§22 are proposed, not yet agreed.
+> Phase 2 designs §18–§22 are proposed, not yet agreed; detector build item 1 (contracts +
+> migration 0004, §18) built 2026-11-20, not on the live DB yet.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -1198,7 +1199,9 @@ funny); `[bots]`; `[transcript]` phrases; `[channels.<login>]` overrides. Unknow
 `uncategorised`; `clipper-detector lexicon --unknown` lists the most used (a table only once
 non-developers edit it). **Moment type** = dominant category of per-message votes (one per message
 and category, one per user; `emote_counts` counts tokens, so it's used only where raw chat isn't
-read): top share ≥ 0.4, else `mixed`; < 5 votes `unknown`.
+read): top share ≥ 0.4, else `mixed`; < 5 votes `unknown`. Only `MomentType` values are stored
+(CHECK): a winning category that isn't one (greeting, uncategorised) maps to `mixed` (enough
+votes) or `unknown`.
 
 **3. Stage 2: raw chat and fake spikes.** On suspect/close, read the channel's `chat_messages`
 `[onset − 20 s, peak + 5 s]` and `chat_events` `[onset − 60 s, peak + 5 s]` (index `channel_id,
@@ -1241,14 +1244,18 @@ redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` k
   `[created_at − duration − 5 s, created_at − 5 s]`. ≥ 2 creators overlapping within 90 s (3 above
   20 clips/h) → trigger.
 - **Boosts** +2 (clip mentions), +1 (viewer clip). A signal within ±60 s of a candidate is attached
-  to it; a *suppressed* one is then re-emitted (a viewer thought it was real).
+  to it; a *suppressed* one is then re-emitted (a viewer thought it was real): an in-place UPDATE
+  to `emitted` that keeps `suppress_reason` (audit), with its media request and judge job in the
+  same transaction.
 
 **5. Merge, delay, media request.**
 - **Emit at episode close** (≤ ~20 s after the peak): stable peak/window; the judge waits for
   T + 30 s anyway. **Peak** (chat time) = argmax of the 3 s centred mean of `unique_chatters`;
   **onset** = first second in `[open − 10 s, peak]` where that mean reaches a quarter of the rise.
 - **Delay** `d` = `channels.chat_delay_s` (manual override) → median of the last 5 valid
-  `chat_delay_estimates` → **8 s**; fixed per stream. `T = peak_utc = chat_peak − d`. **Window**
+  `chat_delay_estimates` of the channel, ordered by their stream's `streams.started_at` (join; not
+  `computed_at`: a backfill computes old streams late), skipping backfilled streams flagged
+  `timeline_uncertain_s` → **8 s**; fixed per stream. `T = peak_utc = chat_peak − d`. **Window**
   (§7) `[min(T − 90 s, onset − d − 30 s), max(T + 30 s, close − d + 15 s)]`, at most 5 min.
 - **Cooldown 60 s**: a weaker episode opening < 60 s after a candidate closed folds into it
   (`features.followups`); a stronger one is emitted with `features.prev_candidate_id`. **Budget**:
@@ -1257,11 +1264,20 @@ redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` k
   requested_by="detector")` → `jobs.enqueue(JUDGE, ref_id=id, dedupe_key=dedupe_key(JUDGE, id),
   priority=TRIGGER)` → commit. A 60 s sweep marks its requests fulfilled once `coverage(window)`
   is complete or 15 min after `window_to`. Until the judge exists: `CLIPPER_DETECTOR_JUDGE_JOBS=0`.
+- **Idempotent** (restart replay, offline re-runs): the insert is `ON CONFLICT DO NOTHING` (UNIQUE
+  `stream_id, peak_utc, source`); the media request and judge job are created only when a row was
+  inserted. Before that the detector dedupes in code against every candidate of the stream within
+  ± 60 s (any source and version), since a new delay shifts `peak_utc` and the UNIQUE alone
+  wouldn't catch it.
 
 **6. Offline pass (v1) and chat delay.**
 - **Job** `detect_offline` (ref = stream), enqueued by a 5 min sweep for ended streams with complete
   `coverage([started_at, ended_at])` (backfill: also `vods.chat_metrics_to ≥ ended_at` or chat not
-  available) and no job for this version (dedupe `detect_offline:{stream}:{version}`).
+  available) and no job for this version (dedupe `detect_offline:{stream}:{version}`). A job whose
+  `DetectOfflinePayload.detector_version` isn't the running version completes as a no-op (the
+  sweep enqueues one for the current version). `JobRunner` doesn't renew `locked_at`, so a pass
+  longer than `STALE_AFTER` (30 min) is requeued and runs twice: harmless (inserts are idempotent,
+  estimates upsert), but measure pass times in build item 5.
 - **Triggers** (video time, merged when peaks are < 30 s apart): (a) chat: the live scorer replayed,
   shifted by `d` (so backfilled streams get it too); (b) audio_metrics_1s: laughter ≥ 0.5 in 2 of
   4 s, screaming/shouting ≥ 0.6, cheering/gasp/crying ≥ 0.5 for 2 s, 3 s loudness − 5 min median
@@ -1274,8 +1290,10 @@ redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` k
 - **Delay learning** (first step of each job): onsets of laughter/screaming/cheering ≥ 0.5 (≥ 20 s
   apart, not under music); event-triggered average of chat `z` at lags 1–30 s (cross-correlation of
   event train and chat excess); `d` = argmax after 3 s smoothing, valid with ≥ 15 events and a peak
-  ≥ 1.5 above the median over lags. One `chat_delay_estimates` row per stream; its own offline
-  candidates use it, later streams the median of the last 5. **Writer conflict**: the detector never
+  ≥ 1.5 above the median over lags. One `chat_delay_estimates` row per stream, upserted (`ON
+  CONFLICT (stream_id, method) DO UPDATE …, computed_at = now()`); invalid rows may lack `delay_s`/
+  `strength` (no events). Its own offline candidates use it, later streams the median of the last
+  5 valid (by `streams.started_at`, §5). **Writer conflict**: the detector never
   writes `channels`; `channels.chat_delay_s` becomes the operator's manual override.
 
 **7. Data model.** `candidates` holds detector output only (columns below). §7's `candidate` = an
@@ -1302,7 +1320,16 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
 `CLIPPER_TWITCH_*` enables Get Clips. Controller: `STALE_AFTER` += judge 10 min, offline 30 min.
 
 **10. Build plan.**
-1. **Contracts + migration** (now). *Done:* `test_migrations` passes; payload/enum tests.
+1. ✅ **Contracts + migration** (built 2026-11-20). *Done:* `test_migrations` passes; payload/enum
+   tests. Built as the contract block below: migration `0004_detector`, contracts, controller
+   `STALE_AFTER`. Review changes (2026-11-20, folded into the block below): UNIQUE (`stream_id`,
+   `peak_utc`, `source`) replaces the separate (`stream_id`, `peak_utc`) index; CHECKs
+   `suppress_reason` (one-way), `moment_type` and `nesting` on candidates; nullable `delay_s`/
+   `strength` with CHECKs `valid_has_delay` and `events`; no index on `media_request_id` (add it in
+   the first migration that deletes `media_requests` rows). Columns not marked "null" are NOT NULL,
+   without defaults unless given; `delay_source` and `suppress_reason` are plain text. §19's
+   per-round keys (`judge:{cand}:r{n}`) use the same `dedupe_key`. Needs 0004 on the live DB
+   before the detector runs.
 2. **Scorer, stage 2, lexicon** (now; pure, synthetic fixtures). *Done:* noise → nothing; 15 s ×4
    burst → one candidate, peak ± 2 s; start ramp → nothing; raid, mass gift, copypasta, `!enter`,
    "1/2" votes, greeting flood → suppressed with the right reason; replay from a later start → same.
@@ -1386,20 +1413,25 @@ def detect_lease(channel_id: int) -> str:
 - **`Candidate`** (`candidates`), writer: detector. `id` bigint PK; `stream_id` FK streams,
   `channel_id` FK channels (not null); `source` text CHECK IN ('live','offline'); `status` text
   CHECK IN ('emitted','suppressed'); `suppress_reason` text null (raid, subs, bits, commands,
-  copypasta, vote, bots, greeting, mode_toggle, spam_wave, budget); `trigger` text (chat,
-  clip_mentions, viewer_clips, audio, transcript; no CHECK, it grows); `peak_utc` timestamptz (video
-  time); `chat_peak_utc` timestamptz null; `chat_delay_s` float; `delay_source` text (override,
-  learned, default); `moment_from`, `moment_to` timestamptz (CHECK `moment_to >= moment_from`);
-  `window_from`, `window_to` timestamptz (CHECK `window_to > window_from`); `score` float;
-  `moment_type` text default 'unknown'; `features` jsonb default '{}' (z, ρ, baseline, uniques,
-  viewers, shares, categories, top emotes, events, explicit signals, audio, transcript hits,
-  followups); `detector_version` text; `media_request_id` FK media_requests null; `created_at`,
-  `updated_at`. UNIQUE (`stream_id`, `source`, `peak_utc`); INDEX (`stream_id`, `peak_utc`); INDEX
-  (`channel_id`, `created_at`).
+  copypasta, vote, bots, greeting, mode_toggle, spam_wave, budget; CHECK `suppress_reason`:
+  `status <> 'suppressed' OR suppress_reason IS NOT NULL`, one-way so a re-emitted row keeps it);
+  `trigger` text (chat, clip_mentions, viewer_clips, audio, transcript; no CHECK, it grows);
+  `peak_utc` timestamptz (video time); `chat_peak_utc` timestamptz null; `chat_delay_s` float;
+  `delay_source` text (override, learned, default); `moment_from`, `moment_to` timestamptz (CHECK
+  `moment_to >= moment_from`); `window_from`, `window_to` timestamptz (CHECK `window_to >
+  window_from`; CHECK `nesting`: `window_from <= moment_from AND moment_to <= window_to AND
+  peak_utc BETWEEN window_from AND window_to`); `score` float; `moment_type` text default
+  'unknown' (CHECK IN the `MomentType` values); `features` jsonb default '{}' (z, ρ, baseline,
+  uniques, viewers, shares, categories, top emotes, events, explicit signals, audio, transcript
+  hits, followups); `detector_version` text; `media_request_id` FK media_requests null (no index
+  yet); `created_at`, `updated_at`. UNIQUE (`stream_id`, `peak_utc`, `source`) (also serves
+  lookups by stream and peak); INDEX (`channel_id`, `created_at`).
 - **`ChatDelayEstimate`** (`chat_delay_estimates`), writer: detector. `id` bigint PK; `channel_id`
-  FK; `stream_id` FK; `method` text ('audio_events'); `delay_s` float; `events` int; `strength`
-  float (peak above the median over lags); `valid` bool; `detector_version` text; `computed_at`
-  default now(). UNIQUE (`stream_id`, `method`); INDEX (`channel_id`, `computed_at`).
+  FK; `stream_id` FK; `method` text ('audio_events'); `delay_s` float null; `events` int (CHECK
+  `>= 0`); `strength` float null (peak above the median over lags); `valid` bool (CHECK
+  `valid_has_delay`: `NOT valid OR (delay_s IS NOT NULL AND strength IS NOT NULL)`);
+  `detector_version` text; `computed_at` default now(). UNIQUE (`stream_id`, `method`); INDEX
+  (`channel_id`, `computed_at`).
 - `viewer_clips`: unchanged from §17 (writer: backfill tool only); the detector only reads it.
 - Docstrings only: `Channel.chat_delay_s` = manual override by the operator (learned values in
   `chat_delay_estimates`); `MediaRequest`: detector requests are linked from
@@ -1445,7 +1477,8 @@ planned` + `failed`; the rest of §7 comes from §20–§22's tables, and §7 ga
    (else `rejected`/`no_media`). Stream end: `coverage()` makes time after the last chunk a gap.
 4. Compare-and-set `waiting_for_media → judging` (same round), commit; input, cost guard, cache, call,
    resolve + repair; then **one transaction**: `clip_plans` row, clip status, `mark_fulfilled` of the
-   clip's media requests and, for `clip`, the `render` job (`dedupe_key(RENDER, plan_id)`; off with
+   clip's own media requests (the judge's rows, `clip_id` = the clip; never the detector's, which
+   its own sweep fulfils) and, for `clip`, the `render` job (`dedupe_key(RENDER, plan_id)`; off with
    `CLIPPER_JUDGE_RENDER_JOBS=0`). Provider errors retry; the job's last attempt marks it `failed`.
 
 **Context extension.** Answer `need_context` (`before_s`, `after_s`, why) → context = union, clamped

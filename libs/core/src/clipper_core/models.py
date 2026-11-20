@@ -75,7 +75,9 @@ class Channel(Base):
     display_name: Mapped[str | None] = mapped_column(Text)
     recording_mode: Mapped[str] = mapped_column(Text, server_default="full")
     active: Mapped[bool] = mapped_column(server_default=sql_text("true"))
-    chat_delay_s: Mapped[float | None] = mapped_column(Float)  # learned per channel
+    # Manual override by the operator (the detector never writes channels). Learned delays live
+    # in the detector's `chat_delay_estimates`; the detector uses override -> learned -> default.
+    chat_delay_s: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
@@ -434,6 +436,126 @@ class AudioMetricSecond(Base):
     classes: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
 
 
+# --------------------------------------------------------------------------- detector
+
+
+class Candidate(Base):
+    """A moment the detector found (DESIGN §18). Writer: detector; rows are its output only.
+
+    The lifecycle after that lives in the judge's `clips` (`candidate_id`), so §7's "candidate" is
+    an `emitted` row with a judge job and no clip yet. Times (CHECK `nesting`: the moment and the
+    peak lie inside the window):
+    - `peak_utc` = T, the moment in **video** time (= `chat_peak_utc - chat_delay_s` for chat
+      triggers); `chat_peak_utc` = the chat peak (NULL for triggers without chat, e.g. audio).
+    - `chat_delay_s` + `delay_source` (`override` = `channels.chat_delay_s`, `learned` = the
+      median of recent `chat_delay_estimates`, `default`): the delay used, fixed per stream.
+    - `moment_from`..`moment_to`: the moment itself (video time); `window_from`..`window_to`: the
+      media window requested for it (§7), linked through `media_request_id`.
+    `status`: `contracts.CandidateStatus`. `suppressed` rows carry `suppress_reason` (raid, subs,
+    bits, commands, copypasta, vote, bots, greeting, mode_toggle, spam_wave, budget) and get no
+    judge job. Re-emitting one (a viewer clip or clip mentions arrived) is an in-place UPDATE to
+    `emitted` that keeps the reason (audit), with its media request and judge job in the same
+    transaction. `trigger`: chat, clip_mentions, viewer_clips, audio, transcript (no CHECK: it
+    grows). `moment_type`: a `contracts.MomentType` (CHECK); the scorer maps other lexicon
+    categories (greeting, uncategorised) to `mixed`/`unknown`. `features`: what the scorer saw
+    (z, ratio, baseline, uniques, viewers, shares, categories, top emotes, events, explicit
+    signals, audio, transcript hits, followups, prev_candidate_id). `detector_version` = code +
+    params hash + lexicon version.
+
+    Idempotency: the detector inserts with `ON CONFLICT DO NOTHING` (UNIQUE `stream_id, peak_utc,
+    source`) and creates the media request and the judge job only when a row was inserted, all in
+    one transaction. Before that it dedupes in code against every candidate of the stream within
+    ± 60 s (any source and version): a new chat delay shifts `peak_utc`, so the UNIQUE alone
+    doesn't catch a re-run. No index on `media_request_id` yet: add one in the first migration
+    that deletes `media_requests` rows.
+    """
+
+    __tablename__ = "candidates"
+    __table_args__ = (
+        # also serves lookups by (stream_id, peak_utc)
+        UniqueConstraint("stream_id", "peak_utc", "source"),
+        Index(None, "channel_id", "created_at"),
+        CheckConstraint("source IN ('live', 'offline')", name="source"),
+        CheckConstraint("status IN ('emitted', 'suppressed')", name="status"),
+        CheckConstraint(
+            "status <> 'suppressed' OR suppress_reason IS NOT NULL", name="suppress_reason"
+        ),
+        CheckConstraint(
+            "moment_type IN ('funny', 'hype', 'shock', 'tense', 'sad', 'cringe', 'wholesome',"
+            " 'mixed', 'unknown')",
+            name="moment_type",
+        ),
+        CheckConstraint("moment_to >= moment_from", name="moment_range"),
+        CheckConstraint("window_to > window_from", name="window_range"),
+        CheckConstraint(
+            "window_from <= moment_from AND moment_to <= window_to"
+            " AND peak_utc BETWEEN window_from AND window_to",
+            name="nesting",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    source: Mapped[str] = mapped_column(Text)  # contracts.CandidateSource
+    status: Mapped[str] = mapped_column(Text)  # contracts.CandidateStatus
+    suppress_reason: Mapped[str | None] = mapped_column(Text)
+    trigger: Mapped[str] = mapped_column(Text)
+    peak_utc: Mapped[datetime]  # video time (T)
+    chat_peak_utc: Mapped[datetime | None]  # chat time
+    chat_delay_s: Mapped[float] = mapped_column(Float)
+    delay_source: Mapped[str] = mapped_column(Text)  # override | learned | default
+    moment_from: Mapped[datetime]
+    moment_to: Mapped[datetime]
+    window_from: Mapped[datetime]
+    window_to: Mapped[datetime]
+    score: Mapped[float] = mapped_column(Float)
+    moment_type: Mapped[str] = mapped_column(Text, server_default="unknown")
+    features: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    detector_version: Mapped[str] = mapped_column(Text)
+    media_request_id: Mapped[int | None] = mapped_column(ForeignKey("media_requests.id"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class ChatDelayEstimate(Base):
+    """Learned chat delay (chat time - video time) of one stream (DESIGN §18). Writer: detector.
+
+    Computed by the offline pass: event-triggered average of chat activity after loud audio
+    events (`method = 'audio_events'`). `events`: audio events used; `strength`: the peak above
+    the median over lags; `valid` when there were enough events and a clear peak (CHECK
+    `valid_has_delay`: a valid row has `delay_s` and `strength`; an invalid one may have neither,
+    e.g. no events at all). Upserted: `ON CONFLICT (stream_id, method) DO UPDATE ...,
+    computed_at = now()`.
+
+    Later streams of the channel use the median of its last 5 valid estimates **ordered by the
+    stream's `streams.started_at`** (join; not `computed_at`, since a backfill may compute old
+    streams late), skipping backfilled streams whose `vods.flags` has `timeline_uncertain_s`,
+    unless `channels.chat_delay_s` (manual override) is set.
+    """
+
+    __tablename__ = "chat_delay_estimates"
+    __table_args__ = (
+        UniqueConstraint("stream_id", "method"),
+        Index(None, "channel_id", "computed_at"),
+        CheckConstraint("events >= 0", name="events"),
+        CheckConstraint(
+            "NOT valid OR (delay_s IS NOT NULL AND strength IS NOT NULL)", name="valid_has_delay"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    method: Mapped[str] = mapped_column(Text)  # audio_events
+    delay_s: Mapped[float | None] = mapped_column(Float)
+    events: Mapped[int] = mapped_column(Integer)
+    strength: Mapped[float | None] = mapped_column(Float)
+    valid: Mapped[bool]
+    detector_version: Mapped[str] = mapped_column(Text)
+    computed_at: Mapped[datetime] = _created_at()
+
+
 # --------------------------------------------------------------------------- coordination
 
 
@@ -478,7 +600,8 @@ class MediaRequest(Base):
     """A request: "I need transcripts for this time range at this priority."
 
     Raises the priority of matching queued jobs, and of chunks recorded later inside the range.
-    Writers: detector, judge (anyone who needs a window).
+    Writers: detector, judge (anyone who needs a window), each for its own rows. Detector rows
+    are linked from `candidates.media_request_id`; `clip_id` stays for the judge's rows.
     """
 
     __tablename__ = "media_requests"

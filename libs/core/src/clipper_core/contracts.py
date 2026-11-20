@@ -34,7 +34,11 @@ class Priority(IntEnum):
 
 
 class JobKind(StrEnum):
-    TRANSCRIBE = "transcribe"
+    TRANSCRIBE = "transcribe"  # ref_id = chunks.id; recorder / backfill tool, with the chunk
+    # ref_id = candidates.id; enqueued by the detector with the candidate (`judge:{candidate}`),
+    # again by the judge's waiter per context round (`judge:{candidate}:r{round}`, DESIGN §19)
+    JUDGE = "judge"
+    DETECT_OFFLINE = "detect_offline"  # ref_id = streams.id; enqueued by the detector's sweep
 
 
 class JobStatus(StrEnum):
@@ -129,12 +133,51 @@ class SoundGroup(StrEnum):
     GUNFIRE_EXPLOSION = "gunfire_explosion"
 
 
+class CandidateSource(StrEnum):
+    """`candidates.source`: which detector pass found the moment (DESIGN §18)."""
+
+    LIVE = "live"  # live scorer on chat_metrics_1s + raw chat
+    OFFLINE = "offline"  # `detect_offline` pass over an ended stream (chat, audio, transcript)
+
+
+class CandidateStatus(StrEnum):
+    """`candidates.status` (writer: detector). The lifecycle after that lives in the judge's
+    `clips` (DESIGN §7, §19)."""
+
+    EMITTED = "emitted"  # judge job enqueued
+    SUPPRESSED = "suppressed"  # fake-spike rule or budget; see `candidates.suppress_reason`
+
+
+class MomentType(StrEnum):
+    """`candidates.moment_type`: dominant emote/word category of a moment (DESIGN §18). Also the
+    edit plan's moment type (§19)."""
+
+    FUNNY = "funny"
+    HYPE = "hype"
+    SHOCK = "shock"
+    TENSE = "tense"
+    SAD = "sad"
+    CRINGE = "cringe"
+    WHOLESOME = "wholesome"
+    MIXED = "mixed"  # no category reached the top share
+    UNKNOWN = "unknown"  # too few votes
+
+
 class Payload(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
 class TranscribePayload(Payload):
     chunk_id: int
+
+
+class JudgePayload(Payload):
+    candidate_id: int
+
+
+class DetectOfflinePayload(Payload):
+    stream_id: int
+    detector_version: str  # also in the job's dedupe key: a new version may run again
 
 
 # --------------------------------------------------------------------------- words files
@@ -204,6 +247,16 @@ def backfill_lease(video_id: str) -> str:
     return f"backfill:vod:{video_id}"
 
 
-def dedupe_key(kind: JobKind, ref_id: int) -> str:
-    """One job per (kind, object): enqueuing again only raises its priority."""
-    return f"{kind}:{ref_id}"
+def detect_lease(channel_id: int) -> str:
+    """Lease a detector process holds while it scores a channel live."""
+    return f"detect:channel:{channel_id}"
+
+
+def dedupe_key(kind: JobKind, ref_id: int, *parts: str | int) -> str:
+    """One job per (kind, object[, parts]): enqueuing again only raises its priority.
+
+    Extra parts are for jobs that may run again for the same object, e.g. per detector version
+    (`detect_offline:12:<version>`) or per judge round (`judge:7:r1`). Without parts the key
+    stays `kind:ref_id`, as before.
+    """
+    return ":".join(str(p) for p in (kind, ref_id, *parts))
