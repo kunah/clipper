@@ -5,19 +5,18 @@ moments where chat spikes compared to the channel's own history, then records, t
 judges, edits and publishes short vertical clips.
 
 > **Status (2026-11-21):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
-> unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill). The transcriber
-> is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
-> `transcriber` compose service, profile `gpu`). Step 5 (backfill tool, design §17 proposed)
-> done 2026-11-20; it needs migration 0003 on the live DB before a real backfill.
-> Phase 2 designs §18–§22 are proposed, not yet agreed; detector build item 1 (contracts +
-> migration 0004, §18) built 2026-11-20, not on the live DB yet; build item 2 (scorer, stage 2,
-> lexicon, merge: pure code in `services/detector`, synthetic tests) built 2026-11-20; build item 3
-> (live service `clipper-detector`, compose profile `detector`, judge jobs off) built 2026-11-20,
-> not deployed (needs 0004 on the live DB). Judge build item 6a (contracts + migration 0005 +
-> `clipper_core.lifecycle`, §19) built 2026-11-20, not on the live DB yet; build item 6b (input
-> builder + resolver, pure code in `services/judge`) built 2026-11-21; no judge service yet.
-> Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
-> the recorder only records streams the controller marked live.
+> unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill).
+> **Deployed for testing 2026-11-21** (user's OK; from branch `transcriber` @1778961, so compose runs
+> from that worktree until it is merged): live DB migrated to 0005; controller, chat-ingest and
+> recorder rebuilt; the transcriber (profile `gpu`) works through the queued `transcribe` jobs; the
+> live detector (profile `detector`) runs with judge jobs off and viewer clips on. The backfill
+> image is built, not run: backfill runs only on a VOD the user names (§17, decided 2026-11-21).
+> Phase 2 designs §18–§22 are proposed, not yet agreed, apart from the user's 2026-11-21
+> decisions (§15: review on Discord, the judge's first LLM via the Claude Code CLI with a usage
+> guard, publishing per user-filled route config). Detector build items 1–3 (contracts + 0004,
+> scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21. Judge
+> build items 6a (contracts + 0005 + `clipper_core.lifecycle`, §19) and 6b (input builder +
+> resolver, pure code in `services/judge`) built; no judge service yet (6c next).
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -40,8 +39,8 @@ judges, edits and publishes short vertical clips.
   └─────────────────────────────────────────────┘
         │
         ▼
-  offline detector → judge (LLM → edit plan JSON) → renderer → review (Telegram + web)
-        ▲                                                         → publisher → analytics
+  offline detector → judge (LLM → edit plan JSON) → renderer → review (Discord + web)
+        ▲                                                        → publisher → analytics
         └──────────────────────── performance feedback ◄─────────────────────────┘
 ```
 
@@ -54,10 +53,16 @@ judges, edits and publishes short vertical clips.
    outputs a structured **edit plan** (JSON: in/out points, title, captions, SFX, music mood).
 6. **Render** deterministically with ffmpeg: 9:16 layout (facecam + gameplay), animated
    captions from word timestamps, licensed music/SFX only.
-7. **Review**: human approve/reject (Telegram bot on phone for speed, web UI for editing).
+7. **Review**: human approve/reject (Discord bot with buttons on the phone for speed, web UI for
+   editing; Discord instead of Telegram since 2026-11-21).
 8. **Publish** to platforms, then pull analytics back to tune detection and editing.
 
-## 2. Business / rights model (open decision)
+## 2. Business / rights model (decided 2026-11-21: per route, by the user)
+
+**Decided by the user (2026-11-21):** the user decides what is published where, and supplies the
+credentials and the upload method for each platform. The system models no rights of its own:
+a publish route (§22) is config the user fills in, and a clip without a route is never published.
+The background below stays as context.
 
 The stream belongs to the streamer. Clipping random channels onto our own accounts leads to
 DMCA takedowns and strikes. Two legitimate models:
@@ -165,7 +170,7 @@ Services talk only through Postgres and object storage.
 | detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
 | judge | LLM verdict + edit plan, context requests (§19; contract + 0005 built, service not yet) | clips, clip_plans, judge_calls, own media_requests | slim |
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
-| review | FastAPI UI + Telegram bot | clip decisions (later) | slim |
+| review | FastAPI UI + Discord bot (§21) | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
 | tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c), chat_messages, chat_metrics_1s (5d); viewer_clips (5d, all streams) | slim + ffmpeg (profile `tools`) |
 
@@ -226,7 +231,7 @@ per-task context fields; CloudWatch Embedded Metric Format can be added as a for
 Python 3.12, uv workspace, ruff, pytest (+pytest-asyncio), SQLAlchemy 2 (async, psycopg 3),
 Alembic, Pydantic v2 / pydantic-settings, boto3, Postgres 18 + pgvector, SeaweedFS,
 streamlink (playlist URL only) + own HLS loop, ffmpeg (NVENC), faster-whisper, FastAPI,
-Telegram bot. Own minimal Twitch IRC client (full control over tags).
+Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own minimal Twitch IRC client (full control over tags).
 
 ## 14. Roadmap
 
@@ -269,9 +274,9 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
    yet agreed).
 
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
-context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
+context requests) → renderer (9:16, captions) → review (Discord + web) → publisher →
 analytics loop. Then Kick/YouTube. Detector build items 1–3 (contracts, scorer, live service)
-built 2026-11-20, see §18.10; judge build item 6a (contracts, migration 0005, lifecycle helper)
+built 2026-11-20, see §18.10, live since 2026-11-21 (judge jobs off); judge build item 6a (contracts, migration 0005, lifecycle helper)
 built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, see §19. Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
@@ -325,6 +330,13 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-19 | Transcriber runtime (4b-3): faster-whisper's `vad_filter` **off**; **sequential** decoding of the gated stretches; model libraries as **optional extras** of clipper-transcriber (`whisper`, `ced`; only the CUDA image installs them); CED on the **CPU build of torch** | measured on the 20 benchmark chunks: `vad_filter` gave identical words and was 3 % slower (our Silero gate already runs in front); the batched pipeline was 1.2× faster but changed 1–2 % of the words; extras keep the dev env and tests free of torch/CUDA; the CPU build keeps the image ~5 GB smaller (CED speed is open, §16) |
 | 2026-11-20 | **CED runs on the GPU**: ONNX fp16 on onnxruntime-gpu (CUDA 12 build, ORT's own feed), exported at image build time from the pinned weights (build fails unless the sha256 matches); no torch in the image. Supersedes 4b-3's CED on CPU torch, the `ced` extra and the PyTorch CPU index. CED itself stays **provisional** (the user decided only where it runs) | on the CPU CED was the slowest stage (24× realtime, ~2.4 s per chunk). Measured on the idle 4060 (20 bench chunks, 2 s windows / 1 s hop): ORT fp16 849× realtime, 505 MB GPU, 1.1 s load, venv 0.77 GB vs torch CUDA fp16 751×, 509 MB, 3.8 s, 5.4 GB; ONNX vs torch outputs: max group-score diff 0.0022, top-1 agreement 100 % of 1170 windows. The Hub's own `model.onnx` (int8 incl. the mel frontend, no −120 dB floor) is off by up to 0.075. In the pipeline: CED ~1,000–1,500× realtime, overall 13× → 29×, per-second classes within 0.003 of the CPU run (§16) |
 | 2026-11-20 | Whisper decodes at **temperature 0 only** (faster-whisper's temperature fallback off; setting `whisper_temperature_fallback`) | measured on the 20 bench chunks: same words and benchmark agreement either way, the fallback re-decoded 4 of 190 segments per pass and made 2 of 20 chunks differ between two runs (once an invented "we'll be right back"); temperature 0 is identical run to run (retries, re-plans) and 3–5 % faster; no repetition loops either way. Trade-off: a low-scoring segment that isn't a repetition loop is now kept as decoded instead of re-decoded (the loop filter only drops repetition runs) (§16) |
+| 2026-11-21 | Sound classifier stays **CED-base, provisional**, as built; experiments with other classifiers later (user's answer, relayed by the main session) | it works (ONNX on the GPU); accuracy on real laughter/screaming is still unmeasured, and the `SoundTagger` interface keeps it swappable |
+| 2026-11-21 | Judge resolver: when only tiny video islands are left near the moment, it spends its one retry (`Unrepairable`) instead of rejecting as `no_video` (kept as built in 6b; user's answer) | a second answer may pick a range with video; the retry is bounded (one), and a clip that still fails ends `failed` |
+| 2026-11-21 | **Backfill never runs automatically**: only on a VOD/stream the user names (`clipper-backfill vod <id>`). No scheduled, per-channel or bulk backfill; `channel <login>` only lists a channel's archives to pick from (user's answer; §17) | the user decides which old streams are analysed (downloads, GPU time, GQL use) |
+| 2026-11-21 | **Publishing is per route, decided by the user**: the user says what is published where and supplies each platform's credentials and upload method; the publisher holds only the per-route config the user fills in, no rights model of its own (§2, §22). Publisher adapters wait for that input (user's answer) | rights and platform choices are the user's; the system only enforces "no route, no post" |
+| 2026-11-21 | **Review runs on Discord instead of Telegram**: a bot posts each clip with buttons (approve / reject / edit), the web UI stays for detailed editing (user's answer; design in §21) | the user's choice of messenger |
+| 2026-11-21 | **The judge's first real LLM adapter is the Claude Code CLI** (headless `claude -p`, JSON output) on the user's Claude subscription, not an API key; the USD cost guard becomes a **usage guard** that keeps the judge from using up the plan's limits (user's answer; design in §19). Model and limits still open | uses the subscription the user already pays for; the `JudgeModel` protocol keeps API adapters possible |
+| 2026-11-21 | Everything built so far is deployed to the live stack for testing; redeploys are fine (user's OK, deploy done by the main session from branch `transcriber`) | test the pipeline on live data |
 
 ## 16. Transcriber design (step 4)
 
@@ -689,6 +701,18 @@ run on real data yet (needs a broadcast we recorded live, and the live DB/storag
 and chat questions: see §3 (rows "Twitch VOD chat", "Twitch VOD HLS"); the time model below is
 updated with it (5c: T0 from PDT, see "Time model").
 
+**Decided by the user (2026-11-21): backfill is never automatic.** It runs only on a stream/VOD the
+user names ("analyze this one"): `vod <id|url>`. Nothing schedules it, and no command backfills a
+channel's archives in bulk. Checked against this section on 2026-11-21: the only path that
+backfills without an explicit id is `channel <login>`, which today backfills the newest N
+archives. It becomes **list-only** (prints the archives with id, date, duration and whether we
+already have them; the user picks and runs `vod <id>`). That code change is pending (see
+OVERNIGHT.md). The rest needs an explicit id or is metadata only: `vod` takes ids/URLs; `clips
+<login>` reads viewer-clip metadata (Helix, no media) for streams we already have; `calibrate` and
+`status` are read-only. Priority `BACKFILL` (§6) only orders the transcribe jobs a named run
+created. Nothing in §18/§19 starts a backfill: the detector backtest and the judge eval read
+streams the user backfilled.
+
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)
 and viewer clips in the live format, so transcriber, detector and judge need no special case.
@@ -698,7 +722,9 @@ and viewer clips in the live format, so transcriber, detector and judge need no 
   [--no-transcribe] [--max-minutes N] [--chat-max-minutes N]`: default is audio_only + chat +
   clips + jobs (in that order; clips only with Helix credentials). `--video` takes a video rendition
   and copies its audio out, like the recorder; `--video-range` adds video to the chunks it overlaps.
-- `channel <login> [--since D] [--limit N]`: the newest N archives, **oldest first** (VODs expire).
+- `channel <login> [--since D] [--limit N]`: as built, it backfills the newest N archives, **oldest
+  first** (VODs expire). **To change (decided 2026-11-21): list only**, no writes; backfill a
+  listed archive with `vod <id>`.
 - `clips <login|video>...`, `status`, `calibrate <video_id>` (read-only; a stream also recorded
   live): T0 methods vs live PDT by audio correlation, `createdAt` vs `tmi-sent-ts`.
 
@@ -1170,6 +1196,11 @@ for live streams, the backfill tool for backfilled ones). `ChatEvent`: chat-inge
 **Status:** proposal. Schema, scorer and live service can be built now with provisional defaults;
 thresholds, lexicon and offline weights are tuned by backtest once step 5 and the transcriber
 deliver data. v1 needs no chat-ingest change.
+**2026-11-21:** live on the stack (deployed by the main session, judge jobs off, viewer clips on: the
+Twitch app credentials are in the worktree's `.env` now, and the detector polls Get Clips with
+them; whether the detector may keep holding them is still open with the user). The backtest (build
+item 4) has its credentials now, so Helix viewer clips and channel lookups work. It still needs
+backfilled VODs, and those are only the ones the user names (§17, decided 2026-11-21).
 
 **Role.** `services/detector` (slim), one process for all channels, `CLIPPER_DETECTOR_MODE` =
 `live|offline|all`. Writer of `candidates`, `chat_delay_estimates` (new), its own `media_requests`
@@ -1663,9 +1694,13 @@ No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
 ## 19. Judge (phase 2) — proposed 2026-11-19, not yet agreed
 
 **Status:** proposal (not yet agreed); build item 6a (contracts + migration 0005 +
-`clipper_core.lifecycle`) built 2026-11-20, not on the live DB yet; build item 6b (input builder
-+ resolver, pure) built 2026-11-21; the service (6c) not built. The service can be built now with a deterministic fake model; provider and model are the **user's decision** (cost),
-made with the eval harness (6d). Prompt, thresholds and clip lengths get tuned on real candidates.
+`clipper_core.lifecycle`) built 2026-11-20, on the live DB since 2026-11-21; build item 6b (input
+builder + resolver, pure) built 2026-11-21; the service (6c) not built. The service can be built
+now with a deterministic fake model. **Decided by the user (2026-11-21):** the first real model
+runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
+**usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
+guard"). The model, the usage limits and the budgets are still the user's to choose (eval, 6d).
+Prompt, thresholds and clip lengths get tuned on real candidates.
 
 **Ownership (§19–§22; replaces §8's "later" rows once agreed).** One writer per table; `jobs` is
 shared (anyone enqueues). §7's state is never stored: one helper, `clipper_core.lifecycle`, derives it.
@@ -1695,7 +1730,7 @@ planned` + `failed`; the rest of §7 comes from §20–§22's tables, and §7 ga
    clock) with nothing pending in the core `[moment_from − 5 s, moment_to + 5 s]` (flag
    `partial_context`); or past the **hard deadline** (+30 min) with any of the core transcribed
    (else `rejected`/`no_media`). Stream end: `coverage()` makes time after the last chunk a gap.
-4. Compare-and-set `waiting_for_media → judging` (same round), commit; input, cost guard, cache, call,
+4. Compare-and-set `waiting_for_media → judging` (same round), commit; input, usage guard, cache, call,
    resolve + repair; then **one transaction**: `clip_plans` row, clip status, `mark_fulfilled` of the
    clip's own media requests (the judge's rows, `clip_id` = the clip; never the detector's, which
    its own sweep fulfils) and, for `clip`, the `render` job (`dedupe_key(RENDER, plan_id)`; off with
@@ -1711,7 +1746,7 @@ round's schema has no `need_context`. Each round is a `clip_plans` row (analytic
 `base_plan_id` isn't the clip's latest plan or the video is gone (chunk video and the render's ±30 s
 pins). A `PlanPatch` goes through the resolver (`author = operator`; a time with no word nearby stays,
 repair `unsnapped`); an `instruction` is one model call on the plan + the same input (`author =
-judge`; counted by the cost guard, never blocked). One transaction: `clip_plans` v+1 (`parent_id`,
+judge`; counted by the usage guard, never blocked). One transaction: `clip_plans` v+1 (`parent_id`,
 `review_event_id`, `instruction`), `clips.plan_version`, the `render` job; or `notify(REVISION_REFUSED)`.
 
 **LLM input** (stable order, no wall-clock values: cacheable, golden-file tested; seconds relative to
@@ -1750,6 +1785,79 @@ renderer, review and publisher read. **Resolve + repair** (pure; each change a c
 content, JSON schema, max tokens → JSON text, usage in/cached/out, latency, request id). Adapters:
 Anthropic (`output_config.format`), OpenAI (strict Structured Outputs), Ollama (`format` = schema),
 each stripping keywords its provider rejects. Fakes: `FakeJudgeModel` (rules), `ScriptedJudgeModel`.
+**First real adapter (decided 2026-11-21): `ClaudeCliModel`**, below; the API adapters come later
+if at all, behind the same protocol.
+
+**Claude Code CLI adapter (6d; decided by the user 2026-11-21, design proposed).** Each call runs
+one headless `claude -p` process on the user's subscription. Facts verified on 2026-11-21 with
+CLI 2.1.330 (`claude --help`, `claude auth status`, two tiny Haiku calls; the docs at
+code.claude.com: headless, cli-reference, authentication, legal-and-compliance):
+- **Invocation:** `claude -p --output-format stream-json --verbose --model <full id> --tools ""
+  --strict-mcp-config --no-session-persistence --max-turns 3 --system-prompt <prompts/vN/system.md>
+  --json-schema <JudgeAnswer schema>`, plus `--effort <level>` when set. The user content goes on
+  stdin: when stdin isn't redirected the CLI waits 3 s and warns "no stdin data received in 3s".
+  The working dir is an empty temp dir, so no project `CLAUDE.md` is read. No `--fallback-model`,
+  because a silent model switch would change verdicts. The `--system-prompt` replaces Claude Code's
+  default prompt: measured ~3.9k input tokens with the default prompt and no tools, ~1.3k with ours
+  and the schema. The CLI has no max-tokens flag, so `JudgeRequest.max_tokens` is unused here.
+- **Output (verified):** one JSON object per line. `system`/`init` has `model`, `tools`,
+  `mcp_servers`, `apiKeySource` (`"none"` on a subscription login) and `claude_code_version`.
+  `--json-schema` works through a built-in `StructuredOutput` tool, so a run takes **2 turns**
+  (hence `--max-turns 3`). `rate_limit_event` → `rate_limit_info`: `status` (`allowed`),
+  `rateLimitType` (`five_hour`), `resetsAt` (epoch s), `isUsingOverage`, `overageStatus`,
+  `unifiedWindows.five_hour|seven_day.{utilization 0–1, resetsAt, status}`. This event comes only in
+  `stream-json`, not in `--output-format json`. The last line, `type: "result"`, has `subtype`
+  (`success`), `is_error`, `num_turns`, `result` (text), **`structured_output`** (the validated
+  object; missing when the run ended without one, per the docs), `usage` (`input_tokens`,
+  `cache_creation_input_tokens`, `cache_read_input_tokens`, `output_tokens`), `modelUsage` per
+  model, `total_cost_usd`, `duration_ms`, `duration_api_ms`, `stop_reason`, `terminal_reason`,
+  `api_error_status`, `credential_expires_at`, `permission_denials`. Its `total_cost_usd` and
+  `modelUsage.*.costUSD` are list-price estimates (`costBasis: "list"`), not charges: they go into
+  `judge_calls.cost_usd` for comparison only. The docs also name `system`/`api_retry` (`error`
+  such as `rate_limit`, `attempt`, `retry_delay_ms`). A run without `structured_output` counts as
+  invalid JSON (the resolver's one retry).
+- **Mapping:** `JudgeResponse` text = `json.dumps(structured_output)`, usage in/cached/out from
+  `usage`, latency `duration_ms`, request id = `session_id`. `request_hash` options include the
+  model and effort. The CLI version, the init event and the rate-limit info go into the call's S3
+  record, not the hash, so a CLI update doesn't re-judge anything.
+- **Process:** a per-call timeout (`claude_timeout_s`, 180 s), after which the process tree is
+  killed and the call row records an error. `CLAUDE_CODE_MAX_RETRIES` is low (2), so the job
+  queue does the waiting. Never set `CLAUDE_CODE_RETRY_WATCHDOG`, which would hold a worker until
+  a usage limit resets. Concurrency 1 (one process at a time keeps the usage reading current).
+  `--max-budget-usd` (also a list-price estimate) only caps a runaway run, e.g. at 0.50.
+- **Auth:**
+  - **Precedence (docs):** cloud-provider env > `ANTHROPIC_AUTH_TOKEN` > `ANTHROPIC_API_KEY` >
+    `apiKeyHelper` > `CLAUDE_CODE_OAUTH_TOKEN` > profile credentials > the `/login` session. In
+    `-p` an API key is always used when present, which would silently bill the API instead of the
+    plan. So the adapter builds the child's environment from scratch: `PATH`, a writable
+    `HOME`/`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN` and the retry setting. Nothing
+    `ANTHROPIC_*` or `CLAUDE_CODE_*` is inherited (a run started from a Claude Code terminal
+    would otherwise pass that session's variables on).
+  - **Guards:** at start, `claude auth status` with that environment must report `authMethod`
+    `oauth_token` (or `claude.ai` natively), else the service refuses to judge and sends a notice.
+    The init event's `apiKeySource` must be `none` on every call, else the process is killed and
+    the job fails permanently. `--bare` can't be used: it never reads `CLAUDE_CODE_OAUTH_TOKEN`
+    (docs).
+  - **Container:** the judge image installs a pinned CLI version. The user runs `claude
+    setup-token` once on the PC (browser login; it prints a one-year token that "can only make
+    model requests" and isn't saved anywhere) and puts it in `.env` as
+    `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`. `credential_expires_at` from each result drives a
+    heartbeat warning and a notice 14 days before expiry.
+  - **Natively** (dev PC, the CLI is installed and logged in with `authMethod` `claude.ai`):
+    the same token and a separate `CLAUDE_CONFIG_DIR`, so the service never touches the user's own
+    sessions or config. Falls back to the user's login only when no token is set (`loginExpiresAt`
+    is ~2 weeks, renewed by interactive use).
+- **Terms (docs, for the user):** the legal page says subscription OAuth is "designed to support
+  ordinary use of Claude Code", and that products serving other people should use API keys
+  ("route requests through Free, Pro, Max, or Ultra plan credentials on behalf of their users" is
+  not permitted). The judge serves only the user, on the user's own plan; if that ever changes,
+  switch to an API adapter.
+- **To verify in 6d:** whether an empty `--setting-sources` or a fresh `CLAUDE_CONFIG_DIR` keeps
+  user hooks/settings out without a first-run prompt; `apiKeySource` with the token; the `-p`
+  output when a usage limit is hit (not documented; it can't be provoked cheaply, so it gets
+  handled generically: `is_error` or `api_error_status` 429 → defer); the other values of
+  `rate_limit_info.status`; the install method and size in the image; `--system-prompt-file` (named
+  in `--help`'s `--bare` text) to keep prompts out of argv.
 
 **Provider options** (user's pick; per clip at ~4k uncached + 3k cached input, 1–3k output incl.
 reasoning; list prices 2026-11-19, verify; a context round adds ~50 %):
@@ -1764,18 +1872,36 @@ reasoning; list prices 2026-11-19, verify; a context round adds ~50 %):
 
 ~200 calls/day (60 stream-hours × ~3) ≈ $12/day Opus, $6 Sonnet, < $1 Haiku/nano (§18's caps: ≤ ~5×).
 Batch APIs (−50 %, hours) suit only backfill; a cascade (small screens, large plans) is to be measured.
+On the CLI adapter (decided 2026-11-21) these dollars only compare models (list-price estimates):
+what limits the judge is the plan's usage windows (usage guard below).
 
 **Cache, idempotency, cost.**
 - **`judge_calls`** row per call: `request_hash` = sha256(model, prompt version, schema version,
   rendered request), usage, `cost_usd` (price table in settings), latency, answer or error; full I/O
   in S3. Committed **alone, right after the call**: a crash or retry reuses the paid answer. Unique:
   clip per candidate, plan version per clip, render job per plan, waiter job per round.
-- **Cost guard** on top of §18's candidate budget: estimated cost per call vs
-  `budget_usd_per_stream_hour` (rolling 60 min) and `daily_usd`; over the stream budget only candidates
-  above that hour's median score proceed, over the daily cap `rejected`/`budget` + heartbeat warning.
+- **Usage guard** (decided 2026-11-21; replaces the USD cost guard of this draft), on top of §18's
+  candidate budget. It keeps the judge from using up the user's plan limits, which the judge
+  shares with the user's own Claude use. Inputs: the last `rate_limit_event` (five-hour and
+  seven-day `utilization`, `resetsAt`, `status`; kept in memory and in the heartbeat) and local
+  call counts (rolling 60 min per stream, UTC day).
+  - **Before a call:** if the last reading has `five_hour ≥ usage_five_hour_max` or `seven_day ≥
+    usage_seven_day_max` (proposed 0.5 / 0.5; the user's call) or a `status` other than `allowed`,
+    the clip waits: its judge job is deferred to `min(resetsAt, hard deadline)`.
+  - **At the hard deadline** the clip becomes `rejected`/`budget`.
+  - **Call caps:** over `calls_per_stream_hour`, only candidates above that hour's median score
+    proceed; over `calls_per_day`, `rejected`/`budget` and a heartbeat warning.
+  - **Stale readings:** a reading older than `usage_stale_s` (15 min; the user may have used Claude
+    since) lets one call through to refresh it.
+  - **Errors:** a call that fails with a rate or usage limit defers to `resetsAt` (else 15 min)
+    and writes an error row with 0 usage.
+  - **Operator revisions** are counted but never blocked by our caps (a human is waiting); only the
+    platform's own limit stops them, and then a notice says so.
+  - Settings: `usage_five_hour_max`, `usage_seven_day_max`, `usage_stale_s`,
+    `calls_per_stream_hour`, `calls_per_day` (the USD settings stay for a future API adapter).
 - **Prompt versions** `v{N}-{sha8}` (`clipper_judge/prompts/v{N}/`, schema from `JudgeAnswer`; in the
   hash, every plan, the heartbeat; stable text first). **Shadow runs** (`CLIPPER_JUDGE_SHADOW`): extra
-  model/prompt pairs on the same input, `shadow = true`, never rendered, inside the cost guard.
+  model/prompt pairs on the same input, `shadow = true`, never rendered, inside the usage guard.
 
 **Analytics later.** Plans + calls join `review_events` and `publication_stats` by `clip_id`: approval
 rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + `viewer_clips` + labels.
@@ -1799,7 +1925,7 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
    - **§21's code-only contract, the part judge and renderer need**, is in now: `JobKind.REVIEW`,
      `REVISE_PLAN`, `NOTIFY`, `NoticeKind` (`revision_refused`, `render_failed`), `PlanPatch`,
      `ReviewPayload`, `RevisePlanPayload`, `NotifyPayload`. Left for 21a: `ReviewStatus`,
-     `ReviewAction`, `ReviewLabel`, `PostMetadata`, `REVIEW_TELEGRAM_LEASE`; `STALE_AFTER` for
+     `ReviewAction`, `ReviewLabel`, `PostMetadata`, `REVIEW_DISCORD_LEASE` (was Telegram's); `STALE_AFTER` for
      `render`/`review`/`notify` comes with 7a/21a.
    - **`EditPlan` validator details**: points (emphasis, word fixes, SFX, thumbnail) lie in a
      segment's half-open `[start, end)`; zooms and a teaser lie inside *one* segment; segments
@@ -1935,8 +2061,13 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
    NOTIFY → `planned` + render job in one transaction; `need_context` → `request_media(100)` bumps
    queued transcribe jobs, round 2 must decide; crash between call and commit → no second call;
    soft/hard deadlines; budget → `rejected`/`budget`; a patch → v+1 + render job, a stale base refused.
-4. **6d Real adapters + `clipper-judge eval`** (user's choice, keys, spend). *Done:* ≥ 50 labelled
-   candidates through 2–3 models (agreement, repairs/clip, p50/p95 latency, $/clip); the user picks.
+4. **6d `ClaudeCliModel` + usage guard + `clipper-judge eval`** (decided 2026-11-21: Claude Code CLI on
+   the user's subscription; needs the user's `claude setup-token` token for the container, the model
+   and the usage limits). *Done:* contract tests on a fake `claude` executable (recorded stream-json
+   lines: success, no `structured_output`, `is_error`, 429, timeout, wrong `apiKeySource`); the
+   child environment carries no `ANTHROPIC_*`; the guard defers at the caps and lets a stale reading
+   refresh; the "to verify" points of the adapter checked by hand; ≥ 50 labelled candidates through
+   2–3 Claude models (agreement, repairs/clip, p50/p95 latency, usage per clip); the user picks.
 
 ### Proposed decision-log rows
 
@@ -1947,9 +2078,9 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
 | 2026-11-19 | Deadlines: soft 4 min after the context end (judge with what exists if the core moment is covered), hard 30 min; stream end handled by `coverage()` | campaigns reward speed; a busy GPU must not hold clips forever |
 | 2026-11-19 | Context extension: ≤ T − 10 min / T + 2 min, ≤ 2 extensions (≤ 3 calls), the last round's schema can't ask again; `request_media(JUDGE_CONTEXT)` in the round's transaction | bounded cost and latency; §6 priorities do the rest |
 | 2026-11-19 | The model answers in a judge-internal `JudgeAnswer` (seconds relative to T, sentence ids); deterministic code resolves it into the versioned `EditPlan` (UTC, snapped to words, clamped to video) in libs/core | prompts change often, the renderer contract rarely; LLM times are never trusted raw |
-| 2026-11-19 | LLM behind a `JudgeModel` Protocol (Anthropic, OpenAI, Ollama adapters, deterministic fake); provider and model chosen by the user from `clipper-judge eval` numbers | cost is the user's call; the service and tests don't depend on a provider |
+| 2026-11-19 | LLM behind a `JudgeModel` Protocol (Anthropic, OpenAI, Ollama adapters, deterministic fake); provider and model chosen by the user from `clipper-judge eval` numbers | cost is the user's call; the service and tests don't depend on a provider; **first real adapter: the Claude Code CLI on the user's subscription (decided 2026-11-21, §15)** |
 | 2026-11-19 | Every call is logged in `judge_calls` with a request hash and committed right after the call; retries reuse it | crash-safe, never pay twice; cost and latency data for analytics |
-| 2026-11-19 | Cost guard in USD per stream-hour and per day, on top of §18's candidate budget; operator revisions are counted but never blocked | token counts vary with context rounds; a candidate cap alone doesn't bound spend; a human is waiting |
+| 2026-11-19 | ~~Cost guard in USD~~ **superseded 2026-11-21 by the usage guard (plan utilization + call caps, §15)**: cost guard in USD per stream-hour and per day, on top of §18's candidate budget; operator revisions are counted but never blocked | token counts vary with context rounds; a candidate cap alone doesn't bound spend; a human is waiting |
 | 2026-11-19 | Judge input is text only in v1 (transcript, chat per 5 s, audio events, meta); frames deferred | cheap, works with every provider; add frames when the eval shows misses |
 | 2026-11-19 | Clips without video (audio_only) are rejected as `no_video` without an LLM call unless `judge_audio_only` | they can't be rendered (§20); spend only where output is possible |
 | 2026-11-19 | The judge enqueues the `render` job in the plan's transaction (first plans and revisions) | jobs are enqueued with their data (rule); no extra wake-up channel |
@@ -1981,7 +2112,7 @@ class ClipRejectReason(StrEnum):  # clips.reject_reason (review's labels: Review
     MODEL = "model"  # the model said no
     NO_VIDEO = "no_video"  # nothing renderable; no LLM call
     NO_MEDIA = "no_media"  # hard deadline passed without a transcribed core
-    BUDGET = "budget"  # cost guard
+    BUDGET = "budget"  # usage guard (was: cost guard)
 
 class Verdict(StrEnum):
     CLIP = "clip"
@@ -2167,9 +2298,12 @@ soon as their migrations ran (7a, 21a, 22a only add tests against the real table
 kept for evals and prompt work).
 
 **Outside core.** `services/judge` (`CLIPPER_JUDGE_*`: provider, model, api key `SecretStr`, prices
-per 1M, `budget_usd_per_stream_hour`, `daily_usd`, `soft_wait_s` 240, `hard_wait_s` 1800,
+per 1M, `budget_usd_per_stream_hour`, `daily_usd` (for a later API adapter); CLI adapter (6d):
+`claude_path`, `claude_oauth_token` `SecretStr` (from `claude setup-token`), `claude_model`, `claude_effort`,
+`claude_timeout_s` 180, `claude_max_budget_usd` 0.50; usage guard: `usage_five_hour_max`,
+`usage_seven_day_max`, `usage_stale_s` 900, `calls_per_stream_hour`, `calls_per_day`; `soft_wait_s` 240, `hard_wait_s` 1800,
 `max_rounds` 2, `max_before_s` 600, `max_after_s` 120, `min_clip_s` 10, `max_clip_s` 60,
-`judge_audio_only` false, `render_jobs` true, `shadow`, `concurrency` 4); compose service (assets
+`judge_audio_only` false, `render_jobs` true, `shadow`, `concurrency` 4, 1 for the CLI adapter); compose service (assets
 volume read-only, for the SFX tag list); controller `STALE_AFTER[JUDGE] = 10 min` (§18),
 `STALE_AFTER[REVISE_PLAN] = 10 min`. (Built in 6b: the filters below are in `clipper_core.chat`.) The judge reads chat through §17's `clipper_core.chat` and the
 detector's filter helpers (bots, commands, dup normalisation), moved there so both read chat alike.
@@ -2212,7 +2346,8 @@ or jellyfin-ffmpeg; URL + sha256) + bundled OFL fonts; compose reserves the GPU 
 6. **Encode**, one ffmpeg run, two outputs: `clip.mp4` 1080×1920 at source fps (≤ 60), H.264 High,
    `h264_nvenc` (p5, VBR ~8 Mbps / max 12, 2 s GOP) or `libx264` (`medium`, CRF 20) by
    `CLIPPER_RENDERER_ENCODER=auto|nvenc|x264` (`auto` falls back when NVENC init fails);
-   `preview.mp4` 540×960, ~1.5 Mbps capped so the file stays ≤ 20 MB (Telegram bots upload ≤ 50 MB);
+   `preview.mp4` 540×960, ~1.5 Mbps capped so the file stays ≤ 19 MB (Discord's default upload limit
+   is 20 MiB per file, checked 2026-11-21, §21; a 60 s preview is ~12 MB);
    AAC 48 kHz 192 kbps, `+faststart`. Then `thumb.jpg` (at `plan.thumbnail_utc`, else the hook
    start), `captions.ass`, `render.json` (`RenderManifest`).
 7. Upload to `storage.keys.render_file(clip_id, render_id, name)`; **one transaction**: the `renders`
@@ -2308,7 +2443,7 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
 | 2026-11-19 | SFX/music only from a user-supplied local library with a manifest (sha256 + licence + platforms), checked by `assets check`; deterministic choice by hash | §2: licensed audio only, provable per render |
 | 2026-11-19 | Loudness: two-pass `loudnorm`, −14 LUFS, −1 dBTP | platform normalisation targets for shorts; two-pass is deterministic |
 | 2026-11-19 | Reproducibility = `graph_hash` over plan, inputs, layout config, assets, fonts and versions; byte-identical only with x264 | NVENC output may differ across drivers; the graph is what we control |
-| 2026-11-19 | Each render writes final 1080×1920 (+ sha256), a 540×960 preview ≤ 20 MB, thumbnail, ASS and a manifest | the phone review needs a small file; the publisher checks the upload; the manifest makes renders auditable |
+| 2026-11-19 | Each render writes final 1080×1920 (+ sha256), a 540×960 preview ≤ 19 MB (Discord's 20 MiB upload; was 20 MB for Telegram), thumbnail, ASS and a manifest | the phone review needs a small file; the publisher checks the upload; the manifest makes renders auditable |
 | 2026-11-19 | audio_only channels are not rendered in v1 | no video; an audio-only format is a later product decision |
 
 ### Contract changes
@@ -2408,15 +2543,19 @@ a clip pins the chunks it uses (`clips/{id}/pinned/`)".
 
 ## 21. Review (phase 2) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal, nothing built. All of it can be built and tested with fakes, no credentials;
-the real bot needs the user's bot token and Telegram user id, remote web access needs Tailscale.
-Depends on the *contracts* of §19 and §20 (0005/0006), not on their services.
+**Status:** proposal, nothing built. **Decided by the user (2026-11-21): Discord instead of
+Telegram**: a bot posts each clip with buttons (approve / reject / edit), the web UI stays for
+detailed edits. This section was reworked for Discord on 2026-11-21 (the rest of the design is
+unchanged). All of it can be built and tested with fakes, no credentials; the real bot needs the
+user's Discord application (bot token), a private server + review channel and the user's Discord
+user id; remote web access needs Tailscale. Depends on the *contracts* of §19 and §20 (0005/0006),
+not on their services.
 
-**Role.** `services/review` (slim), one process: Telegram bot (long polling), web UI (FastAPI on
+**Role.** `services/review` (slim), one process: Discord bot (Gateway websocket), web UI (FastAPI on
 127.0.0.1:8080), `jobs.JobRunner` for `review` (from the renderer) and `notify` (from anyone) jobs,
 a 30 s sweep (deadlines, reminders). Writer of `clip_reviews`, `review_events` (new); enqueues
 `revise_plan`, `render` (re-render), `publish`, `publication_action`; never writes `clips`,
-`clip_plans`, `renders`, `publications`. The only service that talks to Telegram.
+`clip_plans`, `renders`, `publications`. The only service that talks to Discord.
 **Reads:** `clips` (+ the candidate's score and moment type), the shown render's plan (`EditPlan`:
 title, hashtags, `reasons[0]`), `renders` (`preview_key`, `thumb_key`, `duration_s`,
 `preview_bytes`), `audio_metrics_1s` (music share), `words()`, and §22's `publish_routes`,
@@ -2424,12 +2563,12 @@ title, hashtags, `reasons[0]`), `renders` (`preview_key`, `thumb_key`, `duration
 
 **Review state.** `clip_reviews`, one row per clip (made by its first `review` job): `status`
 `pending | revising | approved | rejected | expired | withdrawn`, the render shown, `deadline`,
-metadata overrides, labels, Telegram message ids. `review_events`, append-only audit: who
-(`telegram:<user id>`, `web:<name>`, `system`), when, what (action, labels, note, the render the
+metadata overrides, labels, Discord message ids. `review_events`, append-only audit: who
+(`discord:<user id>`, `web:<name>`, `system`), when, what (action, labels, note, the render the
 actor saw; `details`: patch, instruction, metadata before → after, targets). An action is one
 transaction: lock the row, check the transition and that the actor saw the current render (stale
-buttons are refused), insert the event, update the row, enqueue jobs. `external_id` (Telegram
-callback/message id, web form token) is unique: redeliveries and double taps do nothing.
+buttons are refused), insert the event, update the row, enqueue jobs. `external_id` (Discord
+interaction id, web form token) is unique: double taps and replays do nothing.
 
 **Actions.**
 - **Approve** (`pending`): one `publish` job per selected route (§22; pre-selected: routes with
@@ -2445,8 +2584,8 @@ callback/message id, web form token) is unique: redeliveries and double taps do 
   3 s earlier, punchier hook"); status `revising`; a `revise_plan` job (ref = event, dedupe
   `revise_plan:{event}`, priority `JUDGE_CONTEXT`: a human waits). The judge (§19) writes
   `clip_plans` v+1 + the `render` job; the new render's `review` job makes the clip `pending` again
-  (Telegram replaces the message's media). `notify(REVISION_REFUSED | RENDER_FAILED)` → `pending`
-  on the previous render, with the reason.
+  (the bot posts the new preview as a reply and strips the old message's buttons).
+  `notify(REVISION_REFUSED | RENDER_FAILED)` → `pending` on the previous render, with the reason.
 - **Re-render** (same plan, glitch): a `render` job, `dedupe_key(RENDER, plan_id, f"e{event_id}")`.
   **Withdraw** (after approve): `publication_action(delete)` per live post; publish jobs not started
   yet cancel themselves (§22). **Reopen** (expired/rejected → `pending`, +30 min; ≤ 7 days, while
@@ -2458,19 +2597,53 @@ of the clip's routes (campaign speed; default 2 h, also without routes), capped 
 15 min before (edits don't ring); at the deadline the sweep writes `expire` (actor `system`) and
 removes the buttons. Quiet hours are UTC (`CLIPPER_REVIEW_QUIET_UTC=23:00-07:00`), mute only.
 
-**Telegram bot.** Own minimal Bot API client on httpx (~10 methods, like our IRC/Helix clients). Long
-polling (`getUpdates`, 50 s), no webhook: no public endpoint on the home PC. One poller (lease
-`review:telegram`). Updates left unconfirmed by a crash come again and are dropped by `external_id`.
-- **Auth**: only `CLIPPER_REVIEW_TELEGRAM_USER_IDS` (numeric) are served; others are logged with their
-  id (the user finds theirs by sending `/start`). Messages go to `CLIPPER_REVIEW_TELEGRAM_CHAT_ID`.
-- **Clip message**: `sendVideo` (the render's `preview.mp4`, ≤ 20 MB, `supports_streaming`, `file_id`
-  kept) + caption ≤ 1024 chars: channel, moment type, length, score, title, the judge's one-line
-  reason, music share (Content ID risk), deadline, web link. Buttons ✅ Approve · ❌ Reject · ✏️ Title
-  · 🔁 Change · 🌐 Web; callback data (≤ 64 bytes) = action + render id (`ap:5812`). Reject opens the
-  labels; Title/Change ask via `ForceReply` (Change also offers ±3 s start/end buttons as patches);
-  TikTok targets add its privacy choice + consent (§22).
-- `/queue`, `/login` (web magic link), `/mute 2h`. After a decision all the clip's messages are edited
-  ("✅ by web 12:03", buttons gone). ≤ 1 message/s per chat; 429 `retry_after` honoured.
+**Discord bot** (reworked 2026-11-21; facts from Discord's developer docs and the Attachments FAQ,
+checked 2026-11-21). A private server (guild) the user owns, one review channel, the bot as its
+only other member. Own minimal client on httpx + a websocket library: REST (create/edit message
+with attachments and components, interaction responses, followups) and the Gateway (Hello →
+heartbeat, Identify, Resume with session id + sequence, `INTERACTION_CREATE`), ~15 methods, like
+our IRC/Helix clients, behind a `DiscordApi` protocol (discord.py could replace it behind the same
+protocol if Gateway edge cases bite). No public endpoint on the home PC: interactions arrive over the
+Gateway (mutually exclusive with an HTTP interactions URL), and responses go back over REST. No
+privileged intents: all input comes from buttons, select menus, modals and slash commands, never
+from message text (no `MESSAGE_CONTENT`). One Gateway connection (lease `review:discord`).
+- **Auth**: only `CLIPPER_REVIEW_DISCORD_USER_IDS` (snowflakes) may act; anyone else gets an
+  ephemeral "not allowed" and is logged with their id. Messages go to
+  `CLIPPER_REVIEW_DISCORD_CHANNEL_ID` in `CLIPPER_REVIEW_DISCORD_GUILD_ID` (slash commands are
+  registered for that guild only). Bot permissions: View Channel, Send Messages, Attach Files, Embed
+  Links, Read Message History (scopes `bot` + `applications.commands`).
+- **Interaction deadlines** (docs): the first response within **3 s**, else the user sees "This
+  interaction failed"; the interaction token then works for followups for **15 min**. A button is
+  acknowledged at once (deferred update), then the action's transaction runs, then the message is
+  edited. A modal must be the first response, so Title/Change/Reject note open their modal without
+  touching the DB, and the submit is a new interaction. Interactions are not redelivered: one lost
+  during a Gateway reconnect fails visibly and the user taps again (no state changed), and stale
+  buttons are refused by render id.
+- **Clip message**: `preview.mp4` as an attachment, plus an embed with channel, moment type,
+  length, score, title, the judge's one-line reason, music share (Content ID risk), deadline and a
+  web link. Buttons (≤ 5 per row; `custom_id` ≤ 100 chars = action + render id, e.g. `ap:5812`):
+  ✅ Approve · ❌ Reject · ✏️ Title · 🔁 Change · 🌐 Web (a link button to the web UI).
+  - **Reject**: a multi-select of the `ReviewLabel`s (≤ 25 options; there are 18) + a "note"
+    button (modal).
+  - **Title**: a modal with title, description and hashtags (≤ 5 inputs, ≤ 4000 chars each).
+  - **Change**: a modal with the free-text instruction, plus an ephemeral row of ±3 s start/end
+    buttons sent as patches.
+  - Publish targets that need a choice (TikTok privacy + consent, §22) add a select.
+- **Upload limit and preview**: the default upload limit is **20 MiB per file for all users**
+  (bots included; the Attachments FAQ says it was raised from 10 MB in August 2026), more only at
+  higher server boost tiers (reportedly 50 MB at tier 2 and 100 MB at tier 3; not in the developer
+  docs). The request limit is ~25 MiB. §20's preview (540×960, ~1.5 Mbps, ≤ 19 MB; a 60 s clip ≈
+  12 MB) fits, so no extra preview render is needed. The limit is a setting
+  (`CLIPPER_REVIEW_DISCORD_MAX_UPLOAD_MB`, 19). A larger preview, or a 413 / error 40005 ("Request
+  entity too large"), falls back to the thumbnail + the web link, which plays the preview through
+  the Range proxy.
+  - Attachment CDN URLs are signed and expire (`ex`/`is`/`hm`), so we store message and attachment
+    ids, never URLs.
+  - Whether an attached mp4 plays inline in the phone app isn't documented; it gets checked by hand
+    in 21c.
+- Slash commands `/queue`, `/login` (an ephemeral web magic link), `/mute 2h`. After a decision the
+  clip's message is edited ("✅ by web 12:03", buttons gone). Rate limits: per-route buckets
+  (`X-RateLimit-*` headers), 429 `retry_after` honoured, ≤ 1 message edit/s in the channel.
 
 **Web UI.** FastAPI + Jinja2 + htmx (vendored, no build step), calling the bot's action functions.
 - **Pages**: queue (by deadline); clip (player, thumbnail, plan, metadata, history, publications and
@@ -2481,7 +2654,7 @@ polling (`getUpdates`, 50 s), no webhook: no public endpoint on the home PC. One
 - **Media** is streamed by the service with HTTP Range (SeaweedFS on 127.0.0.1 isn't reachable from
   the phone); presigned URLs once storage is R2 (`CLIPPER_REVIEW_MEDIA=proxy|presigned`).
 - **Auth**: 127.0.0.1 only, remote via **Tailscale Serve** (tailnet-only HTTPS, never Funnel).
-  Password (argon2id hash in env) or a one-time `/login` link (5 min). Signed session cookie
+  Password (argon2id hash in env) or a one-time `/login` link from the bot (5 min). Signed session cookie
   (HttpOnly, Secure, SameSite=Strict, 14 days) + a CSRF token on POSTs. A `reviewers` table later.
 
 **Feedback labels** (`contracts.ReviewLabel`; no DB CHECK, it grows): detector `not_a_moment`,
@@ -2490,12 +2663,15 @@ polling (`getUpdates`, 50 s), no webhook: no public endpoint on the home PC. One
 `sensitive`, `no_rights`; `too_late`, `other`; `great` on approve. Operator edits are signal too
 (`clip_plans` with `author = 'operator'` vs the judge's first plan).
 
-**Interfaces and tests.** `TelegramApi` Protocol: real httpx client; `FakeTelegram` records sends,
-injects updates, simulates 429 and "message is not modified". `MediaSource` (S3 ranges; fake dict),
+**Interfaces and tests.** `DiscordApi` Protocol: the real REST + Gateway client; `FakeDiscord` records
+sends and edits, injects interactions (buttons, selects, modal submits, slash commands), simulates 429,
+a late acknowledgement (> 3 s), "Unknown interaction" (10062), 413/40005 on a large file and a Gateway
+reconnect with resume. `MediaSource` (S3 ranges; fake dict),
 injected clock, fixture rows for judge/renderer output, FastAPI TestClient. No test sends a message.
 
-**Risks.** A leaked bot token lets someone pose as the bot but not act (allowlist): rotate it in
-BotFather. Previews sit on Telegram's servers (private chat). Telegram down → the web UI still works.
+**Risks.** A leaked bot token lets someone post as the bot but not act (the allowlist is checked in
+our code): reset it in the Discord developer portal. Previews sit on Discord's servers (a private
+server). Discord down → the web UI still works.
 
 **Build plan.**
 1. **21a Contracts + 0007 + lifecycle (review part).** *Done:* `test_migrations` passes; state
@@ -2503,8 +2679,10 @@ BotFather. Previews sit on Telegram's servers (private chat). Telegram down → 
 2. **21b Core**: actions, `review`/`notify` handlers, sweep. *Done:* approve → one `publish` job per
    route in the same transaction; concurrent approve/reject → one wins; stale render refused; revise →
    event + `revise_plan`; refused revision → `pending`; expiry and reopen.
-3. **21c Telegram**: client, poller + lease, messages, callbacks, ForceReply. *Done:* a FakeTelegram
-   test per flow; foreign user ignored; redelivered update → no second event; 429 obeyed.
+3. **21c Discord**: REST + Gateway client, lease, messages, buttons, selects, modals, slash commands.
+   *Done:* a FakeDiscord test per flow; foreign user refused (ephemeral); a repeated interaction id →
+   no second event; ack within 3 s even when the DB is slow; 429 obeyed; an oversize preview →
+   thumbnail + link; checked by hand in the user's server on a phone (inline video playback).
 4. **21d Web UI**: login, queue, clip page, word picker, edits, Range proxy. *Done:* TestClient: no
    session → login, no CSRF → 403, edit → event + job, Range → 206; checked by hand on a phone.
 
@@ -2515,8 +2693,9 @@ BotFather. Previews sit on Telegram's servers (private chat). Telegram down → 
 | 2026-11-19 | Review state in review-owned `clip_reviews` (one row per clip) + append-only `review_events` (who/when/what); §7's later states are derived by §19's `lifecycle.lifecycle_state()` | one writer per table; the audit trail is complete and never rewritten |
 | 2026-11-19 | Review never writes plans: a change is stored as an event (`PlanPatch` or free-text instruction) and sent as a `revise_plan` job; the judge resolves it, writes the new `clip_plans` version (`author`, `parent_id`) and the render job, or refuses via `notify` | one writer for plans; validation (word snapping, video) and the LLM live in one place |
 | 2026-11-19 | Post title/description/hashtag edits are review overrides (`clip_reviews.post_metadata`), no new plan or render; the burned-in title band changes only by a revision | metadata isn't in the video; a re-render would cost a minute for nothing |
-| 2026-11-19 | Only review talks to Telegram; the other services send `notify` jobs (`dedupe_key(NOTIFY, ref_id, kind)`) | one place holds the bot token; durable, deduped notices |
-| 2026-11-19 | Telegram: own minimal Bot API client (httpx), long polling, one instance (lease), user-id allowlist, buttons carry the render id, updates deduped by id | no public endpoint on the home PC; stale buttons and redeliveries are harmless; fakeable |
+| 2026-11-19 | Only review talks to the messenger (Discord since 2026-11-21); the other services send `notify` jobs (`dedupe_key(NOTIFY, ref_id, kind)`) | one place holds the bot token; durable, deduped notices |
+| 2026-11-21 | Discord (the user's choice, §15): own minimal REST + Gateway client behind `DiscordApi`, interactions over the Gateway (no public endpoint), no privileged intents, one connection (lease `review:discord`), user-id allowlist, buttons/selects/modals carry the render id, interactions deduped by id, ack within 3 s then act | no public endpoint on the home PC; stale buttons and replays are harmless; fakeable |
+| 2026-11-21 | The review message attaches §20's preview (≤ 19 MB, under Discord's 20 MiB default upload limit); larger → thumbnail + web link; no extra preview render | a 60 s preview at ~1.5 Mbps is ~12 MB; Discord changed its limit in 2026 before, so it's a setting |
 | 2026-11-19 | Web UI: FastAPI + Jinja2 + htmx, bound to 127.0.0.1, remote via Tailscale Serve only; password or bot magic link, signed cookie, CSRF | no build step; never on the public internet; one operator now |
 | 2026-11-19 | In/out edits by clicking transcript words (`transcripts.words()`) within the render's ±30 s pin margin | sentence-accurate cuts on a phone; re-renders work after chunk video expires |
 | 2026-11-19 | Review deadline per clip from the routes' `review_window_s` (default 2 h), capped at moment + 12 h; expired = discarded, reopenable for 7 days; quiet hours (UTC) only mute | campaigns reward speed; a stale clip should not block the queue |
@@ -2595,7 +2774,7 @@ class NotifyPayload(Payload):
     publication_id: int | None = None
     severity: Literal["info", "warning", "error"] = "info"
 
-REVIEW_TELEGRAM_LEASE = "review:telegram"  # the single getUpdates poller
+REVIEW_DISCORD_LEASE = "review:discord"  # the single Gateway connection
 ```
 Dedupe: `review:{render}`, `revise_plan:{event}`, `dedupe_key(NOTIFY, ref_id, kind)` (ref = the
 render, review event, publication or account; account notices add the UTC date as a part).
@@ -2606,7 +2785,7 @@ render, review event, publication or account; account notices add the UTC date a
   `render_id` FK renders null (the render shown); `deadline` timestamptz null; `first_shown_at`,
   `decided_at` timestamptz null; `decided_by` text null; `post_metadata` jsonb default '{}'
   (`PostMetadata` overrides; not `metadata`, which SQLAlchemy reserves); `labels` jsonb default '[]';
-  `telegram` jsonb default '{}' (`chat_id`, `message_ids`, `file_id`, open `ForceReply` prompts);
+  `discord` jsonb default '{}' (`channel_id`, `message_ids`, `attachment_id`);
   `created_at`, `updated_at`. INDEX (`status`, `deadline`).
 - **`ReviewEvent`** (`review_events`), writer: review, append-only. `id` bigint PK; `clip_id` FK
   clips; `action` text (no CHECK: `ReviewAction` grows); `actor` text; `render_id` FK renders null;
@@ -2620,17 +2799,21 @@ against the real table.
 
 **Outside core**: controller `STALE_AFTER` += `REVIEW: 5 min`, `NOTIFY: 5 min` (`REVISE_PLAN` with
 §19); `services/review` (pyproject, Dockerfile, workspace member), compose `review` with
-`127.0.0.1:8080:8080`; `.env.example`: `CLIPPER_REVIEW_TELEGRAM_BOT_TOKEN`, `_TELEGRAM_USER_IDS`,
-`_TELEGRAM_CHAT_ID`, `_WEB_PASSWORD_HASH`, `_SESSION_SECRET`, `_PUBLIC_URL`, `_QUIET_UTC`, `_MEDIA`,
-`_PUBLISH_JOBS`.
+`127.0.0.1:8080:8080`; `.env.example`: `CLIPPER_REVIEW_DISCORD_BOT_TOKEN`, `_DISCORD_APPLICATION_ID`,
+`_DISCORD_GUILD_ID`, `_DISCORD_CHANNEL_ID`, `_DISCORD_USER_IDS`, `_DISCORD_MAX_UPLOAD_MB`,
+`_WEB_PASSWORD_HASH`, `_SESSION_SECRET`, `_PUBLIC_URL`, `_QUIET_UTC`, `_MEDIA`, `_PUBLISH_JOBS`.
 
 ---
 
 ## 22. Publisher (phase 2) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal. Pipeline, scheduler, token crypto and a fake platform can be built now. Real
-adapters wait for the user's §2 decision (platforms, accounts) and app credentials; TikTok and
-Instagram also for an approval. Platform facts re-checked 2026-11-19 (table): **§3 update proposed**.
+**Status:** proposal. Pipeline, scheduler, token crypto and a fake platform can be built now.
+**Decided by the user (2026-11-21):** the user decides what is published where and will provide
+the credentials and the upload method for each platform. So there is no rights model to design:
+a route is config the user fills in (channel → account, upload method, template, rules, caps, an
+optional note), and a clip without a route is never published. The real adapters wait for that
+input; TikTok and Instagram also need an approval. Platform facts re-checked 2026-11-19 (table):
+**§3 update proposed**.
 
 **Role.** `services/publisher` (slim), `jobs.JobRunner` for `publish`, `sync_publication`,
 `publication_action` (the first and last from review, §21), plus a daily token sweep. Writer of
@@ -2722,9 +2905,9 @@ expiry < 7 days (IG 60 d, TikTok refresh 365 d: UNVERIFIED); `invalid_grant` →
 (`http://127.0.0.1:<port>`); TikTok/Meta need a registered HTTPS redirect (the Tailscale HTTPS name,
 or paste the URL back).
 
-**Legal / ToS (brief).** Rights first (§2): **no route, no post**; each route records its basis
-(`streamer_account`, `campaign` + URL, `written_permission`); backfilled clips only if the user says
-so (§17). YouTube: one API project (extra projects to bypass quota break the ToS), more quota via the
+**Legal / ToS (brief).** **No route, no post** (§2). Routes are the user's config (decided
+2026-11-21): no rights-basis field, only an optional free-text `note`, and backfilled clips only if
+the user routes them. YouTube: one API project (extra projects to bypass quota break the ToS), more quota via the
 audit form; spam/repetitive content, "reused content" demonetisation. TikTok: the audit checks the
 posting UX (preview, privacy choice, consent, music confirmation, disclosure); unaudited = private
 only. Instagram: Platform Terms, app review for others' accounts. Campaigns: own accounts, no view
@@ -2750,12 +2933,12 @@ botting; paid clips may need an ad disclosure (FTC/ASA). Stream music → Conten
 | 2026-11-19 | Never double-post: partial unique `(clip, account)`, the row before the upload, the platform handle committed before the first byte, a lease while uploading, `recover()` on retry, `unknown` goes to the operator | a crash between "posted" and "stored" must not cause a second post |
 | 2026-11-19 | OAuth tokens AES-256-GCM-encrypted in Postgres (AAD = row + field, key ids), key from env/secret file, only the publisher decrypts | backups and other services never see usable tokens; no extra infra for one operator |
 | 2026-11-19 | Accounts and routes are written only by the publisher (its CLI does OAuth connect and route setup) | one writer per table, like `clipper-channels` for the controller |
-| 2026-11-19 | Rights default deny: a channel is publishable only through a `publish_routes` row with a rights basis; credit to the streamer is mandatory in every template | §2: DMCA/strikes; campaigns require attribution |
+| 2026-11-19 | Rights default deny: a channel is publishable only through a `publish_routes` row (since 2026-11-21: config the user fills in, no rights-basis field, §15); credit to the streamer is mandatory in every template | §2: DMCA/strikes; campaigns require attribution |
 | 2026-11-19 | The publisher schedules itself (per-account caps, min gap, UTC windows, YouTube project quota until midnight PT) and waits with a generic `jobs.DeferJob` | TikTok has no API scheduling; waiting for a slot or quota must not burn retry attempts |
 | 2026-11-19 | Post text = plan title/hashtags → review overrides → route template, clamped per platform; what was sent is stored | one merge order; the judge suggests, the operator decides, the route enforces credit and rules |
 | 2026-11-19 | Status and stats from one self-deferring `sync_publication` job per publication on a decaying schedule; `publication_stats` from day one | one durable timer per post; views feed the analytics loop early |
 | 2026-11-19 | A platform rejection/removal pauses the account and labels the clip | repeated copyright hits end a channel (3 YouTube strikes) |
-| 2026-11-19 | Campaign submission is manual (Telegram task + `submitted` event) until Whop exposes Content Rewards via API | no submission API found |
+| 2026-11-19 | Campaign submission is manual (a Discord task since 2026-11-21 + `submitted` event) until Whop exposes Content Rewards via API | no submission API found |
 | 2026-11-19 | §3 update proposed: YouTube unverified projects no longer private-locked (videos.insert page, re-checked 2026-11-19); insert = 1 unit of a 100/day bucket; Instagram 100 (or 50) per 24 h via `content_publishing_limit`; TikTok 6 req/min per token, unaudited = private viewing and private accounts only | official docs re-checked 2026-11-19; §3 itself changes only when this is agreed |
 
 ### Contract changes
@@ -2786,10 +2969,6 @@ class PublicationStatus(StrEnum):
 
 class Visibility(StrEnum):
     PUBLIC = "public"; UNLISTED = "unlisted"; LIMITED = "limited"; PRIVATE = "private"
-
-class RightsBasis(StrEnum):
-    STREAMER_ACCOUNT = "streamer_account"; CAMPAIGN = "campaign"
-    WRITTEN_PERMISSION = "written_permission"
 
 class PublicationActionKind(StrEnum):
     DELETE = "delete"; MARK_POSTED = "mark_posted"; MARK_NOT_POSTED = "mark_not_posted"
@@ -2858,13 +3037,15 @@ async def defer(session: AsyncSession, job: ClaimedJob, until: datetime, reason:
   `status` text default 'active' CHECK IN ('active','paused','needs_reauth','disabled');
   `status_reason` text null; `scopes` jsonb default '[]'; `key_id` text null; `access_token_enc`,
   `refresh_token_enc` bytea null; `access_expires_at`, `refresh_expires_at`, `refreshed_at`
-  timestamptz null; `capabilities` jsonb default '{}' (audited, privacy options, max duration);
+  timestamptz null; `upload_method` text default 'api' (what the user chose for the platform, e.g.
+  `api` = the platform's adapter, `manual` = a Discord notice with the final file and text, and the
+  user marks it posted); `capabilities` jsonb default '{}' (audited, privacy options, max duration);
   `policy` jsonb default '{}' (`daily_cap`, `min_gap_s`, `windows_utc`); `created_at`, `updated_at`.
   UNIQUE (`platform`, `external_id`).
 - **`PublishRoute`** (`publish_routes`), writer: publisher. `id` bigint PK; `channel_id` FK channels;
   `platform_account_id` FK platform_accounts; `active`, `auto_select` bool default true;
-  `rights_basis` text CHECK IN ('streamer_account','campaign','written_permission'); `rights_ref`
-  text not null (campaign URL, permission note); `campaign_name`, `campaign_url` text null; `rules`
+  `note` text null (the user's own note; no rights-basis column since 2026-11-21); `campaign_name`,
+  `campaign_url` text null; `rules`
   jsonb default '{}' (`RouteRules`); `template` jsonb default '{}' (`PostTemplate`); `created_at`,
   `updated_at`. UNIQUE (`channel_id`, `platform_account_id`).
 - **`Publication`** (`publications`), writer: publisher. `id` bigint PK; `clip_id` FK clips;
@@ -2901,27 +3082,32 @@ TikTok [Direct Post](https://developers.tiktok.com/doc/content-posting-api-refer
 [post status](https://developers.tiktok.com/doc/content-posting-api-reference-get-video-status);
 Meta [Content Publishing](https://developers.facebook.com/docs/instagram-platform/content-publishing/),
 [API updates 2025-12-03](https://developers.facebook.com/blog/post/2025/12/03/instragram-api-updates/);
-Telegram [Bot FAQ (limits, 50 MB upload)](https://core.telegram.org/bots/faq);
+Discord (checked 2026-11-21, §21) [uploading files](https://docs.discord.com/developers/reference),
+[interactions](https://docs.discord.com/developers/interactions/receiving-and-responding),
+[components](https://docs.discord.com/developers/components/reference),
+[Attachments FAQ (20 MB since August 2026)](https://support.discord.com/hc/en-us/articles/25444343291031);
 Whop [Content Rewards](https://docs.whop.com/memberships-and-access/third-party-apps/content-rewards),
 [Content Rewards FAQ](https://contentrewards.com/faqs),
 [bounty program API](https://docs.whop.com/developer/bounties/run-a-bounty-program).
 
 ### Decisions and credentials needed from the user (§19–§22)
 
-- **Rights model (§2)**: which channels may be clipped and published, on which platforms and
-  accounts; per route the rights basis, campaign, rules, template and caps; whether backfilled clips
-  (§17) may be published.
-- **Judge model**: provider + model, picked from `clipper-judge eval` numbers (approve the eval spend),
-  and its API key.
-- **Judge budgets**: USD per stream-hour and per day (e.g. $0.50 / $10); judge audio_only channels or
-  switch them to `full` (audio_only can't be rendered in v1).
+Updated 2026-11-21 with the user's answers (§15).
+- **Routes (§2, decided 2026-11-21)**: per platform the credentials and the upload method (from the
+  user); per route the channel, account, template, rules and caps the user fills in.
+- **Judge model and limits**: the Claude model for the CLI adapter (picked from `clipper-judge eval`
+  numbers), the usage-guard limits (share of the five-hour / seven-day windows, calls per
+  stream-hour and per day), and for the container a `claude setup-token` token in `.env`. Judge
+  audio_only channels or switch them to `full` (audio_only can't be rendered in v1).
 - **Taste**: titles, clip lengths (default 10–60 s), caption style presets; sign off 5 real renders.
 - **Layouts**: facecam rects per channel in `layouts.toml` (ohnepixel first, via `layout-preview`).
 - **Licensed SFX/music library** with licence proof per asset (nothing ships without it).
 - **Retention**: discarded clips 7 days, pinned video of published clips 30 days.
-- **Review**: Telegram bot token (@BotFather `/newbot`, `/setjoingroups` off), your numeric user
-  id(s) and chat id; web password; Tailscale on PC + phone (optional); review window and max age per
-  campaign; quiet hours.
+- **Review (Discord, decided 2026-11-21)**: a Discord application with a bot (developer portal:
+  bot token, application id), a private server with a review channel and the bot invited (scopes
+  `bot` + `applications.commands`), your Discord user id(s), server id and channel id (developer
+  mode → Copy ID); web password; Tailscale on PC + phone (optional); review window and max age per
+  route; quiet hours.
 - **YouTube**: Google Cloud project, Data API v3, OAuth client (Desktop), consent screen "In
   production", scopes `youtube.upload` + `youtube.readonly` (+ `youtube` to delete); run the smoke.
 - **TikTok**: developer app (Login Kit + Content Posting API), redirect URI, client key/secret, the

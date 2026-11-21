@@ -126,13 +126,6 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   `PlanPatch` for review edits, job kinds RENDER/REVIEW/REVISE_PLAN/NOTIFY + payloads,
   `clipper_core.lifecycle` (derived §7 clip state), storage key for judge I/O. 880 tests.
 
-## Blocked / waiting for you
-
-- Detector unit 4 (backtest CLI): needs ground truth = viewer clips (Twitch app credentials in
-  this checkout's `.env`) and some backfilled VODs on a migrated DB.
-- Judge unit 6d (real LLM adapters + `clipper-judge eval`): your provider/model choice, API key
-  and the eval spend.
-
 - Judge unit 6b (commit "Judge input builder + resolver"): new `services/judge` package (pure):
   versioned, byte-stable LLM input (transcript with timing, chat summary, audio events, media
   ranges; chat/titles fenced and length-capped against prompt injection; prompt text in
@@ -144,19 +137,67 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
   normalised text, "clip it", links, commands) moved from the detector into
   `clipper_core.chat` + `bots.toml` (detector re-exports them; lexicon v2). 1021 tests.
 
+## Your answers (2026-11-21, relayed by the main session)
+
+Recorded as decision rows in DESIGN §15 (dated 2026-11-21) and in the sections named:
+1. CED-base: stays as is, provisional; experiments later. No action (§15).
+2. Resolver, tiny video islands: keep spending the one retry instead of `no_video` (§15).
+3. Backfill is never automatic: only a VOD/stream you name (`vod <id>`); `channel` becomes
+   list-only (§15, §17). Checked §17: `channel <login>` is the only path that backfills without
+   an explicit id (today it backfills the newest 5). `clips <login>` reads clip metadata only,
+   `calibrate`/`status` are read-only, and nothing in §18/§19 starts a backfill. **The code change
+   to `channel` is not made yet** (you said stop after 6b): first item under Next.
+4. Publishing: you decide what goes where and provide credentials + upload method per platform;
+   no rights model beyond a per-route config you fill in; adapters wait (§2, §15, §22: the
+   `RightsBasis` enum/CHECK is dropped from the draft, routes get an optional `note`, accounts an
+   `upload_method`, e.g. `api` or `manual`).
+5. Review on Discord instead of Telegram: §21 reworked (bot with buttons/selects/modals over the
+   Gateway, no public endpoint; web UI unchanged). Discord's upload limit, checked 2026-11-21:
+   **20 MiB per file by default** (bots too; raised from 10 MB in August 2026), more only with
+   server boosts. §20's preview (~12 MB for 60 s, capped at 19 MB) fits, so there's no extra
+   preview render; larger previews fall back to the thumbnail + web link.
+6. Judge 6d: the Claude Code CLI on your subscription (§19 "Claude Code CLI adapter" + "Usage
+   guard"). Verified on this PC (CLI 2.1.330) with two tiny Haiku calls in `-p` mode: the flags,
+   the `result` fields, `--json-schema` → `structured_output` (takes 2 turns, so `--max-turns` ≥ 2), and
+   a `rate_limit_event` in `stream-json` with your five-hour/seven-day utilization (the usage
+   guard reads it). Auth: `claude setup-token` (one-year token, `CLAUDE_CODE_OAUTH_TOKEN`) for
+   the container; `--bare` can't use it; an `ANTHROPIC_API_KEY` in the environment would take
+   precedence and bill the API, so the adapter strips it and checks `apiKeySource`. Note for you:
+   Claude Code's legal page says subscription OAuth is for "ordinary use of Claude Code" and that
+   products serving other users must use API keys; the judge serves only you.
+7. Deploy for testing: done by the main session (Environment events). Redeploys are fine.
+8. Twitch app credentials: in the worktree's `.env` now. The detector polls viewer clips live; the
+   backtest's credential blocker is gone.
+
+Still open with you (the main session asked you): the 8 s default chat delay, whether the
+detector may hold the Twitch credentials, judge model and usage limits, raid/sub suppression,
+judging audio_only channels, GQL use, taste/layout/retention, the Discord credentials.
+
+## Blocked / waiting for you
+
+- Detector unit 4 (backtest CLI): the credentials are there now (`.env`); it still needs
+  backfilled VODs, and backfill runs only on VODs you name: tell me which ones (or name them in a
+  `clipper-backfill vod <id>` run).
+- Judge unit 6d (Claude CLI adapter + usage guard + `clipper-judge eval`): buildable on a fake
+  `claude` executable; the real runs need your model choice and usage limits, and for the
+  container a `claude setup-token` token in `.env`.
+
 ## Stopped here (2026-11-21, on your request "stop after 6b")
 
-Nothing is running; no agents active. The worktree is clean at the last commit.
+Nothing is running; no agents active. The worktree is clean at the last commit. After the stop,
+only docs changed: your answers (above) went into DESIGN.md and this file (2026-11-21).
 
 ## Next (when you resume)
 
+- Backfill: make `clipper-backfill channel <login>` list-only (your answer 3; small change + tests).
 - Judge 6c (service with the fake model: waits for transcripts, context rounds, one
-  transaction per plan + render job), then renderer §20 (contracts, pure ffmpeg graph builder,
-  NVENC smoke test), review §21 and publisher §22 contracts + fakes.
-- Open choice from 6b: when only tiny video islands remain near the moment, the resolver spends
-  the one retry (`Unrepairable`) instead of rejecting as `no_video` — keep or change.
+  transaction per plan + render job), then 6d's buildable part (Claude CLI adapter on a fake
+  executable + usage guard; also the stale `# cost guard (daily cap)` comment on
+  `ClipRejectReason.BUDGET` in `contracts.py`), renderer §20 (contracts, pure ffmpeg graph
+  builder, NVENC smoke test only while the GPU isn't busy with the backlog), review §21 (Discord)
+  and publisher §22 contracts + fakes.
 
-## How to deploy the transcriber (your call, in the morning)
+## How to deploy the transcriber (done 2026-11-21 by the main session, see Environment events)
 
 1. `docker compose up --build migrate` — applies migrations 0002 (transcriber), 0003
    (backfill tables + `streams` CHECKs), 0004 (detector tables) and 0005 (judge tables) to the
@@ -175,6 +216,19 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-21 ~14:15Z: **deployed for testing** by the main session (your OK) from this worktree
+  (`transcriber` @1778961; until it is merged, compose must run from here). Migrate ran
+  0001→0005 on the live DB; controller, chat-ingest and recorder were recreated (ohnepixel was
+  live, stream 1412; the recorder resumed at seq 100). The transcriber is working through 795
+  queued `transcribe` jobs (GPU ~3.8 GB, 96 %; only the HF_TOKEN warning). The detector is live
+  with `judge_jobs=false`, `viewer_clips=true`, 8 s default delay, 0 candidates at the time. The
+  backfill image is built, not run. The main session copied main's `.env` into this worktree
+  (gitignored, never committed): native `uv run` tools here now reach the live DB unless the URL
+  is overridden; tests keep using `CLIPPER_TEST_DATABASE_URL`. No GPU e2e runs while the
+  backlog is processed.
+- 2026-11-21: two tiny `claude -p` calls (Haiku, a few tokens each) on your subscription, to
+  verify the CLI's flags and output for §19 (you asked for it to be checked, not taken from
+  memory). Nothing else used the CLI.
 - 2026-11-21: Docker Desktop was off (reboot/quit); you started it again (~12:40 local); the
   live stack is running.
 
@@ -202,11 +256,15 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Open questions for the user
 
+(2026-11-21: answers 1–8 are under "Your answers" above; what they settle is marked **answered**
+below, the rest is still open.)
+
 Designs written overnight and marked "proposed, not yet agreed" in DESIGN.md: §17 backfill,
 §18 detector, §19 judge, §20 renderer, §21 review, §22 publisher. Their decision rows sit under each section, not in the
 decision log, until you agree.
 
-- **Transcriber:** confirm CED-base (still provisional). On CPU it is the slowest stage (24×
+- **Transcriber:** **answered 2026-11-21: CED-base stays provisional, experiments later.** Was:
+  confirm CED-base (still provisional). On CPU it is the slowest stage (24×
   realtime on 2 threads). **Decided by you (via the main session, 2026-11-19 evening): CED runs on
   the GPU.** The main session is comparing CED's ONNX model on onnxruntime-gpu (preferred, no
   torch) vs CUDA torch (+~5 GB image) and will send a recipe; this session implements it then and
@@ -215,7 +273,8 @@ decision log, until you agree.
   stretch vs 49× on whole chunks).
   The decision log says "built-in VAD"; measured, our Silero gate makes it redundant, so
   `vad_filter` defaults to False (setting).
-- **Backfill (§17):** use Twitch's undocumented GQL API at all (VOD playback token + chat
+- **Backfill (§17):** **answered 2026-11-21: only on VODs you name, never automatic.** Still
+  open: use Twitch's undocumented GQL API at all (VOD playback token + chat
   replay; Twitch discourages third-party use, client ids can be revoked)? Without it, backfill
   gets only Helix metadata + top clips. Which channels and how many VODs back? Audio only, or video
   ranges too? May clips from backfilled VODs ever be published (§2 rights), or is it dev data
@@ -228,11 +287,12 @@ decision log, until you agree.
   channel-point reward, highlighted message) as `_`-keys in `badges` like `_action`, or a proper
   column (needs a chat-ingest redeploy either way)?
 - **Judge / renderer / review / publisher (§19–§22):**
-  - Rights model (§2): which channels, platforms and accounts; per publish route the rights basis,
-    campaign rules and caps; may backfilled clips be published?
-  - Judge LLM provider + model (to be picked by a `clipper-judge eval` run: approve its spend),
-    budgets in USD per stream-hour and per day (e.g. $0.50 / $10); judge audio_only channels
-    (can't be rendered without video) or switch them to `full`?
+  - Rights model (§2): **answered 2026-11-21: you decide per route and provide credentials +
+    upload method per platform; no rights model beyond the route config.**
+  - Judge LLM: **answered 2026-11-21: Claude Code CLI on your subscription, usage guard.** Still
+    open: the model (from a `clipper-judge eval` run), the usage limits (share of the five-hour /
+    seven-day windows, calls per stream-hour/day); judge audio_only channels (can't be rendered
+    without video) or switch them to `full`?
   - Taste: title style, clip lengths (default 10–60 s), caption presets; sign off ~5 real renders.
   - Facecam layout per channel (`layouts.toml`, ohnepixel first); a licensed SFX/music library
     with licence proof per asset; retention (discarded clips 7 days, pinned video of published
@@ -240,10 +300,15 @@ decision log, until you agree.
 
 ## Credentials / decisions needed
 
-- Confirm the sound classifier (CED-base is provisional).
-- Judge: LLM API key (provider of your choice).
-- Review: Telegram bot token (@BotFather), your numeric Telegram user id(s) and chat id; a web UI
-  password; optionally Tailscale on PC + phone.
-- Publisher: YouTube (Google Cloud project, Data API v3, Desktop OAuth client, consent screen "In
-  production"); TikTok (developer app with Content Posting API + audit); Instagram (professional
-  account + Facebook Page, Meta app + app review); Whop account (campaign submission stays manual).
+- Judge: for the container, a `claude setup-token` token (`CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN` in
+  `.env`; natively your CLI login works too); the model and usage limits. Make sure no
+  `ANTHROPIC_API_KEY` sits in `.env` (it would bill the API instead of the plan; the adapter
+  strips it anyway).
+- Review (Discord): a Discord application with a bot (bot token, application id), a private
+  server with a review channel and the bot invited, your Discord user id, the server and channel
+  ids; a web UI password; optionally Tailscale on PC + phone.
+- Publisher: per platform, the credentials and upload method you choose (answer 4), then the
+  routes. For API uploads: YouTube (Google Cloud project, Data API v3, Desktop OAuth client,
+  consent screen "In production"); TikTok (developer app with Content Posting API + audit);
+  Instagram (professional account + Facebook Page, Meta app + app review); Whop (campaign
+  submission stays manual).
