@@ -219,6 +219,11 @@ live chunks only from 12:32:42 to 17:29:24Z, Docker was off later):
   writes `.mp4`; calibrate needs the same. 78 of 297 live chunks were skipped as VOD edge or muted.
   Recorded in DESIGN §3 and §17.
 
+**Rerun after the fMP4 fix (2026-11-21, this session, read-only):** `T0_audio` = 12:32:36.486Z
+from 3 windows (scores 1.000/0.999/0.948, spread 21.4 ms = one AAC frame); `T0_pdt` is **16 ms**
+earlier, the chat anchor +4.25 s later (Twitch's replay latency compensation, as on xqc). So the
+PDT T0 the backfill uses is right to within one AAC frame. Details in DESIGN §17 "Calibrate".
+
 `clipper-backfill clips 2934862154`: 100 fetched, 99 kept, all new, all with a time span, linked
 to stream 803 (top clip: 5794 views at 12:50:35Z ± 37 s). They're in `viewer_clips`, the ground
 truth for the backtest. The live detector didn't run during stream 803, so the backtest needs the
@@ -248,15 +253,19 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
 
 ## Next
 
-- Backfill `calibrate`: handle fMP4 VODs (prepend the `EXT-X-MAP` init section, write `.mp4`, like
-  `pipeline._build`) + a test with an fMP4 fixture; then rerun `calibrate 2934862154` for the
-  audio T0.
+- Done 2026-11-21 after the resume: `channel` list-only (b556ed4); `calibrate` reads fMP4 VODs
+  (91abaeb) and its rerun on 2934862154 gave the audio T0 (above).
 - Backfill `--fill-gaps` (your answer, 2026-11-21; DESIGN §15 row + §17 "Fill the gaps of a
   live-recorded stream", proposed): `clipper-backfill vod <id> --fill-gaps` fills only a
   live-recorded stream's `not_recorded` gaps (and its unrecorded tail) from the VOD while it
   exists, on request only, never touching live parts. After the fMP4 `calibrate` fix (fill uses
   the calibrated T0). First targets: stream 803 (VOD 2934862154, live part ends 17:29:24Z), then
-  the 7134 s gap in stream 1412.
+  the 7134 s gap in stream 1412. Measured from the VOD listing: 803's VOD runs to ~22:14Z
+  (unrecorded tail ~4.7 h after 17:29Z); 1412's VOD ends ~21:07Z, and besides its gaps (22 s,
+  7134 s, 576 s) the recording stopped at 19:06:47Z (the stack was down ~19:07–21:58Z: chat stops
+  then too), so a ~2 h tail. Audio for both ≈ 0.7 GB, ~9 h to transcribe at BACKFILL priority.
+  Older ohnepixel streams have unrecorded tails too (stream 17, 2026-11-19: recorded to 18:36Z,
+  VOD to ~22:32Z); only on your request.
 - Chat-ingest: the extra IRC tags as columns (second batch, answer 5): migration + chat-ingest +
   backfill (writes null) + tests; it ships with a chat-ingest redeploy, which you time
   (chat-ingest restarts lose a few seconds of chat).

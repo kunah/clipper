@@ -273,7 +273,8 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
    Shared code moved to `clipper_core.{chunks,chat,ffmpeg}`; migration 0003 (`vods`,
    `viewer_clips`, `streams` CHECKs). Tested on a real VOD (10 min media, 4 min chat). First real run
    of clips and `calibrate` 2026-11-21 on ohnepixel 2934862154 (clips: 99 kept; calibrate: chat
-   clock confirmed, audio T0 failed on the fMP4 VOD, fixed the same day, rerun pending). `channel
+   clock confirmed, audio T0 failed on the fMP4 VOD, fixed the same day; rerun: `T0_pdt` is 16 ms
+   before `T0_audio`, i.e. within one AAC frame). `channel
    <login>` only lists a channel's archives (2026-11-21: backfill runs only on a named VOD). Design:
    [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not
    yet agreed).
@@ -715,8 +716,8 @@ are requeued by the controller after 15 min (exists).
 **Status:** proposal; 5a (shared pieces + contract), 5b (Twitch VOD access), 5c (media + time:
 `tools/backfill`) and 5d (chat replay, viewer clips, `calibrate`) are built; `calibrate` first ran
 on real data 2026-11-21 (ohnepixel 2934862154, recorded live as our stream 803): chat clock
-confirmed, audio T0 failed on the fMP4 VOD, fixed the same day, rerun pending (see "Calibrate"
-under 5d). The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
+confirmed, audio T0 failed on the fMP4 VOD, fixed the same day; the rerun measured `T0_pdt` −
+`T0_audio` = −16 ms (see "Calibrate" under 5d). The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
 and chat questions: see §3 (rows "Twitch VOD chat", "Twitch VOD HLS"); the time model below is
 updated with it (5c: T0 from PDT, see "Time model").
 
@@ -753,7 +754,8 @@ stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in st
   stream, with `muted` gaps as usual and BACKFILL-priority transcribe jobs.
 - **Time**: the VOD's T0 measured by `calibrate` against the live chunks when there is one
   (±21 ms, it lines up with the live clock), else `T0_pdt` with a flag. The fMP4 `calibrate`
-  fix this needed is built (2026-11-21); its rerun on 2934862154 is pending.
+  fix this needed is built (2026-11-21); its rerun on 2934862154 put `T0_pdt` 16 ms before
+  `T0_audio`, so the PDT fallback is good to about one AAC frame.
 - **Chat** (the whole stack was down in both cases, chat included): replay messages only for
   seconds without live chat. `sent_at = createdAt` equals `tmi-sent-ts` (verified 205/205), so the
   PK already skips messages logged live. Metrics are written only for seconds without a live
@@ -1088,7 +1090,14 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
      chat half still reports. Tests: the synthetic audio as an fMP4 VOD (ffmpeg's HLS muxer;
      windows start at fragments with `baseMediaDecodeTime` > 0; plain and priming edit list):
      T0 < 2 ms; init lost → windows skipped, the init asked for once; init change → that window
-     left out; a segment failing for good → its window skipped. Rerun on 2934862154: pending.
+     left out; a segment failing for good → its window skipped. **Rerun 2026-11-21 on 2934862154**
+     (after the fix): 3 windows (chunks 42, 136, 243; scores 1.000, 0.999, 0.948), `T0_audio` =
+     12:32:36.486Z (spread 21.4 ms = one AAC frame); `T0_pdt` − `T0_audio` = **−0.016 s**, chat
+     anchor (truncated) +4.245 s, (rounded) +4.745 s, Helix `created_at` +3.514 s, path epoch
+     −3.486 s. Replay comments found in our live chat: `createdAt − tmi-sent-ts` = 0.000 s for all
+     205; `tmi-sent-ts − (T0_audio + offset)` ∈ [4.22, 5.21] s (median 4.75): a 1 s band, i.e.
+     whole-second offsets plus Twitch's ~4.2 s latency compensation. So the PDT T0 is right to
+     within one AAC frame on this (fMP4) VOD.
    - **Deviations:** the chat-time fallback uses the chat clock (above), not `T0 + offset`;
      `--max-minutes` limits media and chat (each from its own resume point), `--chat-max-minutes`
      chat alone; `--start-offset` is media only (chat always starts at 0: missing seconds would
