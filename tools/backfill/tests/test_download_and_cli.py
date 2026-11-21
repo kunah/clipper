@@ -177,7 +177,28 @@ def test_channel_and_status_arguments():
     assert (args.login, args.limit, args.since.isoformat()) == (
         "xqc", 2, "2026-11-01T00:00:00+00:00"
     )  # fmt: skip
+    args = parse_args(["channel", "xqc"])
+    assert (args.limit, args.since) == (10, None)
     assert parse_args(["status"]).video_ids == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--dry-run"], ["--max-minutes", "5"], ["--no-media"], ["--video"], ["--no-chat"]],
+)
+def test_channel_lists_only_and_takes_no_run_options(extra, capsys):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["channel", "xqc", *extra])
+    assert exc.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "2.5", "x"])
+def test_channel_limit_is_a_positive_whole_number(limit, capsys):
+    with pytest.raises(SystemExit) as exc:
+        parse_args(["channel", "xqc", "--limit", limit])
+    assert exc.value.code == 2
+    assert "--limit" in capsys.readouterr().err
 
 
 def test_rendition_choice():

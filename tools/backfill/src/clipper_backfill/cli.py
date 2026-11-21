@@ -4,12 +4,14 @@
     uv run clipper-backfill vod https://www.twitch.tv/videos/2932113307 --max-minutes 5
     uv run clipper-backfill vod 2932113307 --video 720p60    # video + its audio (default: audio)
     uv run clipper-backfill vod 2932113307 --no-media --chat-max-minutes 30   # chat only
-    uv run clipper-backfill channel xqc --since 2026-11-01 --limit 3   # needs Helix credentials
+    uv run clipper-backfill channel xqc --since 2026-11-01 --limit 3   # lists only (Helix)
     uv run clipper-backfill clips xqc | clips 2932113307    # viewer clips (Helix credentials)
     uv run clipper-backfill calibrate 2932113307            # read-only: VOD vs our live recording
     uv run clipper-backfill status [VIDEO_ID ...]
 
 In Docker: `docker compose run --rm backfill vod <id> --dry-run` (profile `tools`).
+Backfill runs only on a VOD the user names (DESIGN §17): `channel <login>` lists the channel's
+archives, newest first, with what we already have of each, and writes nothing.
 A `vod` run does media (audio_only by default), then the chat replay (into the live chat tables),
 then viewer clips (only with Helix credentials, else skipped with a note). Idempotent: a re-run
 resumes where the last one committed (`vods.media_done_s`, `vods.chat_done_s`). Needs ffmpeg on
@@ -52,9 +54,9 @@ from clipper_core.runtime import run, stop_event_on_signals
 from clipper_core.storage import ObjectStore
 from clipper_core.timeline import ensure_utc
 from clipper_twitch.gql import GqlBroken, GqlChatReplay, GqlError
-from clipper_twitch.helix import HelixClient, HelixError
+from clipper_twitch.helix import HelixClient, HelixError, HelixUser, HelixVideo
 from clipper_twitch.settings import TwitchSettings
-from clipper_twitch.vod import StreamlinkVodSource, VodError
+from clipper_twitch.vod import StreamlinkVodSource, VodError, parse_vod_path
 
 log = get_logger("clipper_backfill")
 
@@ -88,6 +90,13 @@ def _positive(value: str) -> float:
     number = float(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("must be > 0")
+    return number
+
+
+def _count(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
     return number
 
 
@@ -147,11 +156,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     v = sub.add_parser("vod", parents=[media], help="backfill archives by id or URL")
     v.add_argument("refs", nargs="+", metavar="ID_OR_URL")
     c = sub.add_parser(
-        "channel", parents=[media], help="the newest archives of a channel, oldest first (Helix)"
+        "channel",
+        help="list a channel's archives, newest first, and what we have of each (Helix; "
+        "writes nothing: backfill one with `vod <id>`)",
     )
     c.add_argument("login")
     c.add_argument("--since", type=_day, metavar="YYYY-MM-DD", help="archives created since")
-    c.add_argument("--limit", type=int, default=5, metavar="N", help="newest N archives (5)")
+    c.add_argument("--limit", type=_count, default=10, metavar="N", help="newest N archives (10)")
     k = sub.add_parser(
         "clips", help="viewer clips of a VOD, or of all our streams of a channel (Helix)"
     )
@@ -222,13 +233,70 @@ def status_lines(found: list) -> list[str]:
     return out
 
 
-async def channel_refs(helix: HelixClient, args: argparse.Namespace) -> list[str]:
+async def channel_archives(
+    helix: HelixClient, args: argparse.Namespace
+) -> tuple[HelixUser, list[HelixVideo]]:
+    """The channel and its newest `--limit` archives (created since `--since`), newest first."""
     users = await helix.get_users(logins=[args.login])
     if not users:
         raise UsageError(f"unknown channel {args.login!r}")
-    page = await helix.get_videos(users[0].id, type="archive", limit=max(1, args.limit))
-    videos = [v for v in page.items if args.since is None or v.created_at >= args.since]
-    return [v.id for v in reversed(videos)]  # oldest first: VODs expire
+    page = await helix.get_videos(users[0].id, type="archive", limit=args.limit)
+    return users[0], [v for v in page.items if args.since is None or v.created_at >= args.since]
+
+
+def broadcast_id(video: HelixVideo) -> str | None:
+    """The archive's platform stream id: Helix `stream_id`, else the one in the CDN path of its
+    thumbnail (`<hash>_<login>_<stream id>_<epoch>/`, as `vod` reads it from the media paths)."""
+    if video.stream_id:
+        return video.stream_id
+    path = parse_vod_path(video.thumbnail_url)
+    return path.stream_id if path else None
+
+
+def _hms(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 3600}:{s // 60 % 60:02}:{s % 60:02}"
+
+
+def _cut(value: str, width: int) -> str:
+    value = " ".join(value.split())
+    return value if len(value) <= width else value[: width - 3] + "..."
+
+
+def have_text(have: rows.Have | None) -> str:
+    """Our stream of the broadcast (chunks, UTC span) and the backfill progress, else "-"."""
+    if have is None:
+        return "-"
+    parts = []
+    if (st := have.stream) is not None:
+        span = (
+            f" {st.first_start:%H:%M:%S}-{st.last_end:%H:%M:%S}Z"
+            if st.first_start and st.last_end
+            else ""
+        )
+        now = " (live now)" if st.status == "live" else ""
+        parts.append(f"{st.source} stream {st.id}{now}: {st.chunks} chunks{span}")
+    if (v := have.vod) is not None:
+        media_pct = 100 * v.media_done_s / v.duration_s if v.duration_s else 100.0
+        chat_pct = 100 * v.chat_done_s / v.duration_s if v.duration_s else 100.0
+        parts.append(
+            f"vod: media {v.media_status} {min(100, media_pct):.0f}%, "
+            f"chat {v.chat_status} {min(100, chat_pct):.0f}%"
+        )
+    return "; ".join(parts)
+
+
+def archive_lines(login: str, videos: list[HelixVideo], have: dict[str, rows.Have]) -> list[str]:
+    if not videos:
+        return [f"{login}: no archives found"]
+    out = [f"{'video':<12} {'created (UTC)':<20} {'duration':>8}  {'title':<40}  have"]
+    for v in videos:
+        out.append(
+            f"{v.id:<12} {v.created_at:%Y-%m-%dT%H:%M:%SZ} {_hms(v.duration_s):>8}  "
+            f"{_cut(v.title, 40):<40}  {have_text(have.get(v.id))}"
+        )
+    out.append("backfill one with: clipper-backfill vod <id>")
+    return out
 
 
 async def amain(argv: list[str]) -> int:
@@ -245,9 +313,46 @@ async def amain(argv: list[str]) -> int:
             return 0
         if args.cmd == "clips":
             return await _clips(args, sessions)
+        if args.cmd == "channel":
+            return await _channel(args, sessions, TwitchSettings())
         return await _backfill(args, settings, sessions)
     finally:
         await engine.dispose()
+
+
+async def _channel(
+    args: argparse.Namespace,
+    sessions,
+    twitch: TwitchSettings,
+    *,
+    helix: HelixClient | None = None,
+) -> int:
+    """List only (backfill never runs on its own, DESIGN §17): Helix reads and SELECTs, no
+    writes, no leases, no object storage, no temp dirs."""
+    if not twitch.has_credentials:
+        error("`channel` lists archives with Helix: set CLIPPER_TWITCH_CLIENT_ID/_SECRET")
+        error("(or pass video ids: clipper-backfill vod <id> ...)")
+        return 2
+    helix = helix or HelixClient.from_settings(twitch)
+    try:
+        user, videos = await channel_archives(helix, args)
+    except UsageError as exc:
+        error(f"[error] {args.login}: {exc}")
+        return 2
+    except (HelixError, httpx.HTTPError, ValueError, KeyError) as exc:  # also malformed Helix data
+        error(f"[failed] {args.login}: {type(exc).__name__}: {exc}"[:300])
+        return 1
+    finally:
+        await helix.aclose()
+    async with sessions() as s:
+        have = await rows.what_we_have(
+            s,
+            login=user.login,
+            user_id=user.id,
+            archives=[(v.id, broadcast_id(v)) for v in videos],
+        )
+    print("\n".join(archive_lines(args.login, videos, have)))
+    return 0
 
 
 async def _clips(args: argparse.Namespace, sessions) -> int:
@@ -309,10 +414,6 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
         return 1
     twitch = TwitchSettings()
     helix = HelixClient.from_settings(twitch) if twitch.has_credentials else None
-    if args.cmd == "channel" and helix is None:
-        error("`channel` lists archives with Helix: set CLIPPER_TWITCH_CLIENT_ID/_SECRET")
-        error("(or pass video ids: clipper-backfill vod <id> ...)")
-        return 2
     store = None
     if not opts.dry_run:
         stale = remove_stale_workdirs(bs.temp_dir, older_than_s=bs.lease_ttl_s)
@@ -340,10 +441,7 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
             )
             if args.cmd == "calibrate":
                 return await _calibrate(args, settings, backfiller)
-            refs = args.refs if args.cmd == "vod" else await channel_refs(helix, args)
-            if not refs:
-                print("no archives found")
-            for ref in refs:
+            for ref in args.refs:
                 if stop.is_set():
                     break
                 try:

@@ -63,8 +63,9 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   the chat replay into `chat_messages`/`chat_metrics_1s` (same `SecondAggregator` as live, resume
   from `vods.chat_done_s`/`chat_metrics_to`, skipped where the channel has live chat), then viewer
   clips into `viewer_clips` (Helix credentials, else skipped). `clips`, `calibrate` (read-only:
-  VOD vs our live recording), `status`. Needs ffmpeg on PATH natively (`CLIPPER_BACKFILL_*`);
-  compose service `backfill` (profile `tools`, `docker compose run --rm`).
+  VOD vs our live recording), `status`, `channel` (list only: backfill runs only on a named VOD).
+  Needs ffmpeg on PATH natively (`CLIPPER_BACKFILL_*`); compose service `backfill` (profile
+  `tools`, `docker compose run --rm`).
   `tools/asr-bench/` is outside the workspace (own Dockerfile).
 - `compose.yaml`: Postgres 18 + pgvector, SeaweedFS (S3), migrate, and services.
 
@@ -79,7 +80,8 @@ uv run ruff check . --fix && uv run ruff format .
 uv run alembic -c db/alembic.ini revision -m "add x"   # then write the migration by hand
 uv run clipper-channels add xqc --mode audio_only      # list | mode <login> <mode> | enable | disable
 uv run clipper-backfill vod <id|url> --dry-run         # reads only; prints T0 + plan
-uv run clipper-backfill vod <id> --max-minutes 5      # media + chat, resumable; status | channel <login>
+uv run clipper-backfill vod <id> --max-minutes 5      # media + chat, resumable
+uv run clipper-backfill channel <login>               # lists archives + what we have, no writes
 uv run clipper-backfill vod <id> --no-media --chat-max-minutes 30   # chat only (no object storage)
 uv run clipper-backfill clips <login|id>              # viewer clips (Helix credentials)
 uv run clipper-backfill calibrate <id>                # read-only: VOD vs our live recording of it

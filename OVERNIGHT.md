@@ -145,8 +145,8 @@ Recorded as decision rows in DESIGN §15 (dated 2026-11-21) and in the sections 
 3. Backfill is never automatic: only a VOD/stream you name (`vod <id>`); `channel` becomes
    list-only (§15, §17). Checked §17: `channel <login>` is the only path that backfills without
    an explicit id (today it backfills the newest 5). `clips <login>` reads clip metadata only,
-   `calibrate`/`status` are read-only, and nothing in §18/§19 starts a backfill. **The code change
-   to `channel` is not made yet** (you said stop after 6b): first item under Next.
+   `calibrate`/`status` are read-only, and nothing in §18/§19 starts a backfill. The code change
+   to `channel` was made after you said resume (2026-11-21, see "Resumed").
 4. Publishing: you decide what goes where and provide credentials + upload method per platform;
    no rights model beyond a per-route config you fill in; adapters wait (§2, §15, §22: the
    `RightsBasis` enum/CHECK is dropped from the draft, routes get an optional `note`, accounts an
@@ -233,15 +233,21 @@ offline pass / detector unit 4.
   `claude` executable now (model Opus, no caps by default, Docker); the real runs need your
   `claude setup-token` token in `.env` as `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`.
 
-## Stopped here (2026-11-21, on your request "stop after 6b")
+## Stopped after 6b, resumed (2026-11-21)
 
-Nothing is running; no agents active. The worktree is clean at the last commit. After the stop,
-only docs changed: both batches of your answers (above) went into DESIGN.md and this file
-(2026-11-21).
+Stopped on your request "stop after 6b"; in between only docs changed (both batches of your
+answers, above). **Resumed on the evening of 2026-11-21 on your "ok - resume"**, in this order: `channel`
+list-only, the fMP4 `calibrate` fix + rerun, `--fill-gaps` (stream 803, then 1412), the IRC-tag
+columns (built, deployed only when you time the chat-ingest redeploy), judge 6c, detector unit 4,
+then 6d's buildable part, renderer §20, review §21 (Discord) and publisher §22 contracts + fakes.
+The live stack runs from this worktree: images are built only from a committed state, and the main
+session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexistent DB, since
+`.env` now holds the live URL.
+- 2026-11-21: the five-hour usage limit stopped the agents mid-task (the `channel` fix round);
+  continued after the reset at 21:50Z.
 
-## Next (when you resume)
+## Next
 
-- Backfill: make `clipper-backfill channel <login>` list-only (your answer 3; small change + tests).
 - Backfill `calibrate`: handle fMP4 VODs (prepend the `EXT-X-MAP` init section, write `.mp4`, like
   `pipeline._build`) + a test with an fMP4 fixture; then rerun `calibrate 2934862154` for the
   audio T0.
@@ -280,6 +286,12 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-21 ~21:58Z: the whole stack was restarted by someone (all containers recreated,
+  `migrate` ran again as a no-op), not by this session; images were not rebuilt (still the
+  15:13 CET images from 1778961). Postgres refused connections for ~2 min; a test run in
+  progress skipped its integration tests meanwhile and was rerun.
+- 2026-11-21: E: had 65 GB free (87 % used; 108 GB free on 11-19). Live recordings grow without
+  video retention (not built yet; retention is one of your open questions).
 - 2026-11-21 17:26Z: the main session restarted the stack from this worktree with your OK. Your
   earlier stop left a 7134 s `not_recorded` gap in stream 1412. The transcribe backlog was done by
   then (870 jobs); the detector had 50 candidates.

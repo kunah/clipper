@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import func, insert, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,7 +37,7 @@ from clipper_core.contracts import (
     VodMediaStatus,
     dedupe_key,
 )
-from clipper_core.models import Channel, Stream, ViewerClip, Vod
+from clipper_core.models import Channel, Chunk, Stream, ViewerClip, Vod
 from clipper_core.timeline import Interval, ensure_utc
 
 PLATFORM = "twitch"
@@ -463,6 +463,116 @@ async def status_rows(session: AsyncSession, video_ids: Sequence[str] = ()) -> l
             {"platform": PLATFORM, "ids": list(video_ids)},
         )
     ).all()
+
+
+# --------------------------------------------------------------------------- channel list (reads)
+
+
+@dataclass(frozen=True, slots=True)
+class OurStream:
+    """Our stream of an archive's broadcast (live-recorded or backfilled) and its chunks."""
+
+    id: int
+    source: str  # DataSource
+    status: str  # StreamStatus
+    chunks: int
+    first_start: datetime | None  # of the first chunk (None: no chunks)
+    last_end: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class OurVod:
+    """The archive's `vods` row: backfill progress."""
+
+    stream_id: int
+    duration_s: float
+    media_status: str
+    media_done_s: float
+    chat_status: str
+    chat_done_s: int
+
+
+@dataclass(frozen=True, slots=True)
+class Have:
+    """What we already have of one archive (`clipper-backfill channel`)."""
+
+    stream: OurStream | None
+    vod: OurVod | None
+
+
+async def what_we_have(
+    session: AsyncSession,
+    *,
+    login: str,
+    user_id: str | None,
+    archives: Sequence[tuple[str, str | None]],
+) -> dict[str, Have]:
+    """{video id: Have} for a channel's archives, given as (video id, Helix `stream_id`) pairs:
+    our stream of the broadcast (`streams.platform_stream_id`) and/or the video's `vods` row.
+    Archives we have nothing of are left out. SELECTs only."""
+    channel_id = await find_channel(session, login=login, user_id=user_id)
+    if channel_id is None or not archives:
+        return {}
+    vods = {
+        r.platform_video_id: OurVod(
+            r.stream_id, r.duration_s, r.media_status, r.media_done_s, r.chat_status, r.chat_done_s
+        )
+        for r in await session.execute(
+            select(
+                Vod.platform_video_id,
+                Vod.stream_id,
+                Vod.duration_s,
+                Vod.media_status,
+                Vod.media_done_s,
+                Vod.chat_status,
+                Vod.chat_done_s,
+            ).where(
+                Vod.channel_id == channel_id, Vod.platform_video_id.in_([v for v, _ in archives])
+            )
+        )
+    }
+    found = await session.execute(
+        select(
+            Stream.id,
+            Stream.platform_stream_id,
+            Stream.source,
+            Stream.status,
+            func.count(Chunk.id).label("chunks"),
+            func.min(Chunk.start_utc).label("first_start"),
+            func.max(Chunk.end_utc).label("last_end"),
+        )
+        .outerjoin(Chunk, Chunk.stream_id == Stream.id)
+        .where(
+            Stream.channel_id == channel_id,
+            or_(
+                Stream.platform_stream_id.in_([s for _, s in archives if s]),
+                Stream.id.in_([v.stream_id for v in vods.values()]),
+            ),
+        )
+        .group_by(Stream.id)
+    )
+    by_id: dict[int, OurStream] = {}
+    by_platform_id: dict[str, OurStream] = {}
+    for r in found:
+        first, last = r.first_start, r.last_end
+        stream = OurStream(
+            r.id,
+            r.source,
+            r.status,
+            r.chunks,
+            ensure_utc(first) if first else None,
+            ensure_utc(last) if last else None,
+        )
+        by_id[r.id] = by_platform_id[r.platform_stream_id] = stream
+    have: dict[str, Have] = {}
+    for video_id, platform_stream_id in archives:
+        vod = vods.get(video_id)
+        stream = by_platform_id.get(platform_stream_id or "")
+        if stream is None and vod is not None:
+            stream = by_id.get(vod.stream_id)
+        if stream is not None or vod is not None:
+            have[video_id] = Have(stream, vod)
+    return have
 
 
 # --------------------------------------------------------------------------- chat

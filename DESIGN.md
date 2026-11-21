@@ -272,7 +272,8 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
    where live chat exists. Viewer clips (Helix) → `viewer_clips` (T0 + vod_offset ± slack).
    Shared code moved to `clipper_core.{chunks,chat,ffmpeg}`; migration 0003 (`vods`,
    `viewer_clips`, `streams` CHECKs). Tested on a real VOD (10 min media, 4 min chat); clips and
-   `calibrate` still need a real run (Helix credentials; a stream recorded live). Design:
+   `calibrate` still need a real run (Helix credentials; a stream recorded live). `channel
+   <login>` only lists a channel's archives (2026-11-21: backfill runs only on a named VOD). Design:
    [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not
    yet agreed).
 
@@ -719,10 +720,10 @@ updated with it (5c: T0 from PDT, see "Time model").
 **Decided by the user (2026-11-21): backfill is never automatic.** It runs only on a stream/VOD the
 user names ("analyze this one"): `vod <id|url>`. Nothing schedules it, and no command backfills a
 channel's archives in bulk. Checked against this section on 2026-11-21: the only path that
-backfills without an explicit id is `channel <login>`, which today backfills the newest N
-archives. It becomes **list-only** (prints the archives with id, date, duration and whether we
-already have them; the user picks and runs `vod <id>`). That code change is pending (see
-OVERNIGHT.md). The rest needs an explicit id or is metadata only: `vod` takes ids/URLs; `clips
+backfilled without an explicit id was `channel <login>` (it backfilled the newest N archives). It
+is now **list-only** (done 2026-11-21): it prints the archives with id, date, duration, title and
+what we already have of each, writes nothing, and the user picks one and runs `vod <id>`. The
+rest needs an explicit id or is metadata only: `vod` takes ids/URLs; `clips
 <login>` reads viewer-clip metadata (Helix, no media) for streams we already have; `calibrate` and
 `status` are read-only. Priority `BACKFILL` (§6) only orders the transcribe jobs a named run
 created. Nothing in §18/§19 starts a backfill: the detector backtest and the judge eval read
@@ -776,9 +777,14 @@ and viewer clips in the live format, so transcriber, detector and judge need no 
   [--no-transcribe] [--max-minutes N] [--chat-max-minutes N]`: default is audio_only + chat +
   clips + jobs (in that order; clips only with Helix credentials). `--video` takes a video rendition
   and copies its audio out, like the recorder; `--video-range` adds video to the chunks it overlaps.
-- `channel <login> [--since D] [--limit N]`: as built, it backfills the newest N archives, **oldest
-  first** (VODs expire). **To change (decided 2026-11-21): list only**, no writes; backfill a
-  listed archive with `vod <id>`.
+- `channel <login> [--since D] [--limit N]` (Helix credentials, else exit 2): **list only**
+  (decided and built 2026-11-21). The newest N (default 10) archives created since D, newest
+  first, one line each: video id, created_at (UTC), duration, title (cut to 40 chars) and what we
+  have of it: our stream of the broadcast (Helix `stream_id` = `streams.platform_stream_id` of that
+  channel: source, id, `live now`, chunk count and UTC span) and the `vods` row (media/chat status
+  and %), else `-`; then a `clipper-backfill vod <id>` hint. Helix reads and SELECTs only: no rows,
+  leases, jobs, object storage, temp dirs or ffmpeg check, and no run options (`--dry-run`,
+  `--max-minutes`, ... are argparse errors). Backfill a listed archive with `vod <id>`.
 - `clips <login|video>...`, `status`, `calibrate <video_id>` (read-only; a stream also recorded
   live): T0 methods vs live PDT by audio correlation, `createdAt` vs `tmi-sent-ts`.
 
@@ -1041,7 +1047,7 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
      twice). Clip ids repeated by Helix are written once; clips of other videos are dropped before
      any lookup. `clips <login>` covers every stream of ours of the channel (live and backfilled).
      Without Helix credentials: skipped with a line in the report (`clips` exits 2). A VOD
-     recorded live gets its clips only. A clips failure never fails a `vod`/`channel` run (media
+     recorded live gets its clips only. A clips failure never fails a `vod` run (media
      and chat are committed by then): logged, `flags.clips_error` until a fetch succeeds.
    - **Calibrate** (`clipper_backfill.calibrate`, read-only, numpy): live chunks spread over the
      stream whose ± 20 s search range lies inside the VOD and has no muted segment; the VOD's
