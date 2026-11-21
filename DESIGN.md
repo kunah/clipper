@@ -351,6 +351,7 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-21 | Clips from backfilled VODs **may be published** if they're worth it, decided per route like any other clip (user's answer; §17, §22) | the route config (§2) is the only gate |
 | 2026-11-21 | `calibrate` and the first backtest data use **yesterday's ohnepixel VOD** (if Twitch still has it): the main session runs `calibrate` and `clips` on it once the stack is up; detector build item 4 uses it later (user's answer; §17, §18) | a broadcast we also recorded live, the only way to measure T0 against our own clock |
 | 2026-11-21 | §17–§22 stay **proposed** as a whole: the user reviews them personally; only the answers recorded above are decided (user's answer) | the designs are long; the user reads them before they count as agreed |
+| 2026-11-21 | Backfill may **fill the `not_recorded` gaps of a live-recorded stream from its VOD**, while the VOD exists: on request only (`clipper-backfill vod <id> --fill-gaps`), it fills only the gaps and never touches what was recorded live; a gone VOD leaves the gap. First targets: stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in stream 1412 (user's answer; design in §17, proposed) | recorder or Docker outages lose hours of a broadcast whose VOD still has them |
 
 ## 16. Transcriber design (step 4)
 
@@ -733,6 +734,38 @@ published per route like any clip; `muted` gaps, no `chat_events` from replay, "
 *and source*" and the controller guard are accepted. `calibrate` (and the first backtest data) use
 yesterday's ohnepixel VOD if it is still available; the main session runs `calibrate` and `clips` on
 it once the stack is up. The section as a whole stays proposed until the user has reviewed it.
+
+**Fill the gaps of a live-recorded stream (decided by the user 2026-11-21; design proposed, not
+built).** Today a VOD of a stream we recorded live gets its clips only. `vod <id> --fill-gaps`
+fills that stream's `not_recorded` gaps from the VOD, on request only. It never writes inside a
+range recorded live, and a gone VOD (or a gap outside it) leaves the gap as it is. First targets:
+stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in stream 1412.
+- **Which ranges**: the live stream's `not_recorded` gaps, plus its tail after the last live
+  chunk when the stream ended unrecorded (803), each cut to the VOD's span. Only ended streams;
+  while the stream is live the recorder still writes it.
+- **Media**: `audio_only` by default (`--video` as for any run), cut at whole VOD segments that
+  lie inside the gap, so a fill never overlaps a live chunk (up to one segment at each edge stays
+  unfilled; finer trimming later if it matters). Chunks get `source = 'backfill'` in the live
+  stream, with `muted` gaps as usual and BACKFILL-priority transcribe jobs.
+- **Time**: the VOD's T0 measured by `calibrate` against the live chunks when there is one
+  (±21 ms, it lines up with the live clock), else `T0_pdt` with a flag. So the fMP4 `calibrate`
+  fix comes first.
+- **Chat** (the whole stack was down in both cases, chat included): replay messages only for
+  seconds without live chat. `sent_at = createdAt` equals `tmi-sent-ts` (verified 205/205), so the
+  PK already skips messages logged live. Metrics are written only for seconds without a live
+  row (`keep_foreign_metrics`).
+- **Writer rule**: "one writer per table *and source*" extends to rows inside a live stream.
+  `chunks`/`chat_messages` rows with `source = 'backfill'` belong to the backfill tool, everything
+  else to the live services, and neither side updates the other's rows (the recorder's gap rows
+  stay as written).
+- **To settle at build time**:
+  - `chunks.seq` for fill chunks (unique per stream; above the stream's last seq, or a separate
+    range).
+  - How `coverage()` and the transcriber's takeover treat a filled range: chunks taking
+    precedence over a `not_recorded` gap row, or a marker on the gap, and contiguity across the
+    live/backfill seam.
+  - The `vods` row of a live stream (`t0_utc` isn't `started_at` there).
+  - Resume per gap.
 
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)

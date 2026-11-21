@@ -245,9 +245,12 @@ only docs changed: both batches of your answers (above) went into DESIGN.md and 
 - Backfill `calibrate`: handle fMP4 VODs (prepend the `EXT-X-MAP` init section, write `.mp4`, like
   `pipeline._build`) + a test with an fMP4 fixture; then rerun `calibrate 2934862154` for the
   audio T0.
-- Not designed yet, for you to decide: stream 803 is only recorded live up to 17:29Z, but backfill
-  skips VODs of streams recorded live (clips only), so the rest of that broadcast can't be filled
-  from the VOD. A "fill a live stream's `not_recorded` gaps from its VOD" mode would be new (§17).
+- Backfill `--fill-gaps` (your answer, 2026-11-21; DESIGN §15 row + §17 "Fill the gaps of a
+  live-recorded stream", proposed): `clipper-backfill vod <id> --fill-gaps` fills only a
+  live-recorded stream's `not_recorded` gaps (and its unrecorded tail) from the VOD while it
+  exists, on request only, never touching live parts. After the fMP4 `calibrate` fix (fill uses
+  the calibrated T0). First targets: stream 803 (VOD 2934862154, live part ends 17:29:24Z), then
+  the 7134 s gap in stream 1412.
 - Chat-ingest: the extra IRC tags as columns (second batch, answer 5): migration + chat-ingest +
   backfill (writes null) + tests; it ships with a chat-ingest redeploy, which you time
   (chat-ingest restarts lose a few seconds of chat).
