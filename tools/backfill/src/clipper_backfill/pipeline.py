@@ -267,7 +267,7 @@ class MediaRunner:
         stem = self.workdir / f"{vod.stream_id}_{unit.seq:06d}"
         media = stem.with_suffix(".mp4" if init_uri else ".ts")
         files.paths.append(media)
-        await asyncio.to_thread(_write, media, init, [datas[s.index] for s in unit.segments])
+        await asyncio.to_thread(write_media, media, init, [datas[s.index] for s in unit.segments])
 
         if unit.audio:
             audio = stem.with_suffix(".aac")
@@ -360,7 +360,11 @@ class MediaRunner:
             log.info("gaps saved", gaps=[f"{g.reason}:{g.seconds:.0f}s" for g in unit.gaps])
 
 
-def _write(path: Path, init: bytes, parts: list[bytes | None]) -> None:
+def write_media(path: Path, init: bytes, parts: Sequence[bytes | None]) -> None:
+    """One readable media file from consecutive segments: MPEG-TS segments concatenate as they
+    are; fMP4 fragments need their init section (`init`, b"" for TS) first, or ffmpeg can't read
+    them ("tfhd was found ... error reading header"). Blocking: run in a thread. Also used by
+    `calibrate`."""
     with path.open("wb") as f:
         f.write(init)
         for part in parts:

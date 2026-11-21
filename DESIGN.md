@@ -90,7 +90,7 @@ may contain copyrighted music (Content ID).
 | Twitch chat | IRC (anonymous read-only) can join many channels. Tags give `tmi-sent-ts`, emotes, badges, USERNOTICE (subs/raids), CLEARMSG. |
 | Twitch status | Helix Get Streams: up to 100 channels per request, includes viewer count. |
 | Twitch VOD chat | Chat replay exists while the VOD exists; no official API (tools like TwitchDownloader use the internal GQL API, can break). Deleted messages removed; no viewer history. Use for backfill/backtesting; log live chat ourselves. Seen 2026-11-19 (smoke test, xqc archive, anonymous GQL `VideoCommentsByOffsetOrCursor` with the old mobile client id, no integrity error): pages of 53–56 comments; a page asked by offset starts a few s **before** it (41867 → 41864); `contentOffsetSeconds` is a JSON int; `createdAt` is UTC (`Z`, ms, trailing zeros dropped), no whole-hour shift in 216 comments; `createdAt − offset` stays in one 1 s band from the start to 11.6 h in (no drift): Twitch's chat T0 ≈ the video's GQL `createdAt` + 0.7 s if offsets are truncated (+ 1.2 s if rounded; not decidable from replay alone). 5c run: 338 comments from 6 pages spread over the 23 h: one band of 0.99 s, chat anchor (truncated) = `T0_pdt` + 3.916 s. 5d run (first 4 min, 2426 comments, 0 off the band by > 2 s, none without `createdAt` or commenter): `createdAt − T_chat − offset` ∈ [0.001, 0.987] s on the re-fetched boundary pages, i.e. consistent with truncated offsets; ~5.6 s of VOD per page at the stream start (~10 comments/s); cursor pages never repeated a comment. The smoke test compared against GQL `createdAt`; Helix `created_at` was not fetched (no credentials). A resub showed up as a plain comment carrying the system text; 7TV/BTTV emotes are plain text; badges with empty set id/version occur. `calibrate` 2026-11-21 (ohnepixel 2934862154, recorded live as our stream 803): 205 of 315 sampled replay comments matched our live chat by msg_id, and `createdAt − tmi-sent-ts` was **exactly 0.000 s for all 205** (the replay's `createdAt` is the IRC server timestamp); chat anchor (truncated) = `T0_pdt` + 4.26 s (the xqc VOD: 3.92 s). |
-| Twitch VOD HLS | Seen 2026-11-19 (smoke test, xqc archive 2932113307, 23 h, via streamlink): renditions `audio_only`, 160p30–1080p60 (`best` = source 1080p60). Media playlists `index-dvr.m3u8`: `PLAYLIST-TYPE:EVENT` + `ENDLIST`, segments `N.ts`, **MPEG-TS** (audio_only: AAC 48 kHz stereo + timed ID3, ~274 KB per 10 s; 1080p60: H.264 + AAC + ID3, ~10.5 MB per 10 s), EXTINF mostly 10.000 with some longer (TARGETDURATION 13), segment timestamps don't start at 0. **Only `audio_only` has `EXT-X-PROGRAM-DATE-TIME`** (every segment, ms), and it is exactly T0 + ΣEXTINF (zero deviation over 23 h, so it shows no gaps) with T0 = the video's GQL `createdAt` − 3.2 s (Helix not checked: no credentials); video renditions have none. `EXT-X-TWITCH-TOTAL-SECS` = ΣEXTINF (83735.25; `lengthSeconds` 83735). `#ID3-EQUIV-TDTG` (no zone) ≈ the VOD's *end* (+ 6 s), not its start. Path `<hash>_<login>_<stream_id>_<epoch>`: epoch = GQL `createdAt` − 6 s. Muted parts: `N-muted.ts`; `audio_only` and 1080p60 were compared: same count (1280 of 8343) and same first names (18–20-muted), full index sets not compared; a muted segment still has its AAC track. No `-unmuted` names, no discontinuities. fMP4 VODs not seen yet (xqc is TS live too). Unknown VOD id: no playback token (streamlink returns no streams); GQL `video: null`. 5c run (2026-11-19, same VOD, first 10 min): segments 18–35 muted, the stored `.aac` (ADTS copy of the TS audio) is ~1.27 MB per 60 s; anonymous GQL metadata (plain query, web client id) gives `createdAt`, `lengthSeconds`, `status`, `broadcastType`, owner, game and `seekPreviewsURL`, whose path `<hash>_<login>_<stream_id>_<epoch>` names the broadcast without a playlist (also for sub-only VODs, presumably). **fMP4 VODs exist**: seen 2026-11-21 on ohnepixel 2934862154 (segments need the `EXT-X-MAP` init section; the media path handles it, `calibrate` didn't, see §17). T0 candidates there: PDT 12:32:36.470, chat anchor 12:32:40.731 (truncated) / 41.231 (rounded), Helix `created_at` 12:32:40 (whole seconds), path epoch 12:32:33. |
+| Twitch VOD HLS | Seen 2026-11-19 (smoke test, xqc archive 2932113307, 23 h, via streamlink): renditions `audio_only`, 160p30–1080p60 (`best` = source 1080p60). Media playlists `index-dvr.m3u8`: `PLAYLIST-TYPE:EVENT` + `ENDLIST`, segments `N.ts`, **MPEG-TS** (audio_only: AAC 48 kHz stereo + timed ID3, ~274 KB per 10 s; 1080p60: H.264 + AAC + ID3, ~10.5 MB per 10 s), EXTINF mostly 10.000 with some longer (TARGETDURATION 13), segment timestamps don't start at 0. **Only `audio_only` has `EXT-X-PROGRAM-DATE-TIME`** (every segment, ms), and it is exactly T0 + ΣEXTINF (zero deviation over 23 h, so it shows no gaps) with T0 = the video's GQL `createdAt` − 3.2 s (Helix not checked: no credentials); video renditions have none. `EXT-X-TWITCH-TOTAL-SECS` = ΣEXTINF (83735.25; `lengthSeconds` 83735). `#ID3-EQUIV-TDTG` (no zone) ≈ the VOD's *end* (+ 6 s), not its start. Path `<hash>_<login>_<stream_id>_<epoch>`: epoch = GQL `createdAt` − 6 s. Muted parts: `N-muted.ts`; `audio_only` and 1080p60 were compared: same count (1280 of 8343) and same first names (18–20-muted), full index sets not compared; a muted segment still has its AAC track. No `-unmuted` names, no discontinuities. This VOD is MPEG-TS (xqc is TS live too); fMP4 VODs exist as well (below). Unknown VOD id: no playback token (streamlink returns no streams); GQL `video: null`. 5c run (2026-11-19, same VOD, first 10 min): segments 18–35 muted, the stored `.aac` (ADTS copy of the TS audio) is ~1.27 MB per 60 s; anonymous GQL metadata (plain query, web client id) gives `createdAt`, `lengthSeconds`, `status`, `broadcastType`, owner, game and `seekPreviewsURL`, whose path `<hash>_<login>_<stream_id>_<epoch>` names the broadcast without a playlist (also for sub-only VODs, presumably). **fMP4 VODs exist**: seen 2026-11-21 on ohnepixel 2934862154 (segments need the `EXT-X-MAP` init section; the media path handles it, and `calibrate` too since its fix (2026-11-21), see §17). T0 candidates there: PDT 12:32:36.470, chat anchor 12:32:40.731 (truncated) / 41.231 (rounded), Helix `created_at` 12:32:40 (whole seconds), path epoch 12:32:33. |
 | Twitch clips | Get Clips returns top viewer-made clips with `vod_offset` → free ground truth for testing the detector. |
 | Twitch HLS | 2 s segments, each with `EXT-X-PROGRAM-DATE-TIME`, in one of two containers depending on the channel (seen 2026-11-18): MPEG-TS (H.264 + AAC 48 kHz + timed ID3; e.g. xqc) or fragmented MP4 (`EXT-X-MAP` init section + `.mp4` fragments, all renditions incl. audio_only; e.g. ohnepixel), even when only H.264 is requested; the live playlist holds only ~30 s, so a recorder restarted within ~30 s loses nothing. Source 1080p60 ≈ 8.4 Mbps (~63 MB/min); audio ≈ 165 kbps (~1.2 MB/min). Ads are inserted for our recorder (a viewer): segments titled "Amazon…" or inside a `twitch-stitched-ad` DATERANGE; filtering them leaves gaps. Turbo token avoids most ads. VODs get muted for copyrighted music; live recordings don't. |
 | MinIO | Community Docker images stopped Oct 2025 → we use **SeaweedFS** (`weed mini`). |
@@ -271,8 +271,9 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
    → `chat_messages` / `chat_metrics_1s` through the live aggregator, watermark resume, skipped
    where live chat exists. Viewer clips (Helix) → `viewer_clips` (T0 + vod_offset ± slack).
    Shared code moved to `clipper_core.{chunks,chat,ffmpeg}`; migration 0003 (`vods`,
-   `viewer_clips`, `streams` CHECKs). Tested on a real VOD (10 min media, 4 min chat); clips and
-   `calibrate` still need a real run (Helix credentials; a stream recorded live). `channel
+   `viewer_clips`, `streams` CHECKs). Tested on a real VOD (10 min media, 4 min chat). First real run
+   of clips and `calibrate` 2026-11-21 on ohnepixel 2934862154 (clips: 99 kept; calibrate: chat
+   clock confirmed, audio T0 failed on the fMP4 VOD, fixed the same day, rerun pending). `channel
    <login>` only lists a channel's archives (2026-11-21: backfill runs only on a named VOD). Design:
    [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not
    yet agreed).
@@ -712,8 +713,10 @@ are requeued by the controller after 15 min (exists).
 ## 17. Backfill tool (step 5) — proposed 2026-11-19, not yet agreed
 
 **Status:** proposal; 5a (shared pieces + contract), 5b (Twitch VOD access), 5c (media + time:
-`tools/backfill`) and 5d (chat replay, viewer clips, `calibrate`) are built; `calibrate` has not
-run on real data yet (needs a broadcast we recorded live, and the live DB/storage). The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
+`tools/backfill`) and 5d (chat replay, viewer clips, `calibrate`) are built; `calibrate` first ran
+on real data 2026-11-21 (ohnepixel 2934862154, recorded live as our stream 803): chat clock
+confirmed, audio T0 failed on the fMP4 VOD, fixed the same day, rerun pending (see "Calibrate"
+under 5d). The 5b smoke test (2026-11-19, one xqc archive) answered the playlist
 and chat questions: see §3 (rows "Twitch VOD chat", "Twitch VOD HLS"); the time model below is
 updated with it (5c: T0 from PDT, see "Time model").
 
@@ -749,8 +752,8 @@ stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in st
   unfilled; finer trimming later if it matters). Chunks get `source = 'backfill'` in the live
   stream, with `muted` gaps as usual and BACKFILL-priority transcribe jobs.
 - **Time**: the VOD's T0 measured by `calibrate` against the live chunks when there is one
-  (±21 ms, it lines up with the live clock), else `T0_pdt` with a flag. So the fMP4 `calibrate`
-  fix comes first.
+  (±21 ms, it lines up with the live clock), else `T0_pdt` with a flag. The fMP4 `calibrate`
+  fix this needed is built (2026-11-21); its rerun on 2934862154 is pending.
 - **Chat** (the whole stack was down in both cases, chat included): replay messages only for
   seconds without live chat. `sent_at = createdAt` equals `tmi-sent-ts` (verified 205/205), so the
   PK already skips messages logged live. Metrics are written only for seconds without a live
@@ -1067,10 +1070,25 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
      `T0_pdt`'s bias. **First run 2026-11-21** (main session, ohnepixel 2934862154 = our stream
      803, live chunks 12:32:42–17:29:24Z only): chat clock confirmed (`createdAt` = `tmi-sent-ts`
      for 205/205 matched comments; chat anchor + 4.26 s after PDT), but **no audio T0** ("no
-     usable window"): the VOD is fMP4, and `_match` writes the fragments as `vod_{seq}.ts` without
-     the `EXT-X-MAP` init section, so ffmpeg can't read them ("tfhd was found … error reading
-     header"). **Bug, fix pending**: prepend the init section and write `.mp4`, as `pipeline._build`
-     does; then rerun on 2934862154. 78 of 297 live chunks were skipped (VOD edge or muted).
+     usable window"): the VOD is fMP4, and `_match` wrote the fragments as `vod_{seq}.ts` without
+     the `EXT-X-MAP` init section, so ffmpeg couldn't read them ("tfhd was found … error reading
+     header"). 78 of 297 live chunks were skipped (VOD edge or muted). **Fixed 2026-11-21**:
+     `_match` fetches the init section (asked for once per run: the downloader remembers it, a
+     lost one too; lost → that window is skipped with a note, no crash; the media path still
+     turns every unit under a lost init into gaps), prepends it and writes `vod_{seq}.mp4`
+     (`pipeline.write_media`, shared with `_build`); a window across an init section change is
+     left out like a muted one. `decode_pcm` reads an `.mp4` with `-ignore_editlist 1`, so
+     sample 0 is the window's first coded sample, as for TS and as in our `.aac` stream copies
+     (media path and recorder). Tests on ffmpeg 9.0.2 (dev machine): no padding up to the first
+     fragment's `baseMediaDecodeTime`; without the flag an edit list's `media_time` (e.g. 1024
+     samples of AAC priming) is dropped at the start of every window (T0 21.3 ms off); the
+     `extract_audio` `.aac` of such a file starts at the same sample with the same length. The
+     images' ffmpeg (Debian trixie, 7.1) is assumed to behave the same, not checked. A window
+     whose download fails after its retries (`DownloadError`) is skipped with a note too, and the
+     chat half still reports. Tests: the synthetic audio as an fMP4 VOD (ffmpeg's HLS muxer;
+     windows start at fragments with `baseMediaDecodeTime` > 0; plain and priming edit list):
+     T0 < 2 ms; init lost → windows skipped, the init asked for once; init change → that window
+     left out; a segment failing for good → its window skipped. Rerun on 2934862154: pending.
    - **Deviations:** the chat-time fallback uses the chat clock (above), not `T0 + offset`;
      `--max-minutes` limits media and chat (each from its own resume point), `--chat-max-minutes`
      chat alone; `--start-offset` is media only (chat always starts at 0: missing seconds would

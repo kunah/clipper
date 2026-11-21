@@ -16,8 +16,22 @@ Read-only (nothing is written, no lease). It answers the time-model questions a 
    (Twitch's replay band: its lower edge is the latency compensation, its width the rounding).
 
 Windows are picked evenly over the live chunks whose search range (± `search_s` around the T0
-estimate) lies inside the VOD and has no muted segment. Downloads: ~`2 * search_s + chunk` s of
-`audio_only` per window (~0.3 MB per 10 s) plus the chat sample pages.
+estimate) lies inside the VOD, has no muted segment and one init section (fMP4). Downloads:
+~`2 * search_s + chunk` s of `audio_only` per window (~0.3 MB per 10 s), the init section of an
+fMP4 VOD (asked for once per run: the downloader remembers it, a lost one too) plus the chat
+sample pages. A window that can't be read (init section or segment lost, a download failing
+after its retries, ffmpeg failing) gets a note and is skipped; the other windows and the chat
+part go on.
+
+fMP4 VODs (`EXT-X-MAP`): a window is written as init section + fragments (`.mp4`, as the media
+path does) and decoded with the edit list ignored, so decoded sample 0 is the first coded sample
+of the window's first fragment, as for MPEG-TS and as in the `.aac` stream copies of the media
+path and the recorder. What the tests showed with ffmpeg 9.0.2 (the dev machine's): no padding up
+to the first fragment's `baseMediaDecodeTime`, but without `-ignore_editlist` an edit list's
+`media_time` (e.g. 1024 samples of AAC priming) is dropped at the start of EVERY window, shifting
+each match by ~21 ms; the `.aac` copy keeps every coded sample either way. Not checked with the
+images' ffmpeg (Debian trixie: 7.1): assumed to have the option and to behave the same (running
+`test_calibrate.py` in the image would show it).
 """
 
 from __future__ import annotations
@@ -43,7 +57,8 @@ from clipper_backfill.backfill import (
     parse_video_ref,
     vod_meta,
 )
-from clipper_backfill.pipeline import MediaError
+from clipper_backfill.download import DownloadError
+from clipper_backfill.pipeline import MediaError, write_media
 from clipper_backfill.t0 import ChatPoint, estimate_t0, pdt_points
 from clipper_core.contracts import DataSource
 from clipper_core.logs import get_logger
@@ -68,8 +83,14 @@ class ReadStore(Protocol):
 
 
 def decode_pcm(ffmpeg: str, path: Path, rate: int = RATE) -> np.ndarray:
-    """The first audio track as mono float32 samples at `rate` (blocking: run in a thread)."""
-    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path)]
+    """The first audio track as mono float32 samples at `rate` (blocking: run in a thread).
+
+    Sample 0 is the first coded sample of the file: an `.mp4` (fMP4 init section + fragments) is
+    read with its edit list ignored (`-ignore_editlist`, a mov demuxer option: not for TS/ADTS)."""
+    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error"]
+    if path.suffix == ".mp4":
+        cmd += ["-ignore_editlist", "1"]
+    cmd += ["-i", str(path)]
     cmd += ["-map", "0:a:0", "-ac", "1", "-ar", str(rate), "-f", "s16le", "pipe:1"]
     try:
         out = subprocess.run(cmd, capture_output=True, timeout=300, check=False)
@@ -209,7 +230,8 @@ def _windows(
     search_s: float,
 ) -> tuple[list[tuple[Any, list[VodSegment]]], int]:
     """Up to `count` (chunk, VOD segments to search) spread over the stream, and how many
-    chunks were left out (outside the VOD or muted around them)."""
+    chunks were left out (outside the VOD, muted or an fMP4 init section change around them:
+    fragments after the change need the other init section, so they don't concatenate)."""
     vod_end = segments[-1].end_s if segments else 0.0
     usable = []
     for chunk in chunks:
@@ -218,7 +240,7 @@ def _windows(
         if start < 0 or end > vod_end:
             continue
         segs = [s for s in segments if s.end_s > start and s.offset_s < end]
-        if segs and not any(s.muted for s in segs):
+        if segs and not any(s.muted for s in segs) and _one_init(segs):
             usable.append((chunk, segs))
     if not usable or count <= 0:
         return [], len(chunks) - len(usable)
@@ -226,6 +248,11 @@ def _windows(
         {min(len(usable) - 1, int((i + 0.5) * len(usable) / count)) for i in range(count)}
     )
     return [usable[i] for i in picks], len(chunks) - len(usable)
+
+
+def _one_init(segs: Sequence[VodSegment]) -> bool:
+    """All under the same `EXT-X-MAP` (or all MPEG-TS)."""
+    return len({s.init_uri for s in segs}) <= 1
 
 
 async def calibrate(
@@ -290,14 +317,18 @@ async def calibrate(
             chunks, audio.segments, estimate.t0, count=windows, search_s=search_s
         )
         if left_out:
-            cal.notes.append(f"{left_out} chunks not usable (VOD edge or muted around them)")
+            cal.notes.append(
+                f"{left_out} chunks not usable (VOD edge, muted or init section change around them)"
+            )
         with tempfile.TemporaryDirectory(
             prefix=TEMP_PREFIX, dir=bf.settings.temp_dir, ignore_cleanup_errors=True
         ) as tmp:
             for chunk, segs in picked:
                 try:
                     cal.matches.append(await _match(bf, store, Path(tmp), chunk, segs))
-                except (MediaError, ValueError) as exc:  # ValueError: decoded shorter than chunk
+                # DownloadError: failed for good after retries (403, 5xx, network); ValueError:
+                # decoded shorter than the chunk
+                except (MediaError, DownloadError, ValueError) as exc:
                     cal.notes.append(f"chunk {chunk.seq}: {type(exc).__name__}: {exc}")
 
     t0a = cal.t0_audio
@@ -342,12 +373,22 @@ async def _sample_comments(
 async def _match(
     bf: Backfiller, store: ReadStore, tmp: Path, chunk: Any, segs: list[VodSegment]
 ) -> AudioMatch:
-    """Where the live chunk's audio lies in the VOD."""
+    """Where the live chunk's audio lies in the VOD. MediaError (or DownloadError): its window
+    can't be read."""
+    if not _one_init(segs):  # `_windows` leaves these out
+        raise MediaError("the fMP4 init section changes inside its window")
+    init = b""
+    init_uri = segs[0].init_uri
+    if init_uri:  # fMP4: the fragments are unreadable without it
+        data = await bf.downloader.init_section(init_uri)
+        if data is None:
+            raise MediaError("the VOD's fMP4 init section is gone")
+        init = data
     datas = await bf.downloader.segments(segs)
     if any(d is None for d in datas.values()):
         raise MediaError("a VOD segment of its window is gone")
-    vod_path = tmp / f"vod_{chunk.seq}.ts"
-    vod_path.write_bytes(b"".join(datas[s.index] or b"" for s in segs))
+    vod_path = tmp / f"vod_{chunk.seq}{'.mp4' if init_uri else '.ts'}"
+    await asyncio.to_thread(write_media, vod_path, init, [datas[s.index] for s in segs])
     live_path = tmp / f"live_{chunk.seq}.aac"
     live_path.write_bytes(await asyncio.to_thread(store.get_bytes, chunk.audio_key))
     ffmpeg = bf.settings.ffmpeg

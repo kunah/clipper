@@ -49,7 +49,7 @@ class Downloader:
         self.max_backoff_s = max_backoff_s
         self._sleep = sleep
         self._slots = asyncio.Semaphore(concurrency)
-        self._init: tuple[str, bytes] | None = None  # the current fMP4 init section
+        self._init: tuple[str, bytes | None] | None = None  # the current fMP4 init section
         self.bytes = 0  # downloaded, all requests
         self.requests = 0
 
@@ -61,12 +61,12 @@ class Downloader:
         return data.decode("utf-8", errors="replace")
 
     async def init_section(self, uri: str) -> bytes | None:
-        """fMP4 init section (cached: consecutive chunks share it). None: lost."""
+        """fMP4 init section. None: lost (404/410, like a segment). Cached, a lost one too:
+        consecutive chunks share it, so it is asked for once per URI in a row, not per chunk."""
         if self._init and self._init[0] == uri:
             return self._init[1]
         data = await self._get(uri, what="init section")
-        if data is not None:
-            self._init = (uri, data)
+        self._init = (uri, data)
         return data
 
     async def segments(self, segments: Sequence[VodSegment]) -> dict[int, bytes | None]:

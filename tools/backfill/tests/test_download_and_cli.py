@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -9,6 +10,8 @@ import pytest
 from clipper_backfill.backfill import UsageError, _pick_rendition, parse_video_ref
 from clipper_backfill.cli import options, parse_args, parse_offset
 from clipper_backfill.download import Downloader, DownloadError
+from clipper_backfill.pipeline import MediaRunner
+from clipper_backfill.planner import plan_units
 from clipper_twitch.hls import parse_vod_playlist
 
 BASE = "https://cdn.test/abc_streamer_777_1795000000/audio_only/"
@@ -107,6 +110,32 @@ async def test_init_section_is_cached():
     assert await dl.init_section(BASE + "init-0.mp4") == b"init-0.mp4"
     assert await dl.init_section(BASE + "init-0.mp4") == b"init-0.mp4"
     assert cdn.calls == ["init-0.mp4"]
+
+
+async def test_a_lost_init_section_is_cached_too():
+    cdn = Cdn(script={"init-1.mp4": [404, 404]})
+    dl, waits = downloader(cdn)
+    assert await dl.init_section(BASE + "init-1.mp4") is None  # a 404 is asked twice
+    assert await dl.init_section(BASE + "init-1.mp4") is None  # then remembered: no backoff
+    assert cdn.calls == ["init-1.mp4", "init-1.mp4"] and len(waits) == 1
+    assert await dl.init_section(BASE + "init-2.mp4") == b"init-2.mp4"  # another URI: asked
+
+
+async def test_a_lost_init_section_marks_every_chunk_on_it_lost(tmp_path):
+    """The media path with the cached loss: each unit under the init is lost (-> gaps), and
+    neither the init nor any fragment is asked for again."""
+    text = '#EXTM3U\n#EXT-X-MAP:URI="init-0.mp4"\n'
+    text += "".join(f"#EXTINF:10.000,\n{i}.mp4\n" for i in range(12)) + "#EXT-X-ENDLIST\n"
+    segs = parse_vod_playlist(text, BASE + "index-dvr.m3u8").segments
+    cdn = Cdn(script={"init-0.mp4": [404, 404]})
+    dl, _ = downloader(cdn)
+    runner = MediaRunner(None, None, dl, None, workdir=tmp_path)  # _build only downloads here
+    units = plan_units(segs, chunk_s=60.0).units
+    assert len(units) == 2
+    for unit in units:
+        files = await runner._build(SimpleNamespace(stream_id=1), unit)
+        assert files.lost == {s.index for s in unit.segments} and files.paths == []
+    assert cdn.calls == ["init-0.mp4", "init-0.mp4"]  # the 404 asked twice, then remembered
 
 
 @pytest.mark.parametrize(
