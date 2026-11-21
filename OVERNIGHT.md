@@ -133,15 +133,28 @@ Nothing is pushed or merged. This file is the resume point and the morning summa
 - Judge unit 6d (real LLM adapters + `clipper-judge eval`): your provider/model choice, API key
   and the eval spend.
 
-## In progress
+- Judge unit 6b (commit "Judge input builder + resolver"): new `services/judge` package (pure):
+  versioned, byte-stable LLM input (transcript with timing, chat summary, audio events, media
+  ranges; chat/titles fenced and length-capped against prompt injection; prompt text in
+  `prompts/v1/`, pinned by sha256) + request hash; `JudgeAnswer` schema; resolver: model answer
+  or operator `PlanPatch` → repaired, valid `EditPlan` (never cuts inside a word, splits at video
+  holes, durations, hashtags, hook/teaser/zooms…) or reject / context request / retry; context
+  caps (≤ 2 extensions, ≤ 3 calls). Property test over words on holes, across video edges and
+  overlapping words: 0 mid-word cuts (the old code had 43/277). Shared chat filters (bots,
+  normalised text, "clip it", links, commands) moved from the detector into
+  `clipper_core.chat` + `bots.toml` (detector re-exports them; lexicon v2). 1021 tests.
 
-- Judge unit 6b: input builder + resolver (pure: transcript/chat/audio window → LLM input;
-  LLM answer → validated EditPlan with recorded repairs).
+## Stopped here (2026-11-21, on your request "stop after 6b")
 
-## Next
+Nothing is running; no agents active. The worktree is clean at the last commit.
 
-- Judge 6c (service with the fake model), then renderer §20 (contracts, pure graph builder,
+## Next (when you resume)
+
+- Judge 6c (service with the fake model: waits for transcripts, context rounds, one
+  transaction per plan + render job), then renderer §20 (contracts, pure ffmpeg graph builder,
   NVENC smoke test), review §21 and publisher §22 contracts + fakes.
+- Open choice from 6b: when only tiny video islands remain near the moment, the resolver spends
+  the one retry (`Unrepairable`) instead of rejecting as `no_video` — keep or change.
 
 ## How to deploy the transcriber (your call, in the morning)
 
@@ -161,6 +174,9 @@ New disk use so far ≈ 6.8 GB as Docker counts it (3.0 GB image + 3.8 GB build 
 with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, volumes) deleted.
 
 ## Environment events
+
+- 2026-11-21: Docker Desktop was off (reboot/quit); you started it again (~12:40 local); the
+  live stack is running.
 
 - 2026-11-19 ~21:34 local: you stopped the Clipper compose stack to use the PC.
 - 2026-11-20 02:31 local: restarted at your OK with `docker start` on the same five containers

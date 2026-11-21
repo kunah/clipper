@@ -16,6 +16,7 @@ members = [
     "clipper-core",
     "clipper-db",
     "clipper-detector",
+    "clipper-judge",
     "clipper-recorder",
     "clipper-transcriber",
     "clipper-twitch",
@@ -411,6 +412,17 @@ requires-dist = [
     { name = "clipper-core", editable = "libs/core" },
     { name = "clipper-twitch", editable = "libs/twitch" },
 ]
+
+[[package]]
+name = "clipper-judge"
+version = "0.1.0"
+source = { editable = "services/judge" }
+dependencies = [
+    { name = "clipper-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "clipper-core", editable = "libs/core" }]
 
 [[package]]
 name = "clipper-recorder"

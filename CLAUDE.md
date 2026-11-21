@@ -13,7 +13,9 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   (S3 + key layout), `partitions` (daily chat partitions), `logs` (unified structured
   logging), `runtime` (entry helpers); shared by live services and backfill: `chunks`
   (`commit_chunk`: chunk + gaps + transcribe job), `chat` (chat rows, `SecondAggregator`,
-  `ChatWriter`), `ffmpeg` (stream copies: audio out, fMP4 -> .ts).
+  `ChatWriter`; chat filters shared by detector and judge: `normalised_text`, `is_command`,
+  `is_mention`, `strip_links`, `user_key`, bots via `load_bots()` from the packaged
+  `clipper_core/bots.toml`), `ffmpeg` (stream copies: audio out, fMP4 -> .ts).
 - `libs/twitch/` (`clipper_twitch`): IRC parser + anonymous chat client, Helix API client
   (streams, users, `get_videos`, `get_video`, `get_clips`), third-party emote sets
   (7TV/BTTV/FFZ), live + VOD HLS playlist parsers (`hls`), VOD playlist URLs via streamlink and
@@ -37,7 +39,7 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   explicitly, and tests use the fakes.
   `services/detector/` (`clipper_detector`, DESIGN §18). Pure part (no DB, no clock): `params`
   (`DetectorParams`, optional TOML, `detector_version`), `lexicon` + versioned
-  `data/lexicon.toml` (emote/word categories, bots, per-channel overrides), `scorer` (stage 1:
+  `data/lexicon.toml` (emote/word categories, per-channel overrides; bots from core), `scorer` (stage 1:
   `ChannelScorer.step(second)` -> suspects/episodes), `stage2` (raw chat -> shares, clean uniques,
   moment type, fake-spike rules), `merge` (episode -> candidate draft: delay, window, cooldown,
   budget), `explicit` ("clip it" mentions, viewer clips -> signals), `pipeline` (scorer + stage 2
@@ -47,6 +49,14 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `settings` (`CLIPPER_DETECTOR_*`: `MODE` live|offline|all, offline not built yet; `JUDGE_JOBS`
   default 0 until the judge exists). Viewer clips only with `CLIPPER_TWITCH_*` credentials.
   Compose service `detector` (profile `detector`). Needs migration 0004.
+  `services/judge/` (`clipper_judge`, DESIGN §19), pure part only so far (6b; no service,
+  Dockerfile or compose yet): `params` (`JudgeParams`), `inputs` (`JudgeInputs`, one round in
+  memory), `transcript` (sentences `S1…`, snapping lookups), `answer` (`JudgeAnswer`, the model's
+  schema), `prompt` (`build_request` -> versioned, byte-stable `JudgeRequest` + `request_hash`;
+  prompt text in `prompts/v{N}/`), `resolver` (answer or `PlanPatch` -> repaired `EditPlan`,
+  reject, context request; repair codes), `samples` (fixture candidate). Goldens in
+  `tests/fixtures/` (`CLIPPER_JUDGE_UPDATE_GOLDEN=1` rewrites them); tests pin the prompt files
+  and the input format (a used `prompts/v{N}/` is frozen: add the next one). Depends on core only.
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
   (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then

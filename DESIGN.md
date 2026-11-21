@@ -4,7 +4,7 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-20):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
+> **Status (2026-11-21):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
 > unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill). The transcriber
 > is built and tested end to end on throwaway data but not deployed yet (migration 0002 + the
 > `transcriber` compose service, profile `gpu`). Step 5 (backfill tool, design §17 proposed)
@@ -14,7 +14,8 @@ judges, edits and publishes short vertical clips.
 > lexicon, merge: pure code in `services/detector`, synthetic tests) built 2026-11-20; build item 3
 > (live service `clipper-detector`, compose profile `detector`, judge jobs off) built 2026-11-20,
 > not deployed (needs 0004 on the live DB). Judge build item 6a (contracts + migration 0005 +
-> `clipper_core.lifecycle`, §19) built 2026-11-20, not on the live DB yet; no judge service yet.
+> `clipper_core.lifecycle`, §19) built 2026-11-20, not on the live DB yet; build item 6b (input
+> builder + resolver, pure code in `services/judge`) built 2026-11-21; no judge service yet.
 > Controller live status needs Twitch app credentials in `.env`; chat logging works without, but
 > the recorder only records streams the controller marked live.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -132,7 +133,8 @@ Jobs have a **priority that can change after they're queued** (demand-driven):
   queued transcription jobs for overlapping chunks are bumped immediately; chunks recorded
   later inside the range are enqueued at that priority (`media.priority_for_range`), which
   covers context *after* the trigger.
-- The judge may extend context (cap: e.g. 10 min before / 2 min after, max 2 rounds). The clip
+- The judge may extend context (cap: e.g. 10 min before / 2 min after, ≤ 2 extensions, so ≤ 3
+  calls per clip). The clip
   goes back to `waiting_for_media`. If the stream ends, continue with what exists.
 - Running jobs aren't interrupted (a 60 s chunk takes seconds).
 - Own job queue in Postgres (`clipper_core.jobs`), not a library: `FOR UPDATE SKIP LOCKED`,
@@ -270,7 +272,7 @@ Telegram bot. Own minimal Twitch IRC client (full control over tags).
 context requests) → renderer (9:16, captions) → review (Telegram + web) → publisher →
 analytics loop. Then Kick/YouTube. Detector build items 1–3 (contracts, scorer, live service)
 built 2026-11-20, see §18.10; judge build item 6a (contracts, migration 0005, lifecycle helper)
-built 2026-11-20, see §19. Designs (all proposed 2026-11-19, not yet agreed):
+built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, see §19. Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -1203,7 +1205,9 @@ model (code defaults, optional TOML); `detector_version` = code + params hash + 
 `[emotes]` exact name → category: funny (KEKW, OMEGALUL), hype (Pog, EZ), shock (NOWAYING, D:),
 tense (monkaS), sad (Sadge), cringe, wholesome (<3), greeting (peepoHey); `[words]` case-insensitive
 (lmao, w, f, no way, hi, clip it); `[patterns]` anchored regexes at weight 0.5 for 7TV variants
-(`^kek`, `^lul` → funny; only on emote-like tokens, build item 2); `[bots]`; `[transcript]` phrases; `[channels.<login>]` overrides. Unknown emotes count as
+(`^kek`, `^lul` → funny; only on emote-like tokens, build item 2); bots (since lexicon v2 in
+`clipper_core/bots.toml`, shared with the judge; a lexicon file may add its own `[bots]`);
+`[transcript]` phrases; `[channels.<login>]` overrides. Unknown emotes count as
 `uncategorised`; `clipper-detector lexicon --unknown` lists the most used (a table only once
 non-developers edit it). **Moment type** = dominant category of per-message votes (one per message
 and category, one per user; `emote_counts` counts tokens, so it's used only where raw chat isn't
@@ -1359,7 +1363,8 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
    nothing; raid, mass gift, copypasta, `!enter`, "1/2" votes, greeting flood → suppressed with
    the right reason; replay from a later start → same. Built as `services/detector`
    (`clipper_detector`, no Dockerfile/compose yet): `params.DetectorParams` (every tunable above,
-   flat TOML overrides, unknown keys rejected), `lexicon` + `data/lexicon.toml` v1 (first
+   flat TOML overrides, unknown keys rejected), `lexicon` + `data/lexicon.toml` v1 (v2 since
+   2026-11-21: the bots moved to `clipper_core/bots.toml`, see §19 6b; first
    hand-made list, to be tuned), `scorer.ChannelScorer`, `stage2.evaluate`,
    `merge.plan_candidate`, `pipeline.run_stream` (the three over in-memory rows: the reference for
    the live service and the backtest), `synthetic` (seeded chat through the real
@@ -1658,8 +1663,8 @@ No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
 ## 19. Judge (phase 2) — proposed 2026-11-19, not yet agreed
 
 **Status:** proposal (not yet agreed); build item 6a (contracts + migration 0005 +
-`clipper_core.lifecycle`) built 2026-11-20, not on the live DB yet; the rest not built. Input
-builder, plan repair and the service can be built now with a deterministic fake model; provider and model are the **user's decision** (cost),
+`clipper_core.lifecycle`) built 2026-11-20, not on the live DB yet; build item 6b (input builder
++ resolver, pure) built 2026-11-21; the service (6c) not built. The service can be built now with a deterministic fake model; provider and model are the **user's decision** (cost),
 made with the eval harness (6d). Prompt, thresholds and clip lengths get tuned on real candidates.
 
 **Ownership (§19–§22; replaces §8's "later" rows once agreed).** One writer per table; `jobs` is
@@ -1698,7 +1703,8 @@ planned` + `failed`; the rest of §7 comes from §20–§22's tables, and §7 ga
 
 **Context extension.** Answer `need_context` (`before_s`, `after_s`, why) → context = union, clamped
 to `[T − 10 min, T + 2 min]` and the stream; round + 1; `request_media(..., Priority.JUDGE_CONTEXT,
-requested_by="judge", clip_id)`; back to `waiting_for_media`: one transaction. Max 2 rounds; the last
+requested_by="judge", clip_id)`; back to `waiting_for_media`: one transaction. At most 2
+extensions (rounds 0 and 1 may ask), so at most 3 calls per clip (plus one retry each); the last
 round's schema has no `need_context`. Each round is a `clip_plans` row (analytics see the asks).
 
 **Revisions** (`revise_plan` from review, §21, at `JUDGE_CONTEXT`: a human waits). Refused if
@@ -1821,11 +1827,110 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
      `lifecycle_state()`; `lifecycle_states()` logs a warning and leaves that clip out, as it does
      ids without a clip row (`candidate` only from the pure function). A bare string where a
      collection is expected (`publication_statuses`, `clip_ids`) is a `TypeError`.
-2. **6b Input builder + resolver (pure).** *Done:* byte-stable input for a fixture candidate (golden
-   file); ≥ 20 repair cases (snap, gap split, durations, no mid-word cut, unknown SFX dropped,
-   touching segments merged, `#`/whitespace hashtags and > 5 tags, long/empty hook text, teaser
-   out of its segment or > 3 s, points at the out point or in a cut, a zoom across a cut, blank
-   title); every resolver output validates as `EditPlan`.
+2. ✅ **6b Input builder + resolver (pure)** (built 2026-11-21). *Done:* byte-stable input for a
+   fixture candidate (golden file); ≥ 20 repair cases (snap, gap split, durations, no mid-word cut,
+   unknown SFX dropped, touching segments merged, `#`/whitespace hashtags and > 5 tags, long/empty
+   hook text, teaser out of its segment or > 3 s, points at the out point or in a cut, a zoom across
+   a cut, blank title); every resolver output validates as `EditPlan`. Built as `services/judge`
+   (`clipper-judge`, module `clipper_judge`, no Dockerfile/compose yet): `params.JudgeParams` (all
+   tunables of builder and resolver in one frozen object, so the input states the limits the
+   resolver enforces), `inputs.JudgeInputs` (one round in memory; rows as protocols, ORM rows fit;
+   `media_ranges(chunks)`, `bridge_jitter`), `transcript` (sentences by the transcriber's rule,
+   ids `S1…` over the context; snapping lookups), `answer` (`JudgeAnswer`, `FinalJudgeAnswer`,
+   `parse_answer`, `AnswerError`, `ANSWER_SCHEMA_VERSION = 1`), `prompt` (`build_request` →
+   `JudgeRequest`, `request_hash(model, request)`, `load_prompt`; `prompts/v1/system.md` +
+   `user.md`), `resolver` (`resolve`, `resolve_patch`, `extend_context`; outcomes `Planned`,
+   `Rejected`, `NeedsContext`, `Unrepairable`; codes `Repair`), `samples` (the fixture candidate,
+   also for 6c's fakes). Tests: golden user content + full request JSON (rounds 0 and 2) in
+   `services/judge/tests/fixtures/` (`CLIPPER_JUDGE_UPDATE_GOLDEN=1` rewrites them), 63 resolver
+   cases, 13 context-request cases, a seeded property test (300 random contexts/videos/words/answers
+   plus a random operator patch each; once run with 4,500 more cases, all valid), ~2.5 s in all.
+   Decisions and deviations:
+   - **Answer shape**: `{reasons, verdict, confidence, need_context, plan}` with the plan fields
+     nested in `plan` (null for reject/need_context), reasons first (the model explains before it
+     decides), seconds relative to T. Lenient where the resolver repairs (title/hook length, `#`
+     tags, unknown SFX tags, any zoom scale, out-of-range confidence/focus), strict on types, enum
+     values and finite numbers (NaN/inf, bad enums: `AnswerError`, one retry). Unknown keys are
+     ignored; the schema still says `additionalProperties: false`. The schema drops pydantic's
+     titles and class docstrings (editing a core enum's docstring must not change the prompt
+     version). A clip without a plan takes the core moment (`default_plan`).
+   - **Prompt version** `v1-<sha8>` over `system.md`, `user.md`, the code's line format
+     (`INPUT_FORMAT = 1`) and both answer schemas; the request hash covers model, prompt version,
+     schema version, system, user, schema and max tokens (canonical JSON). Line endings are
+     normalised to LF when the prompt is loaded.
+   - **Input document**: low-confidence words (< 0.5) marked `(?)` before trailing punctuation
+     (`go(?).`; a bare `?` reads as a question); holes in the transcript `[a→b no audio: <gap
+     reason>]`, `[a→b no transcript yet]` (pending), `[a→b no speech]` (≥ 5 s without words); a
+     Media section (context, video ranges with jitter holes bridged, labelled holes); chat per 5 s
+     bucket aligned on T: messages and distinct users without bots and deleted messages, top 3
+     emotes (from the messages' emote lists), top 3 normalised messages (links stripped,
+     `!commands` and emote-only messages left out), distinct users asking for a clip; audio runs of
+     notable seconds (a group other than speech ≥ 0.5, or loudness ≥ median + 6 dB) with
+     "Content ID risk" at music ≥ 0.6. Untrusted text sits in `<data>` fences, one line per item,
+     control characters removed and angle brackets replaced by single angle quotation marks; chat
+     and the title are also JSON-quoted (the plan's own texts are not escaped: "I <3 this"
+     stays; both cleaners also drop zero-width and bidi characters).
+   - **Resolver details** beyond the list above: a cut with no part in the context takes the core
+     moment; an edge in a video hole moves to the nearest video (`clamp_video`), a cut wholly in a
+     hole to the nearest video range and grows from there (`move_to_media`); holes longer than
+     `split_gap_max_s` (10 s) are not jumped (T's side is kept, its new edge snapped inwards),
+     shorter ones split the cut, pieces < 1 s are dropped. Extension prefers the side with less
+     room around T, sentence edge by sentence edge, then seconds, never above the maximum; trimming
+     cuts the farther side until both are even, then both (1 ms spare for µs rounding); less video
+     than `min_s` is kept (`short_media`) down to CLIP_MIN, below that `rejected`/`no_video`.
+     Teasers need ≥ 1 s (`teaser_min_s`); emphasis words resolve by normalised text to the first
+     unused word of the named sentence (`S14`, `s14`, `14`), the model's order deciding which
+     survive the cap; overlapping zooms merge (union, max scale, the first's target); a blank title
+     falls back to the first sentence overlapping the core, then `<channel> clip`; the blocklist
+     (empty by default) also covers the hook text; `copyright_music_risk` is set when music ≥ 0.6
+     in a second inside the segments; `sensitive`/`copyright_music_risk` are recomputed on every
+     resolve, other flags (`partial_context`) copied. Repair codes are recorded once each, in the
+     order first applied.
+   - **Context requests** (`extend_context`): `before_s`/`after_s` clamped to `[0, 600]`/`[0, 120]`
+     and the stream (`started_at`, `ended_at`); the context only grows (union; one already past
+     the caps is kept); nothing new to see, or `round >= max_rounds` (rounds are 0-based: 0 and 1
+     may ask, 2 must decide), gives `Unrepairable(final=True)`: the retry states the error and
+     uses the final round's schema (`build_request(..., final=True)`). A `need_context` without
+     its object asks for the caps. `NeedsContext.context_request()` = the granted edges relative
+     to T.
+   - **`resolve_patch`** (operator revisions, §21) is in too: only the edges the patch moves are
+     snapped (none nearby: `unsnapped_*`), lengths use the contract's 3–180 s, word fixes are kept
+     only for existing words (start within 1 ms, one per word, inside the segments), the base's
+     emphasis/zooms/SFX/thumbnail are re-checked against the new segments; `model = "operator"`,
+     the base's prompt version.
+   - **Review fixes (2026-11-21)**:
+     - **Chat filters in core**: `clipper_core.chat` now holds `strip_invisible`,
+       `normalised_text`, `is_command`, `strip_links`, `is_mention`, `user_key`, `BotFilter`,
+       `NoBots` and the bot list (`load_bots().for_channel(login)` from the packaged
+       `clipper_core/bots.toml`; not under a `data/` dir); the patterns moved byte for byte, the
+       detector re-exports its old names and behaves as before (its tests unchanged). The
+       detector's `lexicon.toml` is v2 without bots; `Lexicon.load` adds the shared list and its
+       file hash goes into the lexicon tag (`detector_version` changes once). The judge depends on
+       clipper-core only.
+     - **Never inside speech**: words merged where they overlap or touch are speech blocks; an
+       edge inside one moves to the nearer block edge that fits (one step, no loop). Each edge is
+       snapped inside its own video range; a final pass (`_settle`) checks every segment edge
+       (also of a single segment and at holes), drops segments without a clean cut or (with
+       several) shorter than `min_segment_s`, and snaps a new outer edge inwards; a cut the pass
+       shortened below `min_s` is extended once more. The property test now generates words over
+       holes, over video edges and overlapping: before the fixes it found 43 of 277 plans and 35
+       of 277 patched plans cutting inside speech, after them none (3,000 extra cases too; the
+       reviewer's probes: 89 and 68 mid-word cuts, 2 and 2 tiny segments, now 0).
+     - **No cut**: a cut whose video can't hold CLIP_MIN (a small island) falls back to the core
+       moment (`core_fallback`); across a long hole the side whose video ranges can hold CLIP_MIN
+       wins over the side nearer T; still no cut → `rejected`/`no_video` only when the video over
+       `[moment_from − 30 s, moment_to + 30 s]` is shorter than CLIP_MIN, else `Unrepairable`
+       ("choose in_s/out_s inside a video range"; 1.5 % of the adversarial property cases).
+     - **`resolve_patch`** returns `Planned` or `PatchRefused(error)`, never a reject: an operator
+       edit can't change the clip's verdict (6c sends `notify(REVISION_REFUSED)`).
+     - **Inputs**: `JudgeInputs.words_interval` (required) must cover the context ± 5 s
+       (`words_interval_for(context)`), so the service reads the words cut by the context's edges.
+     - **Hash and versions**: `request_hash(model, request, options)` also covers the provider
+       options that change the answer (temperature, reasoning effort, ...). Tests pin the v1
+       prompt files' sha256 and, per `INPUT_FORMAT`, the sample document's: a used prompt is
+       frozen (edit by adding `prompts/v2/`), a format change needs an `INPUT_FORMAT` bump.
+   - Open (for 6c): the title blocklist's words; `split_gap_max_s` and `teaser_min_s` are guesses;
+     whether operator patches may jump a long hole (they can't now).
 3. **6c Service with the fake.** *Done (integration):* partial transcripts → waiting; transcript +
    NOTIFY → `planned` + render job in one transaction; `need_context` → `request_media(100)` bumps
    queued transcribe jobs, round 2 must decide; crash between call and commit → no second call;
@@ -1840,7 +1945,7 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
 | 2026-11-19 | The judge writes `clips` (statuses up to `planned`/`rejected`/`failed`), `clip_plans` and `judge_calls`; later §7 states come from `renders`, `clip_reviews` and `publications`, combined by one helper, `clipper_core.lifecycle.lifecycle_state()` | one writer per table; §7 stays one readable state |
 | 2026-11-19 | A judge job only advances a clip; waiting clips are re-checked on `clipper_transcripts` NOTIFY + a 30 s sweep, and a ready clip gets a new judge job per round (`judge:{cand}:r{n}`) | no worker blocks while media is missing; durable, prioritised, deduped wake-ups |
 | 2026-11-19 | Deadlines: soft 4 min after the context end (judge with what exists if the core moment is covered), hard 30 min; stream end handled by `coverage()` | campaigns reward speed; a busy GPU must not hold clips forever |
-| 2026-11-19 | Context extension: ≤ T − 10 min / T + 2 min, ≤ 2 rounds, the last round's schema can't ask again; `request_media(JUDGE_CONTEXT)` in the round's transaction | bounded cost and latency; §6 priorities do the rest |
+| 2026-11-19 | Context extension: ≤ T − 10 min / T + 2 min, ≤ 2 extensions (≤ 3 calls), the last round's schema can't ask again; `request_media(JUDGE_CONTEXT)` in the round's transaction | bounded cost and latency; §6 priorities do the rest |
 | 2026-11-19 | The model answers in a judge-internal `JudgeAnswer` (seconds relative to T, sentence ids); deterministic code resolves it into the versioned `EditPlan` (UTC, snapped to words, clamped to video) in libs/core | prompts change often, the renderer contract rarely; LLM times are never trusted raw |
 | 2026-11-19 | LLM behind a `JudgeModel` Protocol (Anthropic, OpenAI, Ollama adapters, deterministic fake); provider and model chosen by the user from `clipper-judge eval` numbers | cost is the user's call; the service and tests don't depend on a provider |
 | 2026-11-19 | Every call is logged in `judge_calls` with a request hash and committed right after the call; retries reuse it | crash-safe, never pay twice; cost and latency data for analytics |
@@ -2066,7 +2171,7 @@ per 1M, `budget_usd_per_stream_hour`, `daily_usd`, `soft_wait_s` 240, `hard_wait
 `max_rounds` 2, `max_before_s` 600, `max_after_s` 120, `min_clip_s` 10, `max_clip_s` 60,
 `judge_audio_only` false, `render_jobs` true, `shadow`, `concurrency` 4); compose service (assets
 volume read-only, for the SFX tag list); controller `STALE_AFTER[JUDGE] = 10 min` (§18),
-`STALE_AFTER[REVISE_PLAN] = 10 min`. The judge reads chat through §17's `clipper_core.chat` and the
+`STALE_AFTER[REVISE_PLAN] = 10 min`. (Built in 6b: the filters below are in `clipper_core.chat`.) The judge reads chat through §17's `clipper_core.chat` and the
 detector's filter helpers (bots, commands, dup normalisation), moved there so both read chat alike.
 
 ---

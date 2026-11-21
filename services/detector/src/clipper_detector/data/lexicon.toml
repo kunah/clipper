@@ -1,5 +1,7 @@
 # Clipper detector lexicon (DESIGN §18.2). Format: see clipper_detector/lexicon.py.
 #
+# v2 (2026-11-21): the chat bots moved to clipper_core/bots.toml (shared with the judge); the
+# lexicon reads them from there, so the categories and the bot list are unchanged.
 # v1 (2026-11-20): a first hand-made list of common Twitch / 7TV / BTTV / FFZ emotes and chat
 # words, NOT tuned yet. Tune it with backtests (`clipper-detector lexicon --unknown` will list the
 # most used unknown emotes) and bump `version` with every change: it is part of the
@@ -8,7 +10,7 @@
 # Categories: funny, hype, shock, tense, sad, cringe, wholesome (emotions = "reactions"),
 # greeting. Emotes not listed here count as "uncategorised". A name may appear once per section.
 
-version = 1
+version = 2
 
 # Exact, case-sensitive emote names.
 [emotes]
@@ -84,16 +86,6 @@ cringe = ["^cringe", "^weird", "^dansgame"]
 wholesome = ["love$", "hug(s|gies)?$", "happy$", "blush$"]
 greeting = ["^peepohey", "^peepohi", "wave$"]
 
-# Chat bots: their messages are left out of clean uniques and make the "bots" share.
-[bots]
-logins = [
-    "nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot", "sery_bot",
-    "botrixoficial", "soundalerts", "kofistreambot", "pokemoncommunitygame", "blerp",
-    "streamlootsbot", "lumiastream", "own3d", "tangiabot", "creatisbot", "deepbot", "phantombot",
-    "coebot", "ankhbot", "vivbot", "mixitupbot", "songlistbot", "pretzelrocks", "streamstickers",
-    "frostytoolsdotcom", "commanderroot", "supibot", "potatbotat",
-]
-
 # Transcript phrases for the offline pass (§18.6c): categories plus "clip".
 [transcript]
 clip = ["clip that", "clip it", "clip this", "somebody clip that", "someone clip that"]
@@ -103,9 +95,7 @@ shock = ["oh my god", "what the", "no way", "are you kidding me"]
 sad = ["that's so sad", "i'm so sad"]
 
 # Per-channel overrides (logins in lowercase): a listed name takes that category in the channel,
-# `ignore = [...]` removes a global entry there, `bots` adds the channel's own bots.
-[channels.xqc]
-bots = ["xqcbot"]
-
+# `ignore = [...]` removes a global entry there. Chat bots live in clipper_core/bots.toml (a
+# lexicon file may still add `[bots] logins` and `[channels.<login>] bots` of its own).
 [channels.xqc.emotes]
 wholesome = ["xqcL"]

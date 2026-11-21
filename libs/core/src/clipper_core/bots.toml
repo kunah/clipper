@@ -1,0 +1,19 @@
+# Chat bots (DESIGN §18.3, §19), shared by the detector and the judge (`clipper_core.chat.load_bots`).
+# Lowercase logins. The detector leaves their messages out of clean uniques and counts them in its
+# "bots" share; the judge leaves them out of its chat summary. Moved here from the detector's
+# lexicon.toml (lexicon v2, 2026-11-21). Bump `version` with every change: the detector puts this
+# file's hash into `detector_version` (through the lexicon tag).
+
+version = 1
+
+logins = [
+    "nightbot", "streamelements", "streamlabs", "moobot", "fossabot", "wizebot", "sery_bot",
+    "botrixoficial", "soundalerts", "kofistreambot", "pokemoncommunitygame", "blerp",
+    "streamlootsbot", "lumiastream", "own3d", "tangiabot", "creatisbot", "deepbot", "phantombot",
+    "coebot", "ankhbot", "vivbot", "mixitupbot", "songlistbot", "pretzelrocks", "streamstickers",
+    "frostytoolsdotcom", "commanderroot", "supibot", "potatbotat",
+]
+
+# Per-channel bots (logins in lowercase), added to the list above in that channel.
+[channels.xqc]
+logins = ["xqcbot"]

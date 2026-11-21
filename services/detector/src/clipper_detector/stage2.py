@@ -45,13 +45,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from clipper_core.chat import is_command, user_key
+from clipper_core.chat import normalised_text as normalised_text  # re-exported
 from clipper_core.contracts import CandidateStatus, MomentType, SuppressReason
 from clipper_core.timeline import Interval
 from clipper_detector.lexicon import (
     Category,
     ChannelLexicon,
     MessageMatch,
-    clean_text,
     to_moment_type,
     tokens_of,
 )
@@ -86,7 +87,6 @@ MODERATION_EVENTS = frozenset({"timeout", "ban"})
 _VOTE = re.compile(r"\d{1,2}|[a-z]|believe|doubt")
 _EMOTICON_LETTERS = frozenset("dopx")  # the rest of :D :O :P XD typed apart, not poll answers
 _VOTE_TRAILING = ".,!?;)"
-_COMMAND = re.compile(r"!\w")  # "!enter", "!points"; not "!!!" or "! KEKW"
 # Cheermotes as plain text (backfill has no bits events): "Cheer100", "BibleThump500", ...
 _CHEER = re.compile(
     r"(?:cheer|biblethump|cheerwhal|corgo|uni|showlove|party|seemsgood|pride|kappa|frankerz|"
@@ -94,7 +94,6 @@ _CHEER = re.compile(
     r"pjsalt|mrdestructoid|bday|ripcheer|shamrock|anon)(\d+)",
     re.IGNORECASE,
 )
-_SPACES = re.compile(r"\s+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,15 +190,6 @@ class Stage2Result:
 # --------------------------------------------------------------------------- helpers
 
 
-def normalised_text(text: str) -> str:
-    """For duplicates and commands: no invisible characters, lowercase, single spaces."""
-    return _SPACES.sub(" ", clean_text(text)).strip().lower()
-
-
-def _user_key(m: ChatMessageLike) -> str | None:
-    return m.user_id or (m.user_login.lower() if m.user_login else None)
-
-
 def _emote_names(m: ChatMessageLike) -> list[str]:
     return [e["name"] for e in m.emotes or () if e.get("name")]
 
@@ -278,7 +268,7 @@ def evaluate(
     msgs: list[_Msg] = []
     for m in raw:
         match = lexicon.match(m.text, _emote_names(m))
-        user = _user_key(m)
+        user = user_key(m)
         text = normalised_text(m.text)
         login = (m.user_login or "").lower()
         cheer = _cheer_bits(m.text) > 0 if evs is None else m.msg_id in bits_msgs
@@ -289,7 +279,7 @@ def evaluate(
             match=match,
             text=text,
             bot=lexicon.is_bot(login),
-            command=_COMMAND.match(text) is not None,
+            command=is_command(text),
             vote=_is_vote(m.text, match),
             cheer=cheer,
         )

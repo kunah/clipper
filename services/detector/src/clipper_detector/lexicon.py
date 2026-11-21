@@ -14,11 +14,12 @@ changes (§15). Sections, each `category = [entries]` (a name may appear only on
   (`^l+m+a+o+$`) is a word shape, tried on every token. A pattern match counts
   `DetectorParams.pattern_weight` (0.5), not 1.
 - An emote is also found with punctuation around it ("monkaS," "PepeHands.").
-- `[bots] logins`: chat bots (lowercase logins); `[transcript]`: phrases for the offline pass
-  (categories plus `clip`).
+- `[transcript]`: phrases for the offline pass (categories plus `clip`).
 - `[channels.<login>]`: per-channel `emotes`/`words`/`patterns` (same layout; a listed name takes
-  that category in the channel, `ignore = [...]` removes a global entry there) and `bots`
-  (added to the global list).
+  that category in the channel, `ignore = [...]` removes a global entry there).
+- Chat bots come from `clipper_core/bots.toml` (`clipper_core.chat.load_bots`, shared with the
+  judge; lexicon v2 moved them there): `Lexicon.load` adds them, and its digest covers that file
+  too. A lexicon file may still list extra `[bots] logins` and `[channels.<login>] bots`.
 
 Categories: funny, hype, shock, tense, sad, cringe, wholesome (the *emotions*, which make a
 message a "reaction"), greeting, and `uncategorised` for emotes the lexicon doesn't know (they
@@ -39,6 +40,8 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
+from clipper_core.chat import BotList, load_bots
+from clipper_core.chat import strip_invisible as clean_text  # re-exported
 from clipper_core.contracts import MomentType
 
 
@@ -91,9 +94,6 @@ class LexiconError(ValueError):
 
 # --------------------------------------------------------------------------- normalisation
 
-# Invisible characters chat clients add to get around Twitch's duplicate-message filter
-# (Chatterino/7TV append U+E0000), zero-width joiners/spaces, the emoji variation selector.
-_INVISIBLE = re.compile("[\U000e0000-\U000e007f\u200b-\u200d\u2060\u034f\ufe0f]")
 _EDGE_PUNCT = '.,!?;:"()[]{}<>~*_-\u2026/\\|`'
 _APOSTROPHES = str.maketrans("", "", "'\u2019\u2018")
 # Emoticons typed as text (":D", ":O", ";)", ":/", "xD", "D:") and their lone letters (the D of
@@ -101,11 +101,6 @@ _APOSTROPHES = str.maketrans("", "", "'\u2019\u2018")
 EMOTICON = re.compile(r"[:;=]-?[a-zA-Z0-9()\[\]|/\\*$@]{1,2}|[xX][dD]+|D:|[dDoOpPxX]")
 _RUN3 = re.compile(r"(.)\1{2,}")
 _RUN2 = re.compile(r"(.)\1+")
-
-
-def clean_text(text: str) -> str:
-    """Text without the invisible characters (for tokens, duplicates)."""
-    return _INVISIBLE.sub("", text)
 
 
 def tokens_of(text: str) -> list[str]:
@@ -306,26 +301,37 @@ class Lexicon:
     # ------------------------------------------------------------------ constructors
 
     @classmethod
-    def load(cls, path: str | Path | None = None) -> Lexicon:
-        """The packaged lexicon, or another file in the same format."""
+    def load(cls, path: str | Path | None = None, *, bots: BotList | None = None) -> Lexicon:
+        """The packaged lexicon, or another file in the same format, with the shared bot list
+        (`bots`; default: the packaged `clipper_core/bots.toml`)."""
+        bots = bots or load_bots()
         if path is None:
             data = resources.files("clipper_detector").joinpath("data/lexicon.toml").read_bytes()
-            return cls.from_toml(data.decode("utf-8"))
-        return cls.from_toml(Path(path).read_text(encoding="utf-8"))
+            return cls.from_toml(data.decode("utf-8"), bots=bots)
+        return cls.from_toml(Path(path).read_text(encoding="utf-8"), bots=bots)
 
     @classmethod
-    def from_toml(cls, text: str) -> Lexicon:
+    def from_toml(cls, text: str, *, bots: BotList | None = None) -> Lexicon:
+        """A lexicon text; with `bots`, their logins are added and their file's hash goes into
+        the digest (a bot list edited without a lexicon bump still shows in the tag)."""
         try:
             data = tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
             raise LexiconError(f"lexicon is not valid TOML: {exc}") from exc
-        return cls.from_mapping(data, digest=hashlib.sha256(text.encode("utf-8")).hexdigest()[:6])
+        source = text if bots is None else f"{text}\0{bots.digest}"
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:6]
+        return cls.from_mapping(data, digest=digest, bots=bots)
 
     @classmethod
-    def from_mapping(cls, data: Mapping[str, Any], *, digest: str | None = None) -> Lexicon:
-        """`digest`: of the source text; default: of the mapping's canonical JSON."""
+    def from_mapping(
+        cls, data: Mapping[str, Any], *, digest: str | None = None, bots: BotList | None = None
+    ) -> Lexicon:
+        """`digest`: of the source text; default: of the mapping's canonical JSON (and the bot
+        list's hash). `bots`: the shared bot list, added to the file's own."""
         if digest is None:
             canonical = json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)
+            if bots is not None:
+                canonical += f"\0{bots.digest}"
             digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:6]
         known = {"version", "emotes", "words", "patterns", "bots", "transcript", "channels"}
         if unknown := set(data) - known:
@@ -340,7 +346,10 @@ class Lexicon:
         bots_table = data.get("bots") or {}
         if not isinstance(bots_table, Mapping) or set(bots_table) - {"logins"}:
             raise LexiconError("`[bots]` takes only `logins = [...]`")
-        bots = frozenset(_strings(bots_table.get("logins", []), "bots.logins", lower=True))
+        shared = {} if bots is None else bots.channels
+        bots_all = frozenset(_strings(bots_table.get("logins", []), "bots.logins", lower=True))
+        if bots is not None:
+            bots_all |= bots.logins
         transcript = _transcript(data.get("transcript"))
         base = _tables(emotes, words, patterns, "global")
 
@@ -357,8 +366,11 @@ class Lexicon:
             ch_patterns = _section(table.get("patterns"), f"{where}.patterns", LISTED)
             ch_bots = _strings(table.get("bots", []), f"{where}.bots", lower=True)
             merged = _overlay(base, ch_emotes, ch_words, ch_patterns, where)
-            channels[login.lower()] = (merged, bots | frozenset(ch_bots))
-        return cls(version, base, bots, transcript, channels, digest)
+            own = shared.get(login.lower(), frozenset())
+            channels[login.lower()] = (merged, bots_all | frozenset(ch_bots) | own)
+        for login, own in shared.items():  # channels with bots of their own and no overrides
+            channels.setdefault(login, (base, bots_all | own))
+        return cls(version, base, bots_all, transcript, channels, digest)
 
 
 def _strings(value: Any, where: str, *, lower: bool = False) -> list[str]:

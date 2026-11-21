@@ -33,28 +33,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
+from clipper_core.chat import is_command, normalised_text, user_key
+from clipper_core.chat import is_mention as is_mention  # re-exported
+from clipper_core.chat import strip_links as strip_links  # re-exported
 from clipper_core.contracts import CandidateSource, CandidateStatus, MomentType, SuppressReason
 from clipper_detector.lexicon import ChannelLexicon
 from clipper_detector.merge import CandidateDraft, Delay, PriorCandidate, candidate_times
 from clipper_detector.params import DetectorParams
-from clipper_detector.stage2 import normalised_text
 
 CLIP_MENTIONS = "clip_mentions"  # `candidates.trigger` values and `features.explicit` keys
 VIEWER_CLIPS = "viewer_clips"
 KINDS = (CLIP_MENTIONS, VIEWER_CLIPS)
 
-# on normalised text (lowercase, single spaces)
-_MENTION = re.compile(r"\bcli+p+(?:[\s_-]*(?:it|that|this)\b|ped\b)|^cli+p+[!?.]*$|^!clip\b")
-_NEGATION = re.compile(r"\b(?:don'?t|dont|do not|never|not|no|stop|can'?t|cant|won'?t)\s*$")
-_COMMAND = re.compile(r"!\w")
 _CLIP_LINK = re.compile(
     r"(?:clips\.twitch\.tv/(?:embed\?clip=)?|(?:www\.|m\.)?twitch\.tv/(?:\w+/)?clip/)"
     r"([A-Za-z0-9_-]{4,})",
     re.IGNORECASE,
 )
 _NOT_SLUGS = frozenset({"embed", "create"})  # clips.twitch.tv pages, not clips
-# links with a scheme or www., and bare domains with a path ("youtube.com/clip/abc")
-_URL = re.compile(r"\S*(?:https?://|www\.)\S*|\S+\.\w{2,}/\S*", re.IGNORECASE)
 
 
 class RawMessage(Protocol):
@@ -116,20 +112,6 @@ def total_boost(signals: Iterable[Signal], params: DetectorParams) -> float:
     return sum(boost(k, params) for k in {s.kind for s in signals})
 
 
-def _user(m: RawMessage) -> str | None:
-    return m.user_id or (m.user_login.lower() if m.user_login else None)
-
-
-def strip_links(text: str) -> str:
-    return _URL.sub(" ", text)
-
-
-def is_mention(text: str) -> bool:
-    """A request to clip (see the module docstring); a negated one doesn't count."""
-    norm = normalised_text(strip_links(text).replace("\u2019", "'"))
-    return any(not _NEGATION.search(norm[: m.start()]) for m in _MENTION.finditer(norm))
-
-
 def clip_links(text: str) -> list[str]:
     """Clip slugs of the Twitch clip links in a message."""
     slugs = (m.group(1) for m in _CLIP_LINK.finditer(text))
@@ -182,10 +164,10 @@ class MentionTracker:
         p = self.p
         ts = m.sent_at
         horizon = ts - timedelta(seconds=p.mention_window_s)
-        user = _user(m)
+        user = user_key(m)
         bot = self.lexicon.is_bot((m.user_login or "").lower())
         text = normalised_text(m.text)
-        if user is not None and not (bot or m.deleted or _COMMAND.match(text)):
+        if user is not None and not (bot or m.deleted or is_command(text)):
             self._clean.append((ts, user))
         for q in (self._clean, self._mentions):
             while q and q[0][0] <= horizon:
