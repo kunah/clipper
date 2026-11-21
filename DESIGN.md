@@ -9,11 +9,14 @@ judges, edits and publishes short vertical clips.
 > **Deployed for testing 2026-11-21** (user's OK; from branch `transcriber` @1778961, so compose runs
 > from that worktree until it is merged): live DB migrated to 0005; controller, chat-ingest and
 > recorder rebuilt; the transcriber (profile `gpu`) works through the queued `transcribe` jobs; the
-> live detector (profile `detector`) runs with judge jobs off and viewer clips on. The backfill
+> live detector (profile `detector`) runs with judge jobs off and viewer clips on (the whole stack
+> was stopped cleanly at 15:26Z the same day, not restarted since). The backfill
 > image is built, not run: backfill runs only on a VOD the user names (§17, decided 2026-11-21).
-> Phase 2 designs §18–§22 are proposed, not yet agreed, apart from the user's 2026-11-21
-> decisions (§15: review on Discord, the judge's first LLM via the Claude Code CLI with a usage
-> guard, publishing per user-filled route config). Detector build items 1–3 (contracts + 0004,
+> Designs §17–§22 stay proposed until the user has reviewed them, apart from the user's
+> 2026-11-21 answers in §15: backfill only on request (GQL, audio by default), detector defaults
+> (8 s delay, ≤ 8 candidates/stream-hour, raid/sub suppression, Get Clips), review on Discord,
+> the judge on Opus via the Claude Code CLI in Docker with no usage limits for now, and publishing
+> per user-filled route (backfilled clips included). Detector build items 1–3 (contracts + 0004,
 > scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21. Judge
 > build items 6a (contracts + 0005 + `clipper_core.lifecycle`, §19) and 6b (input builder +
 > resolver, pure code in `services/judge`) built; no judge service yet (6c next).
@@ -337,6 +340,17 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-21 | **Review runs on Discord instead of Telegram**: a bot posts each clip with buttons (approve / reject / edit), the web UI stays for detailed editing (user's answer; design in §21) | the user's choice of messenger |
 | 2026-11-21 | **The judge's first real LLM adapter is the Claude Code CLI** (headless `claude -p`, JSON output) on the user's Claude subscription, not an API key; the USD cost guard becomes a **usage guard** that keeps the judge from using up the plan's limits (user's answer; design in §19). Model and limits still open | uses the subscription the user already pays for; the `JudgeModel` protocol keeps API adapters possible |
 | 2026-11-21 | Everything built so far is deployed to the live stack for testing; redeploys are fine (user's OK, deploy done by the main session from branch `transcriber`) | test the pipeline on live data |
+| 2026-11-21 | Detector defaults accepted: chat delay **8 s** until learned per channel; **≤ 8** chat candidates per stream-hour to the judge; raid and gifted-sub spikes **suppressed** by the stage-2 rules (user's answers; §18) | as proposed in §18 |
+| 2026-11-21 | The detector may hold the Twitch app credentials and polls Helix Get Clips itself (user's answer; §18) | fresh viewer clips are a live signal, and the detector is their only consumer |
+| 2026-11-21 | Extra IRC tags (first message, channel-point reward, highlighted message) get **proper columns** on `chat_messages`, not `_`-keys in `badges`; they ship with a chat-ingest redeploy (user's answer; §18) | typed and queryable |
+| 2026-11-21 | Judge model: **Opus**, through the Claude Code CLI; a pinned full model id, recorded with every call (user's answer; §19) | the user's choice of judgement quality; the subscription covers it |
+| 2026-11-21 | **No usage limits for now** ("let it run"): the usage guard measures and logs the five-hour/seven-day utilization from `rate_limit_event` but blocks nothing by default; a call the platform refuses for a limit still waits for `resetsAt` (user's answer; §19) | see real usage first; the limits can be switched on by setting them |
+| 2026-11-21 | audio_only channels are not judged (`judge_audio_only` stays false); channels the user wants clips from are switched to `full` (user's answer; §19) | audio_only can't be rendered |
+| 2026-11-21 | The judge runs **in Docker**; the user creates the token with `claude setup-token` and puts it in `.env` as `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN` (user's answer; §19) | the same deploy path as the other services |
+| 2026-11-21 | Backfill: Twitch's undocumented **GQL API is used** (VOD playback token + chat replay); **audio by default**, `--video` per run when renders are wanted; accepted: gap reason `muted`, no `chat_events` from replay, "one writer per table *and source*" + the controller guard (user's answers; §17) | as proposed in §17 |
+| 2026-11-21 | Clips from backfilled VODs **may be published** if they're worth it, decided per route like any other clip (user's answer; §17, §22) | the route config (§2) is the only gate |
+| 2026-11-21 | `calibrate` and the first backtest data use **yesterday's ohnepixel VOD** (if Twitch still has it): the main session runs `calibrate` and `clips` on it once the stack is up; detector build item 4 uses it later (user's answer; §17, §18) | a broadcast we also recorded live, the only way to measure T0 against our own clock |
+| 2026-11-21 | §17–§22 stay **proposed** as a whole: the user reviews them personally; only the answers recorded above are decided (user's answer) | the designs are long; the user reads them before they count as agreed |
 
 ## 16. Transcriber design (step 4)
 
@@ -713,6 +727,13 @@ OVERNIGHT.md). The rest needs an explicit id or is metadata only: `vod` takes id
 created. Nothing in §18/§19 starts a backfill: the detector backtest and the judge eval read
 streams the user backfilled.
 
+**Also decided by the user (2026-11-21, §15):** the GQL API is used (playback token + chat replay);
+audio by default, `--video` per run when renders are wanted; clips from backfilled VODs may be
+published per route like any clip; `muted` gaps, no `chat_events` from replay, "one writer per table
+*and source*" and the controller guard are accepted. `calibrate` (and the first backtest data) use
+yesterday's ohnepixel VOD if it is still available; the main session runs `calibrate` and `clips` on
+it once the stack is up. The section as a whole stays proposed until the user has reviewed it.
+
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)
 and viewer clips in the live format, so transcriber, detector and judge need no special case.
@@ -1043,6 +1064,8 @@ one VOD, no rows, writes `report.json` and sanitized samples for `tests/fixtures
 
 ### Proposed decision-log rows
 
+Accepted by the user on 2026-11-21 (§15): one writer per table and source, the controller guard, `muted` gaps, audio_only by default (video on request), no `chat_events` from replay, the GQL row. The rest stays proposed.
+
 | Date | Decision | Why |
 |---|---|---|
 | 2026-11-19 | One writer per table **and source**: everything belonging to a backfilled stream (`streams.source = 'backfill'`: the stream row, its chunks, gaps, chat messages, chat metrics) is written only by the backfill tool, and live services never touch it; derived tables (transcripts, audio metrics) keep one writer for all sources | backfill must write the live tables in the live format; two writers on the same rows would race |
@@ -1198,9 +1221,12 @@ thresholds, lexicon and offline weights are tuned by backtest once step 5 and th
 deliver data. v1 needs no chat-ingest change.
 **2026-11-21:** live on the stack (deployed by the main session, judge jobs off, viewer clips on: the
 Twitch app credentials are in the worktree's `.env` now, and the detector polls Get Clips with
-them; whether the detector may keep holding them is still open with the user). The backtest (build
+them; the user agreed on 2026-11-21 that it holds them). The backtest (build
 item 4) has its credentials now, so Helix viewer clips and channel lookups work. It still needs
-backfilled VODs, and those are only the ones the user names (§17, decided 2026-11-21).
+backfilled VODs, and those are only the ones the user names (§17, decided 2026-11-21): the first
+is yesterday's ohnepixel VOD (§15). Defaults accepted by the user (2026-11-21): 8 s chat delay
+until learned, ≤ 8 chat candidates per stream-hour to the judge, raid and gifted-sub spikes
+suppressed.
 
 **Role.** `services/detector` (slim), one process for all channels, `CLIPPER_DETECTOR_MODE` =
 `live|offline|all`. Writer of `candidates`, `chat_delay_estimates` (new), its own `media_requests`
@@ -1273,9 +1299,11 @@ details, see there):
 *unknown* (no viewer scaling, event rules off, bits from `Cheer\d+` text; dup still catches raids).
 **Not stored**: polls, predictions, hype trains, channel points (not on anonymous IRC; EventSub
 needs the broadcaster's token), so vote/dup/command heuristics stand in; tags `first-msg`,
-`custom-reward-id`, `msg-id=highlighted-message`. **Chat-ingest proposal for its next necessary
-redeploy (v1 doesn't need it)**: those tags as `_first`/`_reward`/`_highlight` keys in `badges`
-(`_action` precedent); `chat_metrics_1s` + ints `command_messages`, `top_text_count`,
+`custom-reward-id`, `msg-id=highlighted-message`. **Chat-ingest change for its next necessary
+redeploy (v1 doesn't need it)**: those tags as **proper columns** on `chat_messages` (decided by the
+user 2026-11-21; proposed: `first_message` bool null, `highlighted` bool null, `reward_id` text
+null; null = unknown, as in backfilled chat; an additive migration, chat-ingest the only live
+writer); `chat_metrics_1s` + ints `command_messages`, `top_text_count`,
 `clip_mentions`, jsonb `emote_messages`: stage 1 filters without raw reads at scale; `NOTIFY` too.
 
 **4. Explicit signals.**
@@ -1581,6 +1609,8 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
 
 ### Proposed decision-log rows
 
+Accepted by the user on 2026-11-21 (§15): the 8 s default delay, ≤ 8 candidates per stream-hour, raid/gifted-sub suppression, the detector holding the Twitch credentials (Get Clips). Extra IRC tags: proper columns, not `_`-keys (part 3, Stage 2, above). The rest stays proposed.
+
 | Date | Decision | Why |
 |---|---|---|
 | 2026-11-19 | Two-stage live detection: per-second stats find suspects, the raw chat of that window confirms and filters | exact unique users, copypasta, commands, bots, votes, "clip it" without changing or redeploying chat-ingest |
@@ -1699,7 +1729,10 @@ builder + resolver, pure) built 2026-11-21; the service (6c) not built. The serv
 now with a deterministic fake model. **Decided by the user (2026-11-21):** the first real model
 runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
 **usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
-guard"). The model, the usage limits and the budgets are still the user's to choose (eval, 6d).
+guard"). Also decided (2026-11-21): the model is **Opus** (pinned full id), **no usage
+limits for now** (the guard measures and logs, and blocks nothing by default), the judge runs **in
+Docker** with a `claude setup-token` token in `.env` (`CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`), and
+audio_only channels are not judged (channels the user wants clips from switch to `full`).
 Prompt, thresholds and clip lengths get tuned on real candidates.
 
 **Ownership (§19–§22; replaces §8's "later" rows once agreed).** One writer per table; `jobs` is
@@ -1885,9 +1918,11 @@ what limits the judge is the plan's usage windows (usage guard below).
   shares with the user's own Claude use. Inputs: the last `rate_limit_event` (five-hour and
   seven-day `utilization`, `resetsAt`, `status`; kept in memory and in the heartbeat) and local
   call counts (rolling 60 min per stream, UTC day).
+  - **Default: off** (decided 2026-11-21, "let it run"). Every reading is logged and in the
+    heartbeat, and the caps below are unset, so nothing blocks; they take effect once set.
   - **Before a call:** if the last reading has `five_hour ≥ usage_five_hour_max` or `seven_day ≥
-    usage_seven_day_max` (proposed 0.5 / 0.5; the user's call) or a `status` other than `allowed`,
-    the clip waits: its judge job is deferred to `min(resetsAt, hard deadline)`.
+    usage_seven_day_max` (unset by default) or a `status` other than `allowed`, the clip waits: its
+    judge job is deferred to `min(resetsAt, hard deadline)`.
   - **At the hard deadline** the clip becomes `rejected`/`budget`.
   - **Call caps:** over `calls_per_stream_hour`, only candidates above that hour's median score
     proceed; over `calls_per_day`, `rejected`/`budget` and a heartbeat warning.
@@ -1897,8 +1932,9 @@ what limits the judge is the plan's usage windows (usage guard below).
     and writes an error row with 0 usage.
   - **Operator revisions** are counted but never blocked by our caps (a human is waiting); only the
     platform's own limit stops them, and then a notice says so.
-  - Settings: `usage_five_hour_max`, `usage_seven_day_max`, `usage_stale_s`,
-    `calls_per_stream_hour`, `calls_per_day` (the USD settings stay for a future API adapter).
+  - Settings: `usage_five_hour_max`, `usage_seven_day_max`, `calls_per_stream_hour`,
+    `calls_per_day` (all `None` = off by default), `usage_stale_s` (the USD settings stay for a
+    future API adapter).
 - **Prompt versions** `v{N}-{sha8}` (`clipper_judge/prompts/v{N}/`, schema from `JudgeAnswer`; in the
   hash, every plan, the heartbeat; stable text first). **Shadow runs** (`CLIPPER_JUDGE_SHADOW`): extra
   model/prompt pairs on the same input, `shadow = true`, never rendered, inside the usage guard.
@@ -2062,14 +2098,18 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
    queued transcribe jobs, round 2 must decide; crash between call and commit → no second call;
    soft/hard deadlines; budget → `rejected`/`budget`; a patch → v+1 + render job, a stale base refused.
 4. **6d `ClaudeCliModel` + usage guard + `clipper-judge eval`** (decided 2026-11-21: Claude Code CLI on
-   the user's subscription; needs the user's `claude setup-token` token for the container, the model
-   and the usage limits). *Done:* contract tests on a fake `claude` executable (recorded stream-json
-   lines: success, no `structured_output`, `is_error`, 429, timeout, wrong `apiKeySource`); the
-   child environment carries no `ANTHROPIC_*`; the guard defers at the caps and lets a stale reading
-   refresh; the "to verify" points of the adapter checked by hand; ≥ 50 labelled candidates through
-   2–3 Claude models (agreement, repairs/clip, p50/p95 latency, usage per clip); the user picks.
+   the user's subscription, model Opus, no usage limits by default, in Docker; needs the user's
+   `claude setup-token` token in `.env`). *Done:* contract tests on a fake `claude` executable
+   (recorded stream-json lines: success, no `structured_output`, `is_error`, 429, timeout, wrong
+   `apiKeySource`); the child environment carries no `ANTHROPIC_*`; with the caps unset nothing
+   blocks and every reading is logged, with caps set the guard defers and lets a stale reading
+   refresh; the "to verify" points of the adapter checked by hand (also: Opus through the CLI on
+   the user's plan); `clipper-judge eval` on ≥ 50 labelled candidates with Opus (agreement,
+   repairs/clip, p50/p95 latency, usage per clip) for prompt work.
 
 ### Proposed decision-log rows
+
+Decided by the user on 2026-11-21 (§15): the CLI adapter with Opus, no usage limits by default (measure and log), the judge in Docker, audio_only not judged (`no_video`). The rest stays proposed.
 
 | Date | Decision | Why |
 |---|---|---|
@@ -2299,9 +2339,11 @@ kept for evals and prompt work).
 
 **Outside core.** `services/judge` (`CLIPPER_JUDGE_*`: provider, model, api key `SecretStr`, prices
 per 1M, `budget_usd_per_stream_hour`, `daily_usd` (for a later API adapter); CLI adapter (6d):
-`claude_path`, `claude_oauth_token` `SecretStr` (from `claude setup-token`), `claude_model`, `claude_effort`,
-`claude_timeout_s` 180, `claude_max_budget_usd` 0.50; usage guard: `usage_five_hour_max`,
-`usage_seven_day_max`, `usage_stale_s` 900, `calls_per_stream_hour`, `calls_per_day`; `soft_wait_s` 240, `hard_wait_s` 1800,
+`claude_path`, `claude_oauth_token` `SecretStr` (env `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`, from `claude
+setup-token`), `claude_model` (Opus, a pinned full id such as `claude-opus-5-5`), `claude_effort`,
+`claude_timeout_s` 180, `claude_max_budget_usd` 0.50; usage guard (off by default): `usage_five_hour_max`,
+`usage_seven_day_max`, `calls_per_stream_hour`, `calls_per_day` (all `None`), `usage_stale_s` 900;
+`soft_wait_s` 240, `hard_wait_s` 1800,
 `max_rounds` 2, `max_before_s` 600, `max_after_s` 120, `min_clip_s` 10, `max_clip_s` 60,
 `judge_audio_only` false, `render_jobs` true, `shadow`, `concurrency` 4, 1 for the CLI adapter); compose service (assets
 volume read-only, for the SFX tag list); controller `STALE_AFTER[JUDGE] = 10 min` (§18),
@@ -2907,7 +2949,7 @@ or paste the URL back).
 
 **Legal / ToS (brief).** **No route, no post** (§2). Routes are the user's config (decided
 2026-11-21): no rights-basis field, only an optional free-text `note`, and backfilled clips only if
-the user routes them. YouTube: one API project (extra projects to bypass quota break the ToS), more quota via the
+the user routes them (decided 2026-11-21: allowed when worth it, per route). YouTube: one API project (extra projects to bypass quota break the ToS), more quota via the
 audit form; spam/repetitive content, "reused content" demonetisation. TikTok: the audit checks the
 posting UX (preview, privacy choice, consent, music confirmation, disclosure); unaudited = private
 only. Instagram: Platform Terms, app review for others' accounts. Campaigns: own accounts, no view
@@ -3095,10 +3137,9 @@ Whop [Content Rewards](https://docs.whop.com/memberships-and-access/third-party-
 Updated 2026-11-21 with the user's answers (§15).
 - **Routes (§2, decided 2026-11-21)**: per platform the credentials and the upload method (from the
   user); per route the channel, account, template, rules and caps the user fills in.
-- **Judge model and limits**: the Claude model for the CLI adapter (picked from `clipper-judge eval`
-  numbers), the usage-guard limits (share of the five-hour / seven-day windows, calls per
-  stream-hour and per day), and for the container a `claude setup-token` token in `.env`. Judge
-  audio_only channels or switch them to `full` (audio_only can't be rendered in v1).
+- **Judge** (decided 2026-11-21: Opus via the CLI, no usage limits for now, in Docker,
+  audio_only not judged): the `claude setup-token` token in `.env` as
+  `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`; switch the channels you want clips from to `full`.
 - **Taste**: titles, clip lengths (default 10–60 s), caption style presets; sign off 5 real renders.
 - **Layouts**: facecam rects per channel in `layouts.toml` (ohnepixel first, via `layout-preview`).
 - **Licensed SFX/music library** with licence proof per asset (nothing ships without it).

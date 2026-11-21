@@ -169,27 +169,59 @@ Recorded as decision rows in DESIGN §15 (dated 2026-11-21) and in the sections 
 8. Twitch app credentials: in the worktree's `.env` now. The detector polls viewer clips live; the
    backtest's credential blocker is gone.
 
-Still open with you (the main session asked you): the 8 s default chat delay, whether the
-detector may hold the Twitch credentials, judge model and usage limits, raid/sub suppression,
-judging audio_only channels, GQL use, taste/layout/retention, the Discord credentials.
+## Your answers, second batch (2026-11-21, relayed by the main session)
+
+Where you didn't answer, your rule "use the recommendation" applies, so those count as decided.
+All recorded in DESIGN §15 (rows dated 2026-11-21) and in §17–§19, §22:
+1. Default chat delay 8 s until learned: yes (§18).
+2. The detector holds the Twitch app credentials and polls Get Clips: yes (§18).
+3. ≤ 8 chat candidates per stream-hour to the judge: yes (§18).
+4. Raid / gifted-sub spikes: suppressed, as designed (§18).
+5. Extra IRC tags (first message, channel-point reward, highlighted message): proper columns on
+   `chat_messages` (proposed `first_message`, `highlighted`, `reward_id`, all nullable: null =
+   unknown, as in backfill), not `_`-keys; needs a migration and a chat-ingest redeploy (§18).
+6. Judge model: Opus through the Claude Code CLI, a pinned full id (§19).
+7. Usage limits: none for now ("let it run"). The guard logs the five-hour/seven-day
+   utilization from `rate_limit_event`, and all its caps are unset by default, so nothing blocks.
+   A call the platform itself refuses for a limit still waits for `resetsAt` (§19). Heads-up: Opus
+   with no caps can use a large share of your plan's five-hour window, which your own Claude use
+   shares (it read 0.8 during my test, mostly this orchestrator session). The heartbeat will show it, and the caps
+   take effect once you set them.
+8. audio_only channels aren't judged; channels you want clips from switch to `full` (§19).
+9. The judge runs in Docker; you create the token with `claude setup-token` and put it in `.env`
+   as `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN` (§19).
+10. Twitch's GQL API (VOD playback token + chat replay): yes (§17).
+11. Backfill fetches audio by default; `--video` per run when renders are wanted (§17).
+12. Clips from backfilled VODs may be published if they're worth it, per route (§17, §22).
+13. Accepted: `muted` gaps, no `chat_events` from replay, "one writer per table *and source*" +
+    the controller guard (§17).
+14. `calibrate` and the first backtest data: yesterday's ohnepixel VOD, if still available. The
+    main session runs `calibrate` and `clips` on it once the stack is up; detector unit 4 uses it
+    later (§17, §18).
+15–20. Taste, layouts, SFX/music, retention, Discord and publisher credentials: answered when
+    needed, still open.
+21. §17–§22 stay "proposed": you'll review them yourself. Only the answers above are decided.
 
 ## Blocked / waiting for you
 
-- Detector unit 4 (backtest CLI): the credentials are there now (`.env`); it still needs
-  backfilled VODs, and backfill runs only on VODs you name: tell me which ones (or name them in a
-  `clipper-backfill vod <id>` run).
+- Detector unit 4 (backtest CLI): credentials are there; the data will be yesterday's ohnepixel
+  VOD, once the main session has run `calibrate` and `clips` on it (and the VOD is backfilled).
 - Judge unit 6d (Claude CLI adapter + usage guard + `clipper-judge eval`): buildable on a fake
-  `claude` executable; the real runs need your model choice and usage limits, and for the
-  container a `claude setup-token` token in `.env`.
+  `claude` executable now (model Opus, no caps by default, Docker); the real runs need your
+  `claude setup-token` token in `.env` as `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`.
 
 ## Stopped here (2026-11-21, on your request "stop after 6b")
 
 Nothing is running; no agents active. The worktree is clean at the last commit. After the stop,
-only docs changed: your answers (above) went into DESIGN.md and this file (2026-11-21).
+only docs changed: both batches of your answers (above) went into DESIGN.md and this file
+(2026-11-21).
 
 ## Next (when you resume)
 
 - Backfill: make `clipper-backfill channel <login>` list-only (your answer 3; small change + tests).
+- Chat-ingest: the extra IRC tags as columns (second batch, answer 5): migration + chat-ingest +
+  backfill (writes null) + tests; it ships with a chat-ingest redeploy, which you time
+  (chat-ingest restarts lose a few seconds of chat).
 - Judge 6c (service with the fake model: waits for transcripts, context rounds, one
   transaction per plan + render job), then 6d's buildable part (Claude CLI adapter on a fake
   executable + usage guard; also the stale `# cost guard (daily cap)` comment on
@@ -216,6 +248,9 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-21 15:26:56Z: the whole live stack was stopped cleanly (all containers exit 0), not by
+  the main session; probably you (another project's DB started then). Not restarted by me; the
+  main session is asking you.
 - 2026-11-21 ~14:15Z: **deployed for testing** by the main session (your OK) from this worktree
   (`transcriber` @1778961; until it is merged, compose must run from here). Migrate ran
   0001→0005 on the live DB; controller, chat-ingest and recorder were recreated (ohnepixel was
@@ -256,54 +291,21 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Open questions for the user
 
-(2026-11-21: answers 1–8 are under "Your answers" above; what they settle is marked **answered**
-below, the rest is still open.)
-
-Designs written overnight and marked "proposed, not yet agreed" in DESIGN.md: §17 backfill,
-§18 detector, §19 judge, §20 renderer, §21 review, §22 publisher. Their decision rows sit under each section, not in the
-decision log, until you agree.
-
-- **Transcriber:** **answered 2026-11-21: CED-base stays provisional, experiments later.** Was:
-  confirm CED-base (still provisional). On CPU it is the slowest stage (24×
-  realtime on 2 threads). **Decided by you (via the main session, 2026-11-19 evening): CED runs on
-  the GPU.** The main session is comparing CED's ONNX model on onnxruntime-gpu (preferred, no
-  torch) vs CUDA torch (+~5 GB image) and will send a recipe; this session implements it then and
-  reruns the GPU e2e test (when you're not using the PC). Until then CED's adapter is unchanged.
-  Also possible: pack short speech stretches into fewer 30 s Whisper windows (Whisper is 31× per
-  stretch vs 49× on whole chunks).
-  The decision log says "built-in VAD"; measured, our Silero gate makes it redundant, so
-  `vad_filter` defaults to False (setting).
-- **Backfill (§17):** **answered 2026-11-21: only on VODs you name, never automatic.** Still
-  open: use Twitch's undocumented GQL API at all (VOD playback token + chat
-  replay; Twitch discourages third-party use, client ids can be revoked)? Without it, backfill
-  gets only Helix metadata + top clips. Which channels and how many VODs back? Audio only, or video
-  ranges too? May clips from backfilled VODs ever be published (§2 rights), or is it dev data
-  only? OK with the new gap reason `muted` and no `chat_events` from replay? New rule "one writer
-  per table *and source*" (backfill writes the rows of backfilled streams in live tables) and the
-  controller guard (never touch `source='backfill'` streams).
-- **Detector (§18):** defaults OK: 8 s chat delay until learned, ≤ 8 judge (LLM) calls per
-  stream-hour? Suppress raid / gifted-sub spikes, or do campaigns want those moments? May the
-  detector hold Twitch app credentials (it polls Get Clips itself)? Extra IRC tags (first message,
-  channel-point reward, highlighted message) as `_`-keys in `badges` like `_action`, or a proper
-  column (needs a chat-ingest redeploy either way)?
-- **Judge / renderer / review / publisher (§19–§22):**
-  - Rights model (§2): **answered 2026-11-21: you decide per route and provide credentials +
-    upload method per platform; no rights model beyond the route config.**
-  - Judge LLM: **answered 2026-11-21: Claude Code CLI on your subscription, usage guard.** Still
-    open: the model (from a `clipper-judge eval` run), the usage limits (share of the five-hour /
-    seven-day windows, calls per stream-hour/day); judge audio_only channels (can't be rendered
-    without video) or switch them to `full`?
-  - Taste: title style, clip lengths (default 10–60 s), caption presets; sign off ~5 real renders.
-  - Facecam layout per channel (`layouts.toml`, ohnepixel first); a licensed SFX/music library
-    with licence proof per asset; retention (discarded clips 7 days, pinned video of published
-    clips 30 days).
+Everything asked so far is answered (2026-11-21, both batches above; DESIGN §15). Still open, to be
+answered when needed:
+- Taste: title style, clip lengths (default 10–60 s), caption presets; sign off ~5 real renders.
+- Facecam layout per channel (`layouts.toml`, ohnepixel first).
+- A licensed SFX/music library with licence proof per asset.
+- Retention: discarded clips 7 days, pinned video of published clips 30 days (proposed); video
+  chunk retention (~48 h) isn't implemented yet (the recordings volume grows).
+- The Discord and publisher credentials (below).
+- Your review of DESIGN §17–§22: they stay "proposed" until you've read them.
 
 ## Credentials / decisions needed
 
-- Judge: for the container, a `claude setup-token` token (`CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN` in
-  `.env`; natively your CLI login works too); the model and usage limits. Make sure no
-  `ANTHROPIC_API_KEY` sits in `.env` (it would bill the API instead of the plan; the adapter
-  strips it anyway).
+- Judge (decided: Opus, Docker, no caps): you create the token with `claude setup-token` and put it
+  in `.env` as `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`. Make sure no `ANTHROPIC_API_KEY` sits in
+  `.env` (it would bill the API instead of the plan; the adapter strips it anyway).
 - Review (Discord): a Discord application with a bot (bot token, application id), a private
   server with a review channel and the bot invited, your Discord user id, the server and channel
   ids; a web UI password; optionally Tailscale on PC + phone.
