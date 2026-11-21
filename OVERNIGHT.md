@@ -202,10 +202,33 @@ All recorded in DESIGN §15 (rows dated 2026-11-21) and in §17–§19, §22:
     needed, still open.
 21. §17–§22 stay "proposed": you'll review them yourself. Only the answers above are decided.
 
+## Answer 14 runs (2026-11-21, main session, on yesterday's ohnepixel VOD)
+
+`clipper-backfill calibrate 2934862154` (ohnepixel 2026-11-20 = our live stream 803; we have
+live chunks only from 12:32:42 to 17:29:24Z, Docker was off later):
+- **Chat clock:** 205 of 315 sampled replay comments matched our live chat by msg_id;
+  `createdAt − tmi-sent-ts` = **exactly 0.000 s for all 205**. The backfilled `sent_at =
+  createdAt` is the live clock.
+- **T0 candidates:** PDT 12:32:36.470; chat anchor 12:32:40.731 truncated / 41.231 rounded
+  (= PDT + 4.26 s, near the 3.9 s seen on xqc); Helix `created_at` 12:32:40.000; path epoch
+  12:32:33.
+- **T0_audio: none ("no usable window"), a bug.** ohnepixel's VOD is **fMP4** (the first fMP4 VOD
+  we've seen). `calibrate.py` `_match` (line ~349) writes the fragments as `vod_{seq}.ts` without
+  the `EXT-X-MAP` init section, so ffmpeg fails ("tfhd was found … error reading header";
+  chunks 42, 136, 243). `pipeline.py` `_build` (lines ~255–268) already prepends `init_uri` and
+  writes `.mp4`; calibrate needs the same. 78 of 297 live chunks were skipped as VOD edge or muted.
+  Recorded in DESIGN §3 and §17.
+
+`clipper-backfill clips 2934862154`: 100 fetched, 99 kept, all new, all with a time span, linked
+to stream 803 (top clip: 5794 views at 12:50:35Z ± 37 s). They're in `viewer_clips`, the ground
+truth for the backtest. The live detector didn't run during stream 803, so the backtest needs the
+offline pass / detector unit 4.
+
 ## Blocked / waiting for you
 
-- Detector unit 4 (backtest CLI): credentials are there; the data will be yesterday's ohnepixel
-  VOD, once the main session has run `calibrate` and `clips` on it (and the VOD is backfilled).
+- Detector unit 4 (backtest CLI): credentials and ground truth are there (99 viewer clips of
+  stream 803, our own live recording of ohnepixel 2026-11-20, so no backfill is needed for its
+  first 5 h). Buildable once you say resume.
 - Judge unit 6d (Claude CLI adapter + usage guard + `clipper-judge eval`): buildable on a fake
   `claude` executable now (model Opus, no caps by default, Docker); the real runs need your
   `claude setup-token` token in `.env` as `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`.
@@ -219,6 +242,12 @@ only docs changed: both batches of your answers (above) went into DESIGN.md and 
 ## Next (when you resume)
 
 - Backfill: make `clipper-backfill channel <login>` list-only (your answer 3; small change + tests).
+- Backfill `calibrate`: handle fMP4 VODs (prepend the `EXT-X-MAP` init section, write `.mp4`, like
+  `pipeline._build`) + a test with an fMP4 fixture; then rerun `calibrate 2934862154` for the
+  audio T0.
+- Not designed yet, for you to decide: stream 803 is only recorded live up to 17:29Z, but backfill
+  skips VODs of streams recorded live (clips only), so the rest of that broadcast can't be filled
+  from the VOD. A "fill a live stream's `not_recorded` gaps from its VOD" mode would be new (§17).
 - Chat-ingest: the extra IRC tags as columns (second batch, answer 5): migration + chat-ingest +
   backfill (writes null) + tests; it ships with a chat-ingest redeploy, which you time
   (chat-ingest restarts lose a few seconds of chat).
@@ -248,6 +277,9 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-21 17:26Z: the main session restarted the stack from this worktree with your OK. Your
+  earlier stop left a 7134 s `not_recorded` gap in stream 1412. The transcribe backlog was done by
+  then (870 jobs); the detector had 50 candidates.
 - 2026-11-21 15:26:56Z: the whole live stack was stopped cleanly (all containers exit 0), not by
   the main session; probably you (another project's DB started then). Not restarted by me; the
   main session is asking you.
