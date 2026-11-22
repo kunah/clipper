@@ -59,6 +59,8 @@ def test_message_row_allows_no_received_at():
         source="backfill",
     )
     assert row.received_at is None and row.source == "backfill"
+    tags = (row.first_message, row.highlighted, row.reward_id, row.msg_type)
+    assert tags == (None, None, None, None)  # unknown
 
 
 @pytest.mark.integration
@@ -77,10 +79,16 @@ async def test_chat_writer_stores_backfilled_rows_idempotently(sessions):
             await writer.write(s, messages, [], metrics, [])
     async with sessions() as s:
         stored = (
-            await s.execute(text("SELECT received_at, source FROM chat_messages ORDER BY sent_at"))
+            await s.execute(
+                text(
+                    "SELECT received_at, source, first_message, highlighted, reward_id, msg_type "
+                    "FROM chat_messages ORDER BY sent_at"
+                )
+            )
         ).all()
         (metric,) = (await s.execute(text("SELECT * FROM chat_metrics_1s"))).all()
-    assert [tuple(r) for r in stored] == [(None, "backfill")] * 3
+    # the IRC tag columns (0006) stay NULL = unknown
+    assert [tuple(r) for r in stored] == [(None, "backfill", None, None, None, None)] * 3
     assert (metric.ts, metric.messages, metric.emote_counts) == (day, 1, {"KEKW": 2})
 
 

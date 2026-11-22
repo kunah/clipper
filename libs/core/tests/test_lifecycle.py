@@ -144,7 +144,7 @@ async def test_lifecycle_states_from_clips_before_the_later_tables_exist(session
         assert await lifecycle_states(s, []) == {}
         with pytest.raises(TypeError, match="clip_ids"):
             await lifecycle_states(s, "12")
-    assert later == (None, None)  # 0006/0008 aren't there yet
+    assert later == (None, None)  # 0007/0009 aren't there yet
     assert states == {i: S(status) for i, status in zip(ids, statuses, strict=True)}
 
 

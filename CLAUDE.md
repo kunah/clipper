@@ -25,7 +25,10 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `CLIPPER_TWITCH_LIVE_TESTS=1` (marker `twitch_live`).
 - `db/` (`clipper_db`): Alembic migrations + `clipper-migrate` one-off container.
 - `services/controller/`: live status via Helix, streams, viewer snapshots, maintenance,
-  and the `clipper-channels` CLI. `services/chat-ingest/`: chat logger + per-second stats.
+  and the `clipper-channels` CLI. `services/chat-ingest/`: chat logger + per-second stats;
+  PRIVMSG tags -> `chat_messages.first_message`/`highlighted`/`reward_id`/`msg_type` (NULL =
+  unknown, e.g. backfill; needs migration 0006, applied alone before redeploying chat-ingest; the
+  backfill doesn't need it).
   `services/recorder/`: HLS -> chunks (local spool -> S3), gaps, transcription jobs; needs
   ffmpeg on PATH when run natively (`CLIPPER_RECORDER_*` settings).
   `services/transcriber/`: GPU worker for `transcribe` jobs (Silero VAD gate -> faster-whisper

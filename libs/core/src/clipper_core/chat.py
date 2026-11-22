@@ -41,7 +41,11 @@ from clipper_core.timeline import utc_now
 
 @dataclass(slots=True)
 class MessageRow:
-    """One `chat_messages` row."""
+    """One `chat_messages` row.
+
+    `first_message`, `highlighted`, `reward_id`, `msg_type`: a PRIVMSG's tags (`first-msg`,
+    `msg-id=highlighted-message`, `custom-reward-id`, the raw `msg-id`; migration 0006), set by
+    chat-ingest; None = unknown (backfill: the chat replay has no such tags)."""
 
     sent_at: datetime
     msg_id: str
@@ -55,6 +59,15 @@ class MessageRow:
     badges: dict[str, str] | None
     deleted: bool = False
     source: str = "live"
+    first_message: bool | None = None
+    highlighted: bool | None = None
+    reward_id: str | None = None
+    msg_type: str | None = None
+
+
+# MessageRow's IRC tag fields (migration 0006). A batch with none of them set (backfill) is written
+# without these columns, so a database before 0006 takes it too.
+TAG_FIELDS = ("first_message", "highlighted", "reward_id", "msg_type")
 
 
 @dataclass(slots=True)
@@ -336,7 +349,9 @@ def load_bots(path: str | Path | None = None) -> BotList:
 class ChatWriter:
     """Batch writes of chat_messages / chat_events / chat_metrics_1s.
 
-    Messages: `ON CONFLICT DO NOTHING` (PK `sent_at, msg_id`), so re-writing a batch is safe.
+    Messages: `ON CONFLICT DO NOTHING` (PK `sent_at, msg_id`), so re-writing a batch is safe. The
+    IRC tag columns (`TAG_FIELDS`, migration 0006) are left out of the INSERT when no row of the
+    batch has one set (the backfill's rows), so only tagged batches (chat-ingest) need 0006.
     Metrics: upserted per `(channel_id, ts)`. Events: plain inserts. Creates the chat partitions
     of the days it writes (remembered per writer instance).
 
@@ -368,7 +383,7 @@ class ChatWriter:
         if messages:
             await self._ensure_partitions(session, {m.sent_at.date() for m in messages})
             await session.execute(
-                insert(ChatMessage).on_conflict_do_nothing(), [asdict(m) for m in messages]
+                insert(ChatMessage).on_conflict_do_nothing(), _message_params(messages)
             )
         if events:
             await session.execute(insert(ChatEvent), [asdict(e) for e in events])
@@ -410,3 +425,14 @@ class ChatWriter:
         if missing:
             await ensure_chat_partitions(session, min(missing), max(missing))
             self._partition_days |= missing
+
+
+def _message_params(messages: list[MessageRow]) -> list[dict[str, Any]]:
+    """INSERT parameters; without the tag columns when no row has a tag (every row needs the same
+    keys: an executemany INSERT names the columns of its first row)."""
+    rows = [asdict(m) for m in messages]
+    if all(row[k] is None for row in rows for k in TAG_FIELDS):
+        for row in rows:
+            for k in TAG_FIELDS:
+                del row[k]
+    return rows

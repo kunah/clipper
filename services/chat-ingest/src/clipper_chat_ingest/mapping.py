@@ -1,6 +1,15 @@
 """IRC messages -> rows for chat_messages / chat_events (pure functions, easy to test).
 
 The row types live in `clipper_core.chat` (shared with the backfill tool's chat replay).
+
+PRIVMSG tags as columns (migration 0006, DESIGN §18.3); None = unknown:
+- `first_message`: `first-msg` "1" -> True, "0" -> False; missing, empty or anything else -> None
+  (Twitch sends `first-msg=0|1` on every tagged PRIVMSG, so a missing tag is unknown, not False);
+- `msg_type`: the raw `msg-id` (`highlighted-message`, `skip-subs-mode-message`,
+  `gigantified-emote-message`, `animated-message`, `user-intro`, ...), None when missing or empty;
+- `highlighted`: `msg_type == "highlighted-message"`; `msg-id` comes only on special messages, so a
+  tagged message without it is False; a line without any tags (no `twitch.tv/tags`) is unknown;
+- `reward_id`: `custom-reward-id` (a reward's UUID), else None.
 """
 
 from __future__ import annotations
@@ -16,6 +25,8 @@ from clipper_twitch.emotes import message_emotes
 from clipper_twitch.irc import IrcMessage, parse_badges, parse_emotes, strip_action
 
 ROOMSTATE_KEYS = ("emote-only", "followers-only", "r9k", "slow", "subs-only")
+HIGHLIGHTED = "highlighted-message"  # PRIVMSG `msg-id` of the channel-point highlight
+FIRST_MSG = {"1": True, "0": False}  # `first-msg` values; others (empty) are unknown
 
 
 @dataclass(slots=True)
@@ -55,6 +66,7 @@ def map_message(
         twitch_emotes = parse_emotes(tags.get("emotes"), text)
         emotes = message_emotes(text, twitch_emotes, channel.emotes, global_emotes)
         badges = parse_badges(tags.get("badges"))
+        msg_type = tags.get("msg-id") or None
         row = MessageRow(
             sent_at=sent_at,
             msg_id=tags.get("id") or f"noid-{received_at.timestamp()}-{msg.nick}",
@@ -66,6 +78,10 @@ def map_message(
             text=text,
             emotes=emotes or None,
             badges=badges or None,
+            first_message=FIRST_MSG.get(tags.get("first-msg", "")),
+            highlighted=(msg_type == HIGHLIGHTED) if tags else None,
+            reward_id=tags.get("custom-reward-id") or None,
+            msg_type=msg_type,
         )
         out = Mapped(message=row)
         if is_action:

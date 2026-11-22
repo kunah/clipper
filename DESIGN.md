@@ -19,7 +19,9 @@ judges, edits and publishes short vertical clips.
 > per user-filled route (backfilled clips included). Detector build items 1–3 (contracts + 0004,
 > scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21. Judge
 > build items 6a (contracts + 0005 + `clipper_core.lifecycle`, §19) and 6b (input builder +
-> resolver, pure code in `services/judge`) built; no judge service yet (6c next).
+> resolver, pure code in `services/judge`) built; no judge service yet (6c next). Migration 0006
+> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22, not on the live DB yet: it goes
+> on before the chat-ingest redeploy that ships it.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -246,7 +248,9 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
    controller (Helix polling every 30 s, streams with 2-miss grace, viewer snapshots, leader
    lease, maintenance: partitions + stale-job requeue, `clipper-channels` CLI), chat-ingest
    (one connection for all channels, raw messages, events, deletions, per-second stats with
-   emote counts by name; 1 s batched writes, retry on DB errors).
+   emote counts by name; 1 s batched writes, retry on DB errors). 2026-11-22 (not deployed):
+   PRIVMSG tags `first-msg`, `msg-id` (raw, and `highlighted`), `custom-reward-id` as columns
+   (migration 0006, §18.3).
 3. ✅ recorder: streamlink resolves the playlist URL, own HLS loop (PDT times, ad filter,
    dedupe across reloads/restarts), local spool (`.ts` + state file per chunk, recovered after a
    crash), ffmpeg copies audio to `.aac`, upload, then chunk + gap + transcription job (priority
@@ -981,7 +985,9 @@ backfill match), `message_emotes()` → `clipper_twitch.emotes` (takes parsed Tw
 - **Not recoverable:** deleted messages (backfill is quieter in spam/mod waves) and all events (no
   USERNOTICE/CLEAR*/ROOMSTATE; bits only as text; a resub appeared as a plain comment by the
   subscriber carrying the system text, so sub notices count as chat messages, not events). So: **no** `chat_events` or `viewer_snapshots`,
-  which the detector reads as "unknown", not "none".
+  which the detector reads as "unknown", not "none". No IRC tags either: the replay leaves
+  `chat_messages.first_message`, `highlighted`, `reward_id`, `msg_type` (migration 0006, §18.3)
+  NULL = unknown, and `ChatWriter` leaves them out of its INSERT, so a backfill needs no 0006.
 
 **Viewer clips (ground truth).** New table `viewer_clips` (writer: backfill tool, PK `(platform,
 clip_id)`), from Helix Get Clips per stream window (top by views) and matched to our live or
@@ -1474,13 +1480,38 @@ details, see there):
 **Backfilled streams** (§17) have no `chat_events`, `viewer_snapshots` or deleted rows: read as
 *unknown* (no viewer scaling, event rules off, bits from `Cheer\d+` text; dup still catches raids).
 **Not stored**: polls, predictions, hype trains, channel points (not on anonymous IRC; EventSub
-needs the broadcaster's token), so vote/dup/command heuristics stand in; tags `first-msg`,
-`custom-reward-id`, `msg-id=highlighted-message`. **Chat-ingest change for its next necessary
-redeploy (v1 doesn't need it)**: those tags as **proper columns** on `chat_messages` (decided by the
-user 2026-11-21; proposed: `first_message` bool null, `highlighted` bool null, `reward_id` text
-null; null = unknown, as in backfilled chat; an additive migration, chat-ingest the only live
-writer); `chat_metrics_1s` + ints `command_messages`, `top_text_count`,
-`clip_mentions`, jsonb `emote_messages`: stage 1 filters without raw reads at scale; `NOTIFY` too.
+needs the broadcaster's token; only a redemption *with a message* shows, as a tag below), so
+vote/dup/command heuristics stand in. **IRC tags as columns (built 2026-11-22, migration
+`0006_chat_tags`; proper columns as the user decided 2026-11-21)**: chat-ingest stores a PRIVMSG's
+tags as `chat_messages` `first_message` bool null (`first-msg`), `highlighted` bool null
+(`msg-id=highlighted-message`), `reward_id` text null (`custom-reward-id`) and `msg_type` text null
+(the raw `msg-id`: `highlighted-message`, `skip-subs-mode-message`, `gigantified-emote-message`,
+`animated-message`, `user-intro`, ...). **NULL = unknown**: rows written before 0006 or by the old
+chat-ingest until its redeploy, and backfilled chat (the replay has no tags, §17).
+`first-msg=0|1` comes on every tagged PRIVMSG, so a missing or empty tag is NULL, not false;
+`msg-id` comes only on special messages, so a tagged message without it has `msg_type` NULL and
+`highlighted = false` (a line without any tags: both NULL); `reward_id` NULL also means "no
+reward". `highlighted IS NULL` tells whether tags were known. **Power-ups**
+(`gigantified-emote-message`, `animated-message`) are paid with bits but carry **no `bits` tag**,
+so they make no `bits` event: only `msg_type` shows them. One `ALTER TABLE ... ADD COLUMN ...,
+ADD COLUMN ...` on the partitioned parent: nullable without a default, so catalog-only for every
+partition (no rewrite); `lock_timeout` 5 s per lock wait (also on the downgrade) makes it give up
+instead of queueing chat-ingest's inserts behind a long transaction. Alembic runs all pending
+migrations in one transaction, so 0006 goes on alone, not in one run with 0007+.
+**Deploy order** (the user times it): with compose, `up --build` of any service runs `migrate`
+first (`depends_on: migrate: service_completed_successfully`), so: (1) `docker compose up --build
+migrate` while the old chat-ingest runs (it keeps working on the new schema), and check that it
+exits 0; (2) then `docker compose up -d --build chat-ingest` (without 0006 its inserts fail, the
+rows wait in the retry buffer, ≤ 200k, and the metrics of those seconds are lost). The backfill
+doesn't need 0006: `ChatWriter` leaves the tag columns out of an INSERT whose rows all lack them
+(backfill rows always do). Not used by the detector yet (later tuning, read only where not
+NULL): a `first_message` share (newcomer waves after a raid or host, "first time here" greetings)
+next to the `greeting` rule, and a `reward_id`/`highlighted`/Power-up share (channel-point and
+Power-up waves: TTS, "highlight my message", gigantified emotes) next to the `bits` rule, as
+stage-2 features or suppress reasons; the judge's chat summary could mark such messages.
+**Chat-ingest change for a later redeploy (v1 doesn't need it)**:
+`chat_metrics_1s` + ints `command_messages`, `top_text_count`, `clip_mentions`, jsonb
+`emote_messages`: stage 1 filters without raw reads at scale; `NOTIFY` too.
 
 **4. Explicit signals.**
 - **"Clip it"**: every 5 s, scan new raw messages of held channels for a request to clip: "clip
@@ -1918,9 +1949,9 @@ shared (anyone enqueues). §7's state is never stored: one helper, `clipper_core
 |---|---|---|---|
 | detector §18 | `candidates`, `chat_delay_estimates`, own `media_requests` (0004) | `judge`, `detect_offline` | `detect_offline` |
 | judge §19 | `clips`, `clip_plans`, `judge_calls`, own `media_requests` (0005); `clips/{id}/judge/` | `judge` (rounds), `render`, `notify` | `judge`, `revise_plan` |
-| renderer §20 | `renders` (0006); `clips/{id}/pinned/`, `clips/{id}/renders/` | `review`, `notify` | `render` |
-| review §21 | `clip_reviews`, `review_events` (0007) | `revise_plan`, `render` (re-render), `publish`, `publication_action` | `review`, `notify` |
-| publisher §22 | `platform_accounts`, `publish_routes`, `publications`, `publication_stats` (0008) | `sync_publication`, `notify` | `publish`, `sync_publication`, `publication_action` |
+| renderer §20 | `renders` (0007); `clips/{id}/pinned/`, `clips/{id}/renders/` | `review`, `notify` | `render` |
+| review §21 | `clip_reviews`, `review_events` (0008) | `revise_plan`, `render` (re-render), `publish`, `publication_action` | `review`, `notify` |
+| publisher §22 | `platform_accounts`, `publish_routes`, `publications`, `publication_stats` (0009) | `sync_publication`, `notify` | `publish`, `sync_publication`, `publication_action` |
 
 **Role.** `services/judge` (slim): N `jobs.JobRunner`s on `judge` (ref = candidate) and `revise_plan`
 (ref = review event, §21) + a waiter loop. `clips.status`: `waiting_for_media → judging → rejected |
@@ -2484,7 +2515,7 @@ class EditPlan(StoredModel):
   NULL)`); `confidence` float null; `reasons`, `repairs` jsonb default
   '[]'; `model`, `prompt_version` text; `shadow` bool default false; `judge_call_id` FK judge_calls
   null; `author` text default 'judge' CHECK IN ('judge','operator'); `parent_id` FK clip_plans null
-  (the plan a revision changed); `review_event_id` bigint null (FK added by 0007, §21);
+  (the plan a revision changed); `review_event_id` bigint null (FK added by 0008, §21);
   `instruction` text null; `created_at`. UNIQUE (`clip_id`, `version`).
 - **`JudgeCall`** (`judge_calls`), writer: judge. `id` bigint PK; `clip_id` FK clips null;
   `stream_id` FK streams; `model`, `prompt_version`, `request_hash` text; `input_tokens`,
@@ -2631,7 +2662,7 @@ chunks from lavfi: frame index encoded as luma (`geq`), a 1 kHz beep at known UT
 contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultrafast.
 
 **Build plan.**
-1. **7a Contracts + 0006 + pure parts** (timemap, layout geometry, ASS builder, graph builder, asset
+1. **7a Contracts + 0007 + pure parts** (timemap, layout geometry, ASS builder, graph builder, asset
    manifest + picker). *Done:* golden tests; generated ASS renders through ffmpeg's `ass` filter
    without warnings; `test_migrations` passes.
 2. **7b Render loop, libx264, synthetic chunks.** *Done:* frames at a chunk boundary and at segment
@@ -2666,8 +2697,8 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
 
 ### Contract changes
 
-Hand-written migration **`0006_renderer`** (after `0005_judge`): one new table; nothing else changes.
-`JobKind.RENDER` and `RenderPayload` come with 0005 (§19); `JobKind.REVIEW`/`NOTIFY`,
+Hand-written migration **`0007_renderer`** (after `0006_chat_tags`): one new table; nothing else
+changes. `JobKind.RENDER` and `RenderPayload` come with 0005 (§19); `JobKind.REVIEW`/`NOTIFY`,
 `ReviewPayload`, `NotifyPayload` and `NoticeKind` are §21's code-only contract (the renderer enqueues).
 
 **`contracts.py`**
@@ -2766,7 +2797,7 @@ Telegram**: a bot posts each clip with buttons (approve / reject / edit), the we
 detailed edits. This section was reworked for Discord on 2026-11-21 (the rest of the design is
 unchanged). All of it can be built and tested with fakes, no credentials; the real bot needs the
 user's Discord application (bot token), a private server + review channel and the user's Discord
-user id; remote web access needs Tailscale. Depends on the *contracts* of §19 and §20 (0005/0006),
+user id; remote web access needs Tailscale. Depends on the *contracts* of §19 and §20 (0005/0007),
 not on their services.
 
 **Role.** `services/review` (slim), one process: Discord bot (Gateway websocket), web UI (FastAPI on
@@ -2892,7 +2923,7 @@ our code): reset it in the Discord developer portal. Previews sit on Discord's s
 server). Discord down → the web UI still works.
 
 **Build plan.**
-1. **21a Contracts + 0007 + lifecycle (review part).** *Done:* `test_migrations` passes; state
+1. **21a Contracts + 0008 + lifecycle (review part).** *Done:* `test_migrations` passes; state
    mapping and transitions tested.
 2. **21b Core**: actions, `review`/`notify` handlers, sweep. *Done:* approve → one `publish` job per
    route in the same transaction; concurrent approve/reject → one wins; stale render refused; revise →
@@ -2922,8 +2953,8 @@ server). Discord down → the web UI still works.
 
 ### Contract changes
 
-Migration **`0007_review`** (after `0006_renderer`; additive: two new tables, FKs to `clips` (0005)
-and `renders` (0006), and the FK `clip_plans.review_event_id → review_events` that 0005 left out).
+Migration **`0008_review`** (after `0007_renderer`; additive: two new tables, FKs to `clips` (0005)
+and `renders` (0007), and the FK `clip_plans.review_event_id → review_events` that 0005 left out).
 The enums and payloads below are code only (no DDL): whichever of 6a, 7a, 21a is built first adds
 them, since the judge and renderer enqueue these jobs before review exists. (6a, 2026-11-20, added
 the job kinds, `NoticeKind`, `PlanPatch` and the three payloads; the rest is left for 21a.)
@@ -3012,7 +3043,7 @@ render, review event, publication or account; account notices add the UTC date a
 - `ClipPlan.review_event_id`: `ForeignKey("review_events.id")` (migration: `create_foreign_key`).
 
 **`clipper_core.lifecycle`**: the review mapping is already in §19's helper (6a: `review_status`
-argument, `lifecycle_states()` reads `clip_reviews.clip_id/status` once 0007 ran); 21a adds tests
+argument, `lifecycle_states()` reads `clip_reviews.clip_id/status` once 0008 ran); 21a adds tests
 against the real table.
 
 **Outside core**: controller `STALE_AFTER` += `REVIEW: 5 min`, `NOTIFY: 5 min` (`REVISE_PLAN` with
@@ -3132,7 +3163,7 @@ only. Instagram: Platform Terms, app review for others' accounts. Campaigns: own
 botting; paid clips may need an ad disclosure (FTC/ASA). Stream music → Content ID.
 
 **Build plan.**
-1. **22a Contracts + migration 0008 + `jobs.DeferJob` + crypto + CLI** (fake platform). *Done:*
+1. **22a Contracts + migration 0009 + `jobs.DeferJob` + crypto + CLI** (fake platform). *Done:*
    `test_migrations` passes; wrong AAD/key fails, rotation works; a deferred job keeps its attempts;
    lifecycle maps publications (§19).
 2. **22b Pipeline on `FakePlatform`**: publish job, scheduler, recovery, sync + stats, actions, circuit
@@ -3161,7 +3192,7 @@ botting; paid clips may need an ad disclosure (FTC/ASA). Stream music → Conten
 
 ### Contract changes
 
-Migration **`0008_publisher`** (after `0007_review`; additive: four new tables; FKs to `channels`,
+Migration **`0009_publisher`** (after `0008_review`; additive: four new tables; FKs to `channels`,
 `clips`, `renders`, `review_events`).
 
 **`contracts.py`**
@@ -3283,8 +3314,8 @@ async def defer(session: AsyncSession, job: ClaimedJob, until: datetime, reason:
   engaged views, saves).
 
 **`clipper_core.lifecycle`**: the publication mapping is already in §19's helper (6a:
-`publication_statuses` argument, `lifecycle_states()` reads `publications.clip_id/status` once 0008
-ran); 22a adds tests against the real table. **0008 needs INDEX (`clip_id`) on `publications`** for
+`publication_statuses` argument, `lifecycle_states()` reads `publications.clip_id/status` once 0009
+ran); 22a adds tests against the real table. **0009 needs INDEX (`clip_id`) on `publications`** for
 lifecycle's per-clip subquery (the partial unique index leaves out failed/cancelled/deleted rows).
 
 **Outside core**: controller `STALE_AFTER` += `PUBLISH: 30 min` (the lease protects a slow upload),

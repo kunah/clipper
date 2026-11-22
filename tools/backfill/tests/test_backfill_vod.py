@@ -776,6 +776,12 @@ async def test_chat_replay_becomes_live_rows_and_metrics(sessions, audio_segment
 
     messages = {m[1]: m for m in snap["messages"]}
     assert len(messages) == 150 and snap["events"] == []
+    (tagged,) = await rows(  # the IRC tag columns (0006) stay NULL = unknown
+        sessions,
+        "SELECT count(*) AS n FROM chat_messages WHERE first_message IS NOT NULL "
+        "OR highlighted IS NOT NULL OR reward_id IS NOT NULL OR msg_type IS NOT NULL",
+    )
+    assert tagged.n == 0
     assert {(m[2], m[3], m[4], m[11]) for m in messages.values()} == {
         (vod.channel_id, vod.stream_id, None, "backfill")
     }

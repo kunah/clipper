@@ -100,6 +100,43 @@ async def test_lines_become_messages_events_metrics_and_deletions(sessions):
         assert (await s.execute(text("SELECT count(*) FROM chat_messages"))).scalar_one() == 3
 
 
+async def test_privmsg_tags_are_stored_as_columns(sessions):
+    await setup_channel(sessions)
+    ingest = ChatIngest(sessions, worker_id="test", fetch_emotes=False)
+    await ingest.sync_channels()
+    now = utc_now() - timedelta(seconds=30)
+    reward = "2d9a1a7c-1c6e-4f1b-9e2e-6b4d0e7f3a11"
+    base = f"tmi-sent-ts={ms(now)};user-id=1;first-msg=0;returning-chatter=0"
+    lines = [
+        f"@id=t1;{base.replace('first-msg=0', 'first-msg=1')} :a!a@a PRIVMSG #dallas :hi all",
+        f"@id=t2;{base};msg-id=highlighted-message :a!a@a PRIVMSG #dallas :look",
+        f"@id=t3;{base};custom-reward-id={reward} :a!a@a PRIVMSG #dallas :hydrate",
+        f"@id=t4;{base} :a!a@a PRIVMSG #dallas :plain",
+        f"@id=t5;tmi-sent-ts={ms(now)} :a!a@a PRIVMSG #dallas :no first-msg tag",
+        f"@id=t6;{base};msg-id=gigantified-emote-message :a!a@a PRIVMSG #dallas :Kappa",
+    ]
+    for line in lines:
+        ingest.on_message(parse(line), now)
+    await ingest.flush(final=True)
+    async with sessions() as s:
+        stored = (
+            await s.execute(
+                text(
+                    "SELECT msg_id, first_message, highlighted, reward_id, msg_type "
+                    "FROM chat_messages ORDER BY msg_id"
+                )
+            )
+        ).all()
+    assert [tuple(r) for r in stored] == [
+        ("t1", True, False, None, None),
+        ("t2", False, True, None, "highlighted-message"),
+        ("t3", False, False, reward, None),
+        ("t4", False, False, None, None),
+        ("t5", None, False, None, None),
+        ("t6", False, False, None, "gigantified-emote-message"),
+    ]
+
+
 async def test_new_day_partition_is_created_on_demand(sessions):
     await setup_channel(sessions, live=False)
     ingest = ChatIngest(sessions, worker_id="test", fetch_emotes=False)

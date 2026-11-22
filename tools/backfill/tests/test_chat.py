@@ -96,6 +96,8 @@ def test_fixture_pages_give_live_rows_and_the_live_aggregator_metrics():
         assert [getattr(got, k) for k in same] == [getattr(want, k) for k in same]
         assert (got.badges, got.emotes) == (want.badges, want.emotes)
         assert (got.received_at, got.source, want.source) == (None, "backfill", "live")
+        # the replay carries no IRC tags: the 0006 tag columns stay unknown
+        assert {got.first_message, got.highlighted, got.reward_id, got.msg_type} == {None}
     assert backfill_agg.pop_all() == live.aggregator.pop_all()
 
     emotes = {e["name"]: e["source"] for r in backfilled for e in r.emotes or ()}

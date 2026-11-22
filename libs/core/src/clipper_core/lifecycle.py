@@ -4,11 +4,11 @@
     -> approved | discarded -> publishing -> published   (+ side states failed, unrenderable)
 
 Facts, later stages first (the first match wins):
-1. publications (publisher, §22, migration 0008): any `live` -> published; any `scheduled`,
+1. publications (publisher, §22, migration 0009): any `live` -> published; any `scheduled`,
    `uploading`, `processing` or `unknown` -> publishing;
-2. the clip's review (`clip_reviews.status`, §21, 0007): `approved` -> approved; `rejected`,
+2. the clip's review (`clip_reviews.status`, §21, 0008): `approved` -> approved; `rejected`,
    `expired`, `withdrawn` -> discarded; `pending`, `revising` -> in_review;
-3. the clip's latest render (`renders`, §20, 0006): `rendering` -> rendering; `done` -> in_review
+3. the clip's latest render (`renders`, §20, 0007): `rendering` -> rendering; `done` -> in_review
    (its review job is queued); `failed` -> failed; `unrenderable` -> unrenderable;
 4. `clips.status` (judge, 0005); no clip row -> candidate.
 
@@ -51,7 +51,7 @@ RENDER_STATES = {
     "unrenderable": LifecycleState.UNRENDERABLE,
 }
 
-# Tables of later stages (migrations 0006, 0007, 0008).
+# Tables of later stages (migrations 0007, 0008, 0009).
 RENDERS, CLIP_REVIEWS, PUBLICATIONS = "renders", "clip_reviews", "publications"
 
 

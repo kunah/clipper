@@ -182,6 +182,21 @@ class ChatMessage(Base):
     No foreign keys on purpose: this is the highest-volume table. Writer: chat-ingest
     (`source='live'`), backfill tool (`source='backfill'`: backfilled streams, and the seconds of
     a live stream's `--fill-gaps` ranges that have no live chat; insert-only).
+
+    PRIVMSG tags (migration 0006, DESIGN §18.3), set by chat-ingest; NULL = unknown (rows written
+    before 0006 or by the old chat-ingest until its redeploy, backfilled chat: the GQL replay has
+    none of these tags):
+    - `first_message`: `first-msg=1`, the user's first message in this channel (Twitch sends
+      `first-msg=0|1` on every tagged PRIVMSG; NULL when the tag is missing, empty or unexpected);
+    - `msg_type`: the raw `msg-id` (`highlighted-message`, `skip-subs-mode-message`,
+      `gigantified-emote-message`, `animated-message`, `user-intro`, ...); NULL also on a tagged
+      message without one (most messages);
+    - `highlighted`: `msg_type = 'highlighted-message'`, the "highlight my message" channel-point
+      redemption (False on a tagged message without it);
+    - `reward_id`: `custom-reward-id`, the UUID of the channel-point reward redeemed with this
+      message; NULL also means no reward.
+    `highlighted IS NULL` tells whether the tags were known (`msg_type`/`reward_id` NULL are
+    ambiguous on their own).
     """
 
     __tablename__ = "chat_messages"
@@ -204,6 +219,10 @@ class ChatMessage(Base):
     badges: Mapped[dict[str, Any] | None]  # {"subscriber": "12", "moderator": "1"}
     deleted: Mapped[bool] = mapped_column(server_default=sql_text("false"))
     source: Mapped[str] = mapped_column(Text, server_default="live")
+    first_message: Mapped[bool | None]  # `first-msg` tag (0006); NULL = unknown
+    highlighted: Mapped[bool | None]  # `msg-id=highlighted-message` (0006); NULL = unknown
+    reward_id: Mapped[str | None] = mapped_column(Text)  # `custom-reward-id` (0006)
+    msg_type: Mapped[str | None] = mapped_column(Text)  # the raw `msg-id` tag (0006)
 
 
 class ChatEvent(Base):
@@ -677,7 +696,7 @@ class ClipPlan(Base):
     (`{"before_s", "after_s", "why"}`), both enforced by CHECKs. `reasons`, `repairs`: copies of
     the plan's lists (also for rejects). `author` (`contracts.PlanAuthor`): `judge` (the model)
     or `operator` (a review PlanPatch); revisions set `parent_id` (the plan they changed),
-    `review_event_id` (its FK comes with review's migration, 0007) and `instruction`.
+    `review_event_id` (its FK comes with review's migration, 0008) and `instruction`.
     """
 
     __tablename__ = "clip_plans"
@@ -707,7 +726,7 @@ class ClipPlan(Base):
     judge_call_id: Mapped[int | None] = mapped_column(ForeignKey("judge_calls.id"))
     author: Mapped[str] = mapped_column(Text, server_default="judge")
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("clip_plans.id"))
-    review_event_id: Mapped[int | None] = mapped_column(BigInteger)  # FK added by 0007 (§21)
+    review_event_id: Mapped[int | None] = mapped_column(BigInteger)  # FK added by 0008 (§21)
     instruction: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _created_at()
 

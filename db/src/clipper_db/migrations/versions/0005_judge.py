@@ -6,7 +6,7 @@ Create Date: 2026-11-20
 
 Additive (DESIGN §19): three new tables and one FK on an existing nullable column
 (`media_requests.clip_id`, NULL in every row so far: no writer set it before the judge).
-`clip_plans.review_event_id` gets its FK with review's migration (0007, §21).
+`clip_plans.review_event_id` gets its FK with review's migration (0008, §21).
 """
 
 from __future__ import annotations
@@ -143,7 +143,7 @@ def upgrade() -> None:
         sa.Column("judge_call_id", sa.BigInteger),
         sa.Column("author", sa.Text, server_default="judge", nullable=False),
         sa.Column("parent_id", sa.BigInteger),
-        sa.Column("review_event_id", sa.BigInteger),  # FK comes with 0007 (review_events)
+        sa.Column("review_event_id", sa.BigInteger),  # FK comes with 0008 (review_events)
         sa.Column("instruction", sa.Text),
         _now("created_at"),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_clip_plans")),
