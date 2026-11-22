@@ -173,6 +173,27 @@ def test_budget_caps_emitted_candidates_per_hour():
         assert len(window) >= P.budget_per_hour and d.score <= min(e.score for e in window)
 
 
+def test_the_live_write_dedupe_drops_a_moment_45_s_after_a_suppressed_raid():
+    """As `writes.write_candidate` does live (+- 60 s on the video peak against every candidate
+    of the stream, suppressed ones too): the real moment is not written. `dedupe=False` keeps it.
+    The live service does the same (`test_detector_backtest_cli`)."""
+    sim = chat(1)
+    sim.event(CENTER - 12, "raid", user_login="bigraider", viewerCount="3000")
+    burst(sim, ("bigraiderRaid bigraiderRaid", "raid hype", "here from the raid", "hello"))
+    burst(sim, ("KEKW", "KEKW KEKW", "LMAOOO", "OMEGALUL"), center=CENTER + 45)
+    out = run(sim)
+    assert len(out.episodes) == 2
+    (raid,) = out.drafts
+    assert raid.suppress_reason is SuppressReason.RAID
+    (dup,) = out.duplicates
+    assert dup.of == 0 and dup.draft.emitted and dup.draft.moment_type is MomentType.FUNNY
+    assert abs(off(dup.draft.chat_peak_utc) - CENTER - 45) <= 3
+
+    kept = run(sim, dedupe=False)
+    assert [d.suppress_reason for d in kept.drafts] == [SuppressReason.RAID, None]
+    assert kept.duplicates == []
+
+
 def test_missing_chat_run_is_reported_and_harmless():
     sim = ChatSim(random.Random(5), T0, emote_names=EMOTES)
     sim.chatter(0, 1800, 5, NORMAL)

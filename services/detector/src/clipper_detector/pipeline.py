@@ -1,8 +1,13 @@
 """Scorer -> stage 2 -> merge over in-memory rows of one stream (tests, backtest, offline replay).
 
 The live service (build item 3) runs the same steps with database reads in between; this module
-is the reference it must match. Candidate ids here are local: the position of the draft in
-`StreamRun.drafts` (the database assigns real ones).
+is the reference it must match: for one stream's rows scored from its start, without explicit
+signals, `run_stream` gives the drafts an uninterrupted live run writes (tested in
+`test_detector_backtest_cli`). That includes the live write's dedupe (`writes.write_candidate`): a
+draft whose video peak lies within +- `dedupe_s` of a draft kept earlier (any status) is not
+written; it goes to `StreamRun.duplicates` and, as in live, counts for neither cooldown nor budget.
+Candidate ids here are local: the position of the draft in `StreamRun.drafts` (the database
+assigns real ones).
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from clipper_core.contracts import CandidateSource
 from clipper_detector.lexicon import ChannelLexicon
@@ -33,10 +38,20 @@ from clipper_detector.scorer import (
 from clipper_detector.stage2 import ChatEventLike, ChatMessageLike, evaluate, windows
 
 
+@dataclass(frozen=True, slots=True)
+class Duplicate:
+    """A draft the live write's dedupe drops: within +- `dedupe_s` of `of` (an index into
+    `StreamRun.drafts`) on the video peak."""
+
+    draft: CandidateDraft
+    of: int
+
+
 @dataclass(slots=True)
 class StreamRun:
     drafts: list[CandidateDraft] = field(default_factory=list)
     folded: list[FoldIn] = field(default_factory=list)
+    duplicates: list[Duplicate] = field(default_factory=list)
     episodes: list[Episode] = field(default_factory=list)
     suspects: list[Suspect] = field(default_factory=list)
     missing: list[MissingChat] = field(default_factory=list)
@@ -75,13 +90,16 @@ def run_stream(
     started_at: datetime | None = None,
     prior: PriorBaseline | None = None,
     source: CandidateSource = CandidateSource.LIVE,
+    dedupe: bool = True,
 ) -> StreamRun:
-    """All decisions for one stream's rows. `events=None`: events unknown (backfill)."""
+    """All decisions for one stream's rows. `events=None`: events unknown (backfill).
+    `dedupe=False` keeps the drafts the live write would drop (`StreamRun.duplicates`)."""
     scorer = ChannelScorer(params, started_at=started_at, prior=prior)
     msgs = _Slicer(messages)
     evs = None if events is None else _Slicer(events)
     out = StreamRun()
     recent: list[PriorCandidate] = []
+    within = timedelta(seconds=params.dedupe_s)
 
     def handle(batch: list) -> None:
         for ev in batch:
@@ -119,6 +137,14 @@ def run_stream(
             target.features.setdefault("followups", []).append(decision.followup)
             recent[recent.index(decision.into)] = decision.extended  # cooldown from the last close
             return
+        if dedupe:
+            near = [
+                i for i, d in enumerate(out.drafts) if abs(d.peak_utc - decision.peak_utc) <= within
+            ]
+            if near:  # live: `nearest_candidate` within +- dedupe_s -> not written
+                of = min(near, key=lambda i: (abs(out.drafts[i].peak_utc - decision.peak_utc), i))
+                out.duplicates.append(Duplicate(decision, of))
+                return
         recent.append(decision.as_prior(len(out.drafts)))
         out.drafts.append(decision)
 

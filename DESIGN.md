@@ -17,7 +17,8 @@ judges, edits and publishes short vertical clips.
 > (8 s delay, ≤ 8 candidates/stream-hour, raid/sub suppression, Get Clips), review on Discord,
 > the judge on Opus via the Claude Code CLI in Docker with no usage limits for now, and publishing
 > per user-filled route (backfilled clips included). Detector build items 1–3 (contracts + 0004,
-> scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21. Judge
+> scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21; build
+> item 4 (read-only backtest CLI vs viewer clips) built 2026-11-22, not run on real data yet. Judge
 > build items 6a (contracts + 0005 + `clipper_core.lifecycle`, §19), 6b (input builder +
 > resolver, pure code in `services/judge`) and 6c (the `clipper-judge` service with a
 > deterministic fake model, waiter, context rounds, call cache, usage guard off by default,
@@ -292,7 +293,9 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
 **Phase 2**: detector (live + offline, emote categories, fake-spike filter) → judge (LLM,
 context requests) → renderer (9:16, captions) → review (Discord + web) → publisher →
 analytics loop. Then Kick/YouTube. Detector build items 1–3 (contracts, scorer, live service)
-built 2026-11-20, see §18.10, live since 2026-11-21 (judge jobs off); judge build item 6a (contracts, migration 0005, lifecycle helper)
+built 2026-11-20, see §18.10, live since 2026-11-21 (judge jobs off); build item 4 (the read-only
+backtest CLI, `clipper-detector backtest`) built 2026-11-22, not run on real data yet (first:
+stream 803), tuning the defaults needs that; judge build item 6a (contracts, migration 0005, lifecycle helper)
 built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, 6c (the judge service with a
 deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, see §19; next 6d (the
 Claude Code CLI adapter). Designs (all proposed 2026-11-19, not yet agreed):
@@ -1412,7 +1415,8 @@ Twitch app credentials are in the worktree's `.env` now, and the detector polls 
 them; the user agreed on 2026-11-21 that it holds them). The backtest (build
 item 4) has its credentials now, so Helix viewer clips and channel lookups work. It still needs
 backfilled VODs, and those are only the ones the user names (§17, decided 2026-11-21): the first
-is yesterday's ohnepixel VOD (§15). Defaults accepted by the user (2026-11-21): 8 s chat delay
+is yesterday's ohnepixel VOD (§15). **2026-11-22:** the backtest CLI is built (`clipper-detector
+backtest`, read-only, build item 4); not run on real data yet (first: stream 803). Defaults accepted by the user (2026-11-21): 8 s chat delay
 until learned, ≤ 8 chat candidates per stream-hour to the judge, raid and gifted-sub spikes
 suppressed.
 
@@ -1607,7 +1611,8 @@ has attached their clips (the only set with events and viewers). At `k = ceil(4 
 2/h, 8/h): hit rate@k (precision lower bound: unclipped good moments exist), view-weighted
 recall@k, median (peak − clip start) as a delay check, candidates/h, false suppressions per
 reason; §17's exclusions apply (muted, `timeline_uncertain`). `clipper-detector backtest --stream
-12 | --channel x --since 2026-11-01 [--params p.toml] [--grid z_on=3,4,5]`: read-only, a table.
+12 | --channel x --since 2026-11-01 [--params p.toml] [--grid z_open=3,4,5]`: read-only, a table
+(built: build item 4, with the details settled there: chat-coverage hours, partial streams).
 
 **9. Service shape.** Loops: live 1 s (one query `channel_id = ANY(:held) AND ts > :last AND
 ts < now() − 10 s` on the PK → scorers in ts order); explicit 5 s; streams/leases 10 s; sweeps 60 s /
@@ -1809,13 +1814,130 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
      `CLIPPER_WORKER_ID` would make both share one owner: one service (and id) per process.
    - Open: the draft dedupe (± 60 s on the video peak, §18.5) also drops a *stronger* live
      episode within 60 s of an emitted candidate that `plan_candidate` would emit with
-     `prev_candidate_id`; explicit-signal timing and thresholds are guesses (tune with build
+     `prev_candidate_id`, and a real moment within 60 s of a *suppressed* one (a raid; found by
+     build item 4, which made the pipeline mirror it); explicit-signal timing and thresholds are guesses (tune with build
      items 4/5); the
      raw-chat scan reads every message of held channels every 5 s (fine at 10 channels; at
      hundreds, chat-ingest's proposed `clip_mentions` column); the Helix poll is untested against
      the real API (no credentials in tests).
-4. **Backtest CLI** (needs step 5 data). *Done:* hit rate/recall@k for ≥ 10 streams, < 1 min each;
-   then tune the defaults (**depends on real data**) and log them with their numbers.
+4. **Backtest CLI**: built 2026-11-22, not done (not run on real data yet). *Done:* hit
+   rate/recall@k for ≥ 10 streams, < 1 min each; then tune the defaults (**depends on real
+   data**) and log them with their numbers. *Built:* the command and its metrics, < 1 min per
+   stream measured on synthetic data; still open: the real streams (first stream 803 with its
+   99 viewer clips, run by the main session) and the tuning. `clipper-detector backtest --stream
+   ID... | --channel LOGIN [--since D] [--until D] [--params P] [--lexicon L] [--grid
+   key=v1,v2]... [--k-per-hour 4] [--json]`: `clipper_detector.backtest` (pure: truth,
+   coverage, metrics, grid, table and JSON) + `backtest_cli` (reads, replay, the command);
+   `clipper-detector` without a command is the live service as before (the image's `CMD`).
+   Settled (provisional like the rest; a review the same day added streams without clips left
+   out, per-clip false suppressions, the precision set, the chance level, the broadcast-end cap,
+   ranking clips without a span, the `--grid` guards, slack for an uncertain timeline, moment
+   recall):
+   - **One scorer**: `pipeline.run_stream` over the rows the live service reads, with its read
+     helpers (`reads.metrics`, `viewer_snapshots`, `messages`, `events`, `learned_delays`,
+     `prior_baseline`): every whole second from `ceil(started_at)` (no row = 0; viewers = the
+     latest snapshot at or before the second, read from 120 s before the start; backfilled
+     streams: viewers and events unknown), the prior from the previous stream, the delay
+     override → learned → default, params from `--params` or `CLIPPER_DETECTOR_PARAMS_PATH`, the
+     lexicon likewise (channel overrides applied). Raw chat and events are read only for the
+     union of every episode's stage-2 windows: a stage-1 pass (`run_seconds`, cheap) finds the
+     episodes first, and the scorer is deterministic, so `run_stream` sees the same ones; a 6 h
+     stream reads its windows, not its 65k messages. Existing candidates are not read (a run
+     starts from nothing, like a live run from the stream's start). Tested: the live service run
+     over a stored stream from its start (one sync at the start, then one tick over the whole
+     stream) writes exactly the backtest's drafts, every column and `features` included, and
+     drops the same moment (next point). **Equality holds on the same rows, not on the live run
+     as it happened**: rows that came later (a CLEARMSG marking messages `deleted` after the
+     decision, late `chat_metrics_1s` rows, a stream row that turned up late), delays learned
+     since, a restart's shorter replay baseline or explicit signals make the stored candidates
+     differ from a backtest of today's rows.
+   - **The live write dedupe is in the pipeline now** (deviation, found here):
+     `writes.write_candidate` drops a draft within ± `dedupe_s` (60 s) on the video peak of
+     *any* candidate of the stream, also a suppressed one, so a real moment 40–55 s after a
+     suppressed raid is never written live (16 of 16 seeded runs). `run_stream` kept it, so it
+     didn't reproduce live; it now mirrors the dedupe (`dedupe=True` by default; the dropped
+     drafts go to `StreamRun.duplicates` and, as live, count for neither cooldown nor budget).
+     The backtest counts them as `deduped` and can name `dedupe` as a false-suppression reason.
+     Whether live should keep dropping them (the dedupe is there for restarts) is open (build
+     item 3's Open note).
+   - **Unhashed params**: `dedupe_s` and `final_lag_s` (`NON_SCORING`) change backtest results
+     (the drafts; an open stream's end) without changing `detector_version`; putting them into
+     the hash would give every live candidate a new version string, so instead a run with them
+     off their code defaults is labelled `<detector_version>+dedupe_s=30` (table and JSON
+     `label`, with `unhashed`). `--grid` refuses `restart_replay_s`/`restart_emit_s` (only the
+     live restart replay uses them).
+   - **End of the data**: seconds up to `ended_at`, the channel's next stream's start (live
+     gives a second to the latest-started stream holding it) or the final cutoff, and no further
+     than the chat's end + `force_close_s + close_after_s + activity_window_s + 1`: any episode
+     open at the chat's end is closed by then, so live's further zeros up to `ended_at` change
+     nothing (803's `ended_at` is the next day).
+   - **Chat coverage** = `[first chat_metrics_1s row, last row + 1 s)` (a backfilled stream: up
+     to `vods.chat_metrics_to` when later, whose rows are final), cut at the **broadcast's real
+     end** when known: the `vods` row's `t0_utc + duration_s` (backfill or fill), else the last
+     chunk's end, + the delay (chat time). Offline chat that chat-ingest logged into a stream the
+     controller ended late is no coverage, and candidates whose chat peak lies after the cut are
+     left out of the scoring (`after_broadcast`; the scorer still runs over them, as live did).
+     A live stream whose recorder stopped while chat-ingest went on loses that chat to the cut
+     (accepted: rarer than offline chat). Minus the scorer's `MissingChat` runs inside it, from
+     the base params (so `--grid` scores every combination on the same clips); a run lasting to
+     the end of the data is the chat's end, not a hole. Hours, k and candidates/h count coverage
+     hours (803: ~5 h of 9.7). A warning (table and JSON `warnings`) when the coverage runs more
+     than 10 min past the last viewer clip.
+   - **Streams not scored**: without viewer clips, without one with a span, or without chat
+     rows: listed with a note, left out of the totals.
+   - **Truth**: of all the stream's clips (a NULL span ranks too), the top 10 by views ∪ every
+     clip ≥ the p75 of their views (linear interpolation), picked *before* the exclusions, which
+     are counted per reason: `no_span` (no `vod_offset` yet), `muted` (the span overlaps a
+     `muted` gap), `outside_chat` (the span shifted by the delay doesn't lie inside one coverage
+     interval). Picking first keeps the broadcast's top moments the truth even where we have no
+     chat. Slack = `slack_s` (NULL → duration + 10 s) + the VOD's `timeline_uncertain_s` when
+     its `vods` row is flagged (a warning; the stream is scored).
+   - **Metrics** as §18.8 at 2/h, the `--k-per-hour` rate (sort key, 4) and 8/h; ranking by
+     score, ties to the earlier peak. **Precision**: `hit_rate` tests the top k against the
+     truth clips with a span *before* the muted/outside exclusions (a candidate on a top moment
+     is no miss because that clip can't be scored for recall), `hit_rate_any` against every clip
+     with a span; **chance** / `chance_any` = |∪(span ± slack) ∩ coverage| / |coverage| (video
+     time) for those two sets, per stream and pooled: what random peaks would score, printed
+     next to hit@k. **Recall** (view-weighted, scored truth clips) and **moment recall** (scored
+     truth clips whose bare spans overlap are one moment, weighted by its most viewed clip). The
+     delay check = median (peak − clip start) over the truth clips hit, the best-ranked
+     candidate inside each. **False suppressions**, per rate: each scored truth clip that none
+     of the k hits, attributed to the reason of the best-ranked suppressed candidate inside it
+     (any reason, `weak`, `budget` and `dedupe` too); `suppressed_in_truth` (JSON) keeps the raw
+     count (every suppressed candidate inside a scored truth clip). The total row pools the
+     streams (hits / candidates, hit views / truth views, span seconds / coverage seconds).
+   - **Not replayed**: explicit signals (clip mentions, clip links in chat; their attach and
+     re-emit timing follows the live ticks): the backtest is a live run without signals; Helix
+     viewer clips are the truth, never an input.
+   - **Read-only**: the engine connects with `-c default_transaction_read_only=on` (every write
+     raises). Tests: a read-only engine and every table's row count and md5 equal before and
+     after, also through `amain`.
+   - **Output**: a table per stream + a total row on stdout (logs on stderr), then warnings and
+     the notes of streams not scored; `--json` adds per stream the delay, broadcast end, chat
+     span, missing runs, coverage, every candidate (`candidate_list`: rank, status, reason,
+     `after_broadcast`, the clip it hits) and truth clip (`truth_clips`: best rank, exclusion,
+     slack), not with `--grid`; `--grid` (repeatable, the cartesian product; keys are
+     `DetectorParams` fields, combinations validated like a TOML file) prints one row per
+     combination with its label, best recall@k first. Exit 2: unknown stream/channel, nothing to
+     backtest, invalid `--params`/`--lexicon`/`--grid`.
+   - **Performance**: a synthetic 6 h live stream (3/s chat, 65k messages, 11 moments, viewers,
+     raids) takes 1.25 s from the reads to the score on this PC (target < 1 min).
+   - **Tests** (detector ~2.3 min): 36 on the metrics (hit and slack, k, ranking, recall
+     weighting, moments, delay, the precision set, chance, `hit_rate_any`, percentile, truth
+     selection with unspanned clips, partial coverage with a missing run and the delay shift,
+     truth before exclusions, muted, per-clip false suppressions, totals, table, grid
+     parsing/validation/sort, labels, `clipper-detector`'s command line); 12 against Postgres (a
+     planted moment inside a clip → hit, the deduped moment → false suppression, a clip after
+     the stored chat → outside, the table; `--grid`; backfilled streams with `chat_metrics_to`,
+     a muted clip, an uncertain timeline, `--channel --since`; the broadcast end from the
+     chunks; streams not scored and usage errors; `amain` on a read-only engine; live service =
+     backtest; the 6 h timing); 1 pipeline test (the dedupe).
+   - **To watch on stream 803** (live, so events and viewers known; 99 clips, many after
+     17:29Z): `outside` should hold most clips after 17:29Z; without a `vods` row the coverage
+     ends at the last chunk (17:29:24Z + 8 s), with a fill row at the VOD's end; clips linked by
+     Helix `created_at` (`time_source = helix_created_at`) have 5 s more slack and a T0 ~3.5 s
+     after `T0_audio` (calibrate), which shifts the delay check; compare hit@k with `chance`;
+     the default 8 s delay (no learned estimates yet).
 5. **Offline pass, delay learning, explicit signals** (needs the transcriber running, the tagger
    choice, §17's `get_clips`). *Done:* delay within ± 3 s of a hand measurement on 3 channels;
    backtest reports offline vs chat-only recall (measured, no target yet).
@@ -1850,6 +1972,9 @@ Accepted by the user on 2026-11-21 (§15): the 8 s default delay, ≤ 8 candidat
 | 2026-11-20 | Replay dedupe: an episode inside a candidate's chat span (extended by its follow-ups), or a replayed one whose burst `[onset − 10 s, end + 10 s]` holds an unclaimed peak or follow-up peak an earlier process decided (matched one to one, passed peaks dropped), is that candidate's | a restart's shorter baseline scored folded follow-ups above their candidate and re-emitted them (review probe: 2 extra candidates); a plain ± 60 s test swallowed bursts the earlier process never decided (re-review: chains split, a stronger burst lost) |
 | 2026-11-20 | Final lag 10 s plus a data watermark (newest row + 1 s, within 10 s), late rows counted | 8 s left ~1 s of margin over chat-ingest's grace and flush; a lagging flush must not turn chat into zeros |
 | 2026-11-20 | The chat budget counts chat candidates only; signal-only candidates have their own cap (4 per stream-hour) | a signal-only candidate's score is just its boost: as the budget's "lowest" it let every chat candidate through |
+| 2026-11-22 | `pipeline.run_stream` mirrors the live write dedupe (± `dedupe_s` on the video peak against every candidate kept, any status); the backtest reports the dropped drafts | live never wrote a real moment 40–55 s after a suppressed raid; without the mirror the backtest didn't reproduce live |
+| 2026-11-22 | Backtest k and candidates/h count chat-coverage hours (chat rows, cut at the broadcast's end, minus missing-chat runs); truth = top 10 ∪ ≥ p75 of all clips, picked before the exclusions (`no_span`, `muted`, `outside_chat`), which are counted; precision tests the truth before the exclusions and is read against a chance level | partly recorded streams (803: chat for ~5 of 9.7 h); views rank the broadcast's moments whatever part we recorded; offline chat logged into a stream ended late is no broadcast; a 30 s clip with 40 s slack covers 110 s |
+| 2026-11-22 | The backtest replays no explicit signals; Helix viewer clips are only the truth | signal timing follows the live ticks; clips as input would leak the truth |
 
 ### Contract changes
 

@@ -277,8 +277,13 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
   (`docker compose up --build migrate`, while the old chat-ingest runs; it's catalog-only, 5 s
   lock timeout), then `docker compose up -d --build chat-ingest` (a restart loses a few seconds
   of chat; best while ohnepixel is offline). The backfill doesn't need 0006.
-- Next: detector unit 4 (backtest CLI; real run on stream 803's 99 viewer clips once the stack is
-  up), then 6d's buildable part (Claude CLI adapter on a fake
+- Done 2026-11-22: detector unit 4, `clipper-detector backtest` (read-only; same pipeline as live,
+  verified equal on the same rows; hit@k vs a chance baseline, view-weighted and moment recall at
+  2/4/8 per hour, false suppressions per reason, `--grid`). Real run on stream 803 (99 viewer
+  clips) once the stack is up. Found: the live write path drops a real moment within 60 s of a
+  *suppressed* candidate (e.g. a raid); on the synthetic stream `--grid dedupe_s=30` lifts recall
+  0.50 → 0.80. Not changed live; decide with the 803 numbers.
+- Next: 6d's buildable part (Claude CLI adapter on a fake
   executable + usage guard; also the stale `# cost guard (daily cap)` comment on
   `ClipRejectReason.BUDGET` in `contracts.py`), renderer §20 (contracts, pure ffmpeg graph
   builder, NVENC smoke test only while the GPU isn't busy with the backlog), review §21 (Discord)
@@ -303,6 +308,8 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-22: the five-hour usage limit paused the agents twice (~04:00Z and until 11:50Z);
+  work continued after each reset. The stack is still stopped (checked 14:14Z).
 - 2026-11-22 ~00:00Z: the Clipper stack was stopped cleanly again (all containers exit 0, also
   the main session's `clipper-filer-ui`), not by this session. Not restarted; the real
   `--fill-gaps` runs wait for the stack. Tests meanwhile use a throwaway Postgres container

@@ -52,7 +52,13 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   replay), `reads`/`writes` (one transaction per candidate: row + media request + judge job),
   `settings` (`CLIPPER_DETECTOR_*`: `MODE` live|offline|all, offline not built yet; `JUDGE_JOBS`
   default 0 until the judge exists). Viewer clips only with `CLIPPER_TWITCH_*` credentials.
-  Compose service `detector` (profile `detector`). Needs migration 0004.
+  Compose service `detector` (profile `detector`). Needs migration 0004. `pipeline.run_stream`
+  mirrors the live write dedupe (± `dedupe_s`, dropped drafts in `StreamRun.duplicates`), so it
+  equals an uninterrupted live run without explicit signals. Backtest (build item 4, read-only):
+  `backtest` (pure: truth = top 10 ∪ ≥ p75 viewer clips, chat coverage cut at the broadcast's
+  end, hit@k vs a chance level, clip and moment recall@k, delay check, false suppressions,
+  `--grid` combos, table/JSON) + `backtest_cli` (`clipper-detector backtest`: the live read
+  helpers -> `run_stream`; engine with `default_transaction_read_only`).
   `services/judge/` (`clipper_judge`, DESIGN §19). Pure part (6b): `params` (`JudgeParams`),
   `inputs` (`JudgeInputs`, one round in memory), `transcript` (sentences `S1…`, snapping
   lookups), `answer` (`JudgeAnswer`, the model's schema), `prompt` (`build_request` -> versioned,
@@ -110,6 +116,8 @@ docker compose up -d --build controller chat-ingest recorder
 docker compose up -d --build transcriber    # GPU (profile gpu, enabled by naming it); first start
                                             # downloads ~1.5 GB of weights into the `models` volume
 uv run clipper-detector                     # live detector natively (CLIPPER_DETECTOR_JUDGE_JOBS=0)
+uv run clipper-detector backtest --stream 803 [--json]   # read-only: candidates vs viewer clips
+uv run clipper-detector backtest --channel x --since 2026-11-01 --grid z_open=3.5,4,5
 docker compose up -d --build detector       # profile detector, enabled by naming it
 docker compose up -d --build judge          # profile judge (fake model until 6d); needs 0005
 ```
