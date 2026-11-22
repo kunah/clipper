@@ -316,7 +316,13 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
   clips) once the stack is up. Found: the live write path drops a real moment within 60 s of a
   *suppressed* candidate (e.g. a raid); on the synthetic stream `--grid dedupe_s=30` lifts recall
   0.50 → 0.80. Not changed live; decide with the 803 numbers.
-- Next: the fill-guard fix (per stream, not per channel), then the fills; then 6d leftovers (Claude CLI adapter on a fake
+- Done 2026-11-23: the fill guard is per stream, not per channel: ended + 5 min (DB clock), no
+  recorder heartbeat listing the stream within 10 min, no live chunk of it written within 10 min;
+  an older heartbeat that still lists the stream only warns (start that recorder first).
+- **Stopped here on your request (2026-11-23).** Next when you resume: the fill runs (803 dry run →
+  real run, then 1412), renderer 7a+7b (prompt ready), then review §21 and publisher §22
+  contracts + fakes; a recorder-side check against committing a spooled chunk over fill chunks
+  (needs a recorder redeploy); tuning the detector's chat scorer (viewer floor) on more streams. (Claude CLI adapter on a fake
   executable + usage guard; also the stale `# cost guard (daily cap)` comment on
   `ClipRejectReason.BUDGET` in `contracts.py`), renderer §20 (contracts, pure ffmpeg graph
   builder, NVENC smoke test only while the GPU isn't busy with the backlog), review §21 (Discord)

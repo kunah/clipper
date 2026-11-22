@@ -20,7 +20,8 @@ PATH (`CLIPPER_BACKFILL_FFMPEG`) for media and `calibrate`; `--no-media` needs n
 `vod <id> --fill-gaps` fills the `not_recorded` gaps and the unrecorded tail/head of an ended
 stream WE recorded live from its VOD (DESIGN §17), and never touches what was recorded live; it
 needs object storage and ffmpeg even for `--dry-run` (it measures its T0 on the live audio). Not
-our live stream, a backfilled one, still live, or a T0 that isn't trustworthy (see the dry run;
+our live stream, a backfilled one, still live or written by the recorder in the last 10 min
+(`CLIPPER_BACKFILL_FILL_QUIET_S`), or a T0 that isn't trustworthy (see the dry run;
 `--accept-t0 audio|pdt` overrides): exit 2.
 A third-party emote provider that can't be reached (FFZ is unreachable from the dev PC) doesn't
 stop the chat: its emotes aren't counted and `vods.flags.emote_sets_failed` names it. Viewer-clip

@@ -16,7 +16,8 @@ VOD; its chat is still fetched.
 ended gets its `not_recorded` gaps and unrecorded tail/head filled from the VOD instead: a `vods`
 row referencing the live stream, `source='backfill'` chunks (seq >= `FILL_SEQ_BASE`, no gap
 rows), chat of the seconds without live chat, then the usual clips. Anything recorded live stays
-as it is. Not ours / backfilled / still live: `FillRefused` (the CLI exits 2).
+as it is. Not ours / backfilled / still live / recently written by the recorder (this stream's
+live chunks and recorder heartbeats, not the channel's lease): `FillRefused` (the CLI exits 2).
 """
 
 from __future__ import annotations
@@ -62,7 +63,6 @@ from clipper_backfill.planner import (
 )
 from clipper_backfill.settings import BackfillSettings
 from clipper_backfill.t0 import ChatPoint, T0Estimate, estimate_t0, pdt_points
-from clipper_core import leases
 from clipper_core.contracts import (
     FILL_SEQ_BASE,
     DataSource,
@@ -70,10 +70,9 @@ from clipper_core.contracts import (
     VodChatStatus,
     VodMediaStatus,
     backfill_lease,
-    recording_lease,
 )
 from clipper_core.logs import get_logger, log_context
-from clipper_core.timeline import Interval, utc_now
+from clipper_core.timeline import Interval
 from clipper_core.transcripts import ENDED_GRACE
 from clipper_twitch.gql import ChatReplay, GqlError, ReplayUnavailable, VideoInfo, VideoInfoSource
 from clipper_twitch.helix import HelixClient, HelixVideo
@@ -97,8 +96,8 @@ class UsageError(ValueError):
 
 
 class FillRefused(UsageError):
-    """`--fill-gaps` can't run on this VOD: its broadcast is not one of our live streams, is a
-    backfilled one, or is still live. The CLI exits 2."""
+    """`--fill-gaps` can't run on this VOD (not one of our live streams, a backfilled one, still
+    live or still written by the recorder, an untrusted T0, ...): the CLI exits 2."""
 
 
 def parse_video_ref(ref: str) -> str:
@@ -644,6 +643,7 @@ class Backfiller:
         broadcast = _broadcast(meta, media)
         async with self.sessions() as s:
             stream = await self._fill_stream(s, video_id, meta, broadcast, existing)
+            warnings = await self._recorder_done(s, stream)
             live = await rows.live_media(s, stream.id)
             leftovers = await rows.fill_leftovers(s, stream.id) if existing is None else 0
         # a live seq at FILL_SEQ_BASE - 1 would be the first fill chunk's seq neighbour
@@ -660,6 +660,7 @@ class Backfiller:
             )
         lines = self._describe(meta, media, existing, None)
         lines.append(_live_line(stream, live))
+        lines += warnings
         new = measured = None
         if existing is None:
             new, measured = await self._new_fill_vod(meta, media, broadcast, live, opts)
@@ -697,7 +698,7 @@ class Backfiller:
         broadcast: _Broadcast,
         existing: rows.VodRow | None,
     ) -> rows.StreamRow:
-        """Our ended LIVE stream of the broadcast, else FillRefused."""
+        """Our ended LIVE stream of the broadcast, else FillRefused (then `_recorder_done`)."""
         if existing is not None:
             stream = await rows.stream_by_id(s, existing.stream_id)
         else:
@@ -723,19 +724,50 @@ class Backfiller:
             raise FillRefused(
                 f"stream {stream.id} is still live (the recorder writes it): wait until it ended"
             )
-        if utc_now() < stream.ended_at + ENDED_GRACE:
+        return stream
+
+    async def _recorder_done(self, s: AsyncSession, stream: rows.StreamRow) -> list[str]:
+        """FillRefused while the recorder may still write THIS ended stream (on the database's
+        clock): ended less than `ENDED_GRACE` ago, a recorder heartbeat listing it or a live
+        chunk of it committed less than `fill_quiet_s` ago. Not the channel's
+        `record:channel:{id}` lease: that one is held for the channel's next broadcast too.
+        Returns a warning per older recorder heartbeat that still lists it (a recorder that
+        died recording it may commit a spooled chunk when it starts again)."""
+        assert stream.ended_at is not None
+        activity = await rows.recorder_activity(s, stream.id)
+        if activity.now < stream.ended_at + ENDED_GRACE:
             raise FillRefused(
                 f"stream {stream.id} ended at {stream.ended_at.isoformat()}, less than "
                 f"{ENDED_GRACE.seconds // 60} min ago (the recorder may still upload its last "
                 "chunk): wait until it ended"
             )
-        holder = await leases.holder(s, recording_lease(stream.channel_id))
-        if holder is not None:
+        quiet_s = self.settings.fill_quiet_s
+        for worker, age in activity.recorders:
+            if age < quiet_s:
+                raise FillRefused(
+                    f"a recorder ({worker}) records stream {stream.id} (its heartbeat "
+                    f"{age:.0f} s ago lists it): wait until it ended"
+                )
+        if activity.last_age_s is not None and activity.last_age_s < quiet_s:
             raise FillRefused(
-                f"a recorder ({holder}) holds the recording lease of channel {stream.channel_id}: "
-                "wait until it ended"
+                f"the recorder wrote live chunk {activity.last_seq} of stream {stream.id} "
+                f"{activity.last_age_s / 60:.1f} min ago, less than {quiet_s / 60:g} min (it may "
+                "still write the stream): wait until it ended"
             )
-        return stream
+        warnings = []
+        for worker, age in activity.recorders:
+            log.warning(
+                "a stale recorder heartbeat lists the stream",
+                worker=worker,
+                stream_id=stream.id,
+                heartbeat_age_s=round(age),
+            )
+            warnings.append(
+                f"warning: worker {worker}'s last heartbeat (age {_hms(age)}) still lists stream "
+                f"{stream.id}: its spool may hold a chunk of it; start that recorder first (it "
+                "commits the chunk), then fill"
+            )
+        return warnings
 
     async def _new_fill_vod(
         self,

@@ -361,6 +361,54 @@ async def live_media(session: AsyncSession, stream_id: int) -> LiveMedia:
     return LiveMedia(list(chunks), list(gaps))
 
 
+@dataclass(frozen=True, slots=True)
+class RecorderActivity:
+    """What says whether the recorder may still write a live stream (`--fill-gaps` checks it),
+    on the database's clock: `now` is the transaction's `now()`, the clock `created_at`/
+    `last_seen` were set with; ages are seconds before it."""
+
+    now: datetime
+    last_seq: int | None  # the newest live chunk (by `created_at`); None: no live chunk
+    last_age_s: float | None  # since that chunk was committed
+    recorders: list[tuple[str, float]]  # (worker id, heartbeat age) listing it, newest first
+
+
+async def recorder_activity(session: AsyncSession, stream_id: int) -> RecorderActivity:
+    """The stream's newest live chunk, and every recorder heartbeat row (of any age) whose
+    `info.recording` lists the stream. A recorder lists the streams of its channel recorders
+    from the sync that starts one until the sync after it has stopped, not the chunks still in
+    its finish queue or spool; when the process dies its row keeps the last list
+    (`Recorder.beat`)."""
+    now = (await session.execute(text("SELECT now()"))).scalar_one()
+    last = (
+        await session.execute(
+            text(
+                "SELECT seq, EXTRACT(EPOCH FROM now() - created_at) AS age_s FROM chunks "
+                "WHERE stream_id = :s AND source = :live "
+                "ORDER BY created_at DESC, seq DESC LIMIT 1"
+            ),
+            {"s": stream_id, "live": str(DataSource.LIVE)},
+        )
+    ).first()
+    recorders = (
+        await session.execute(
+            text(
+                "SELECT worker_id, EXTRACT(EPOCH FROM now() - last_seen) AS age_s "
+                "FROM worker_heartbeats WHERE service = 'recorder' AND info -> 'recording' @> "
+                "jsonb_build_array(jsonb_build_object('stream_id', CAST(:s AS bigint))) "
+                "ORDER BY last_seen DESC, worker_id"
+            ),
+            {"s": stream_id},
+        )
+    ).all()
+    return RecorderActivity(
+        now=ensure_utc(now),
+        last_seq=last.seq if last else None,
+        last_age_s=float(last.age_s) if last else None,
+        recorders=[(r.worker_id, float(r.age_s)) for r in recorders],
+    )
+
+
 async def fill_leftovers(session: AsyncSession, stream_id: int) -> int:
     """Chunks of the stream that look like a fill's (`source='backfill'` or seq >=
     `FILL_SEQ_BASE`): a first `--fill-gaps` run (no vods row yet) refuses when there are any

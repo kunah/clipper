@@ -13,6 +13,7 @@ Segments (2), (8), (12), (15) cross a live edge: they stay unfilled. Chunks are 
 
 import csv
 import dataclasses
+import json
 import re
 import shutil
 import subprocess
@@ -371,6 +372,10 @@ async def live_stream(
             )
             prev_end = iv.end
             intervals.append(iv)
+        await s.execute(  # committed seconds after their end, as by the recorder (days ago)
+            text("UPDATE chunks SET created_at = end_utc + interval '5 s' WHERE stream_id = :s"),
+            {"s": sid},
+        )
         in_gap = [
             Interval(TRUE_T0 + timedelta(seconds=a), TRUE_T0 + timedelta(seconds=a + 1))
             for a in LIVE_CHAT_IN_GAP
@@ -686,6 +691,14 @@ async def test_max_minutes_fills_in_slices(sessions, ts_vod, live_audio):
     assert statuses == ["partial", "partial", "done"]
     seqs = await query(sessions, "SELECT seq FROM chunks WHERE source = 'backfill' ORDER BY seq")
     assert [s.seq for s in seqs] == [FILL_SEQ_BASE + i for i in range(5)]
+    # the resumes came seconds after the first run: the fill's own chunks (all younger than
+    # `fill_quiet_s`) are not the recorder's, they don't hold a resume back
+    young = await query(
+        sessions,
+        "SELECT count(*) AS n FROM chunks WHERE source = 'backfill' "
+        "AND created_at > now() - interval '10 min'",
+    )
+    assert young[0].n == 5
     (vod,) = await query(sessions, "SELECT chat_status FROM vods")
     assert vod.chat_status == "off"
 
@@ -836,14 +849,137 @@ async def test_a_failed_match_makes_way_for_the_next_chunk_of_the_seam(
 # --------------------------------------------------------------------------- refusals
 
 
-async def test_refused_until_the_recorder_is_done(sessions, ts_vod, live_audio):
-    store = MemoryStore()
-    live = await live_stream(sessions, store, live_audio, ended_at=utc_now() - timedelta(minutes=1))
-    with pytest.raises(FillRefused, match="less than 5 min ago"):
-        await backfiller(sessions, store, ts_vod).vod(VIDEO, VodOptions(fill_gaps=True))
+async def recorder_beat(
+    sessions, worker: str, *stream_ids: int, ago_s: float = 10.0, service: str = "recorder"
+) -> None:
+    """A recorder's heartbeat as `clipper_recorder.service.Recorder.beat` writes it, `ago_s` ago:
+    its running recorders' streams in `info.recording`."""
+    info = {
+        "recording": [
+            {"channel": "streamer", "stream_id": sid, "mode": "audio_only", "next_seq": 7}
+            for sid in stream_ids
+        ],
+        "finish_queue": 0,
+        "chunks_saved": 7,
+    }
     async with sessions.begin() as s:
         await s.execute(
-            text("UPDATE streams SET ended_at = :e"), {"e": utc_now() - timedelta(minutes=6)}
+            text(
+                "INSERT INTO worker_heartbeats (worker_id, service, host, started_at, last_seen, "
+                "info) VALUES (:w, :svc, 'test', now() - interval '9 days', now() - :ago, "
+                "CAST(:info AS jsonb)) ON CONFLICT (worker_id) DO UPDATE "
+                "SET last_seen = EXCLUDED.last_seen, info = EXCLUDED.info"
+            ),
+            {
+                "w": worker,
+                "svc": service,
+                "ago": timedelta(seconds=ago_s),
+                "info": json.dumps(info),
+            },
+        )
+
+
+async def execute(sessions, sql: str, **params) -> None:
+    async with sessions.begin() as s:
+        await s.execute(text(sql), params)
+
+
+async def refused(sessions, store, vod, why: str) -> None:
+    """A run and its dry run refuse before anything else (nothing written)."""
+    before = await snapshot(sessions)
+    for dry in (False, True):
+        with pytest.raises(FillRefused, match=why):
+            await backfiller(sessions, store, vod).vod(
+                VIDEO, VodOptions(fill_gaps=True, dry_run=dry)
+            )
+    assert await snapshot(sessions) == before
+
+
+async def test_refused_while_the_recorder_may_still_write_the_stream(sessions, ts_vod, live_audio):
+    store = MemoryStore()
+    live = await live_stream(sessions, store, live_audio, ended_at=utc_now() - timedelta(minutes=1))
+    await refused(sessions, store, ts_vod, "less than 5 min ago")
+
+    await execute(sessions, "UPDATE streams SET ended_at = now() - interval '6 min'")  # DB clock
+    # its last chunk committed 2 min ago (a recorder that came back and finished its spool)
+    last = "UPDATE chunks SET created_at = now() - :ago WHERE seq = 2"
+    await execute(sessions, last, ago=timedelta(minutes=2))
+    await refused(
+        sessions,
+        store,
+        ts_vod,
+        rf"the recorder wrote live chunk 2 of stream {live.stream_id} 2\.0 min ago, less than "
+        r"10 min \(it may still write the stream\)",
+    )
+
+    await execute(sessions, last, ago=timedelta(minutes=11))
+    # a recorder lists the stream: still closing its chunk, or it died while recording it
+    await recorder_beat(sessions, "recorder-1", live.stream_id, ago_s=20)
+    await refused(
+        sessions,
+        store,
+        ts_vod,
+        rf"a recorder \(recorder-1\) records stream {live.stream_id} \(its heartbeat 20 s ago",
+    )
+
+    await recorder_beat(sessions, "recorder-1", live.stream_id, ago_s=11 * 60)  # died 11 min ago
+    dry = await backfiller(sessions, store, ts_vod).vod(
+        VIDEO, VodOptions(fill_gaps=True, dry_run=True)
+    )
+    assert dry.status == "dry_run" and any(line.startswith("plan: 5 chunks") for line in dry.lines)
+    assert any(line.startswith("warning: worker recorder-1's last heartbeat") for line in dry.lines)
+    assert await query(sessions, "SELECT * FROM vods") == []
+
+
+async def test_an_old_recorder_heartbeat_listing_the_stream_warns_other_services_are_ignored(
+    sessions, ts_vod, live_audio
+):
+    """A recorder that died while recording the stream keeps its last list, whatever its age (a
+    native worker id may never come back): a warning in the dry run and the run, no refusal. A
+    heartbeat of another service listing the stream means nothing."""
+    store = MemoryStore()
+    live = await live_stream(sessions, store, live_audio)
+    await recorder_beat(sessions, "recorder-old", live.stream_id, ago_s=3 * 86400)
+    await recorder_beat(sessions, "transcriber-1", live.stream_id, ago_s=5, service="transcriber")
+    warning = re.compile(
+        rf"warning: worker recorder-old's last heartbeat \(age 72:00:0\d\) still lists stream "
+        rf"{live.stream_id}: its spool may hold a chunk of it; start that recorder first"
+    )
+    dry = await backfiller(sessions, store, ts_vod).vod(
+        VIDEO, VodOptions(fill_gaps=True, dry_run=True)
+    )
+    out = await backfiller(sessions, store, ts_vod).vod(
+        VIDEO, VodOptions(fill_gaps=True, chat=False)
+    )
+    assert (dry.status, out.status) == ("dry_run", "done"), out
+    for report in (dry, out):
+        (line,) = [line for line in report.lines if line.startswith("warning:")]
+        assert warning.match(line), line
+        assert not any("transcriber-1" in line for line in report.lines)
+    assert len(await query(sessions, "SELECT * FROM chunks WHERE source = 'backfill'")) == 5
+
+
+async def test_the_channels_next_stream_being_recorded_does_not_block_the_fill(
+    sessions, ts_vod, live_audio
+):
+    """Stream 803's case (2026-11-22): the channel is live again as a NEW stream, whose recorder
+    holds the channel's recording lease and writes its chunks; the ended stream gets filled."""
+    store = MemoryStore()
+    live = await live_stream(sessions, store, live_audio)
+    now = utc_now()
+    async with sessions.begin() as s:
+        new_sid = (
+            await s.execute(
+                text(
+                    "INSERT INTO streams (channel_id, platform_stream_id, started_at, status, "
+                    "source) VALUES (:c, '777000999', :t, 'live', 'live') RETURNING id"
+                ),
+                {"c": live.channel_id, "t": now - timedelta(hours=1)},
+            )
+        ).scalar_one()
+        await s.execute(  # committed just now
+            text("INSERT INTO chunks (stream_id, seq, start_utc, end_utc) VALUES (:s, 0, :a, :b)"),
+            {"s": new_sid, "a": now - timedelta(seconds=70), "b": now - timedelta(seconds=10)},
         )
         await s.execute(
             text(
@@ -852,9 +988,23 @@ async def test_refused_until_the_recorder_is_done(sessions, ts_vod, live_audio):
             ),
             {"r": recording_lease(live.channel_id)},
         )
-    with pytest.raises(FillRefused, match=r"a recorder \(recorder-1\) holds the recording lease"):
-        await backfiller(sessions, store, ts_vod).vod(VIDEO, VodOptions(fill_gaps=True))
+    await recorder_beat(sessions, "recorder-1", new_sid)
+
+    dry = await backfiller(sessions, store, ts_vod).vod(
+        VIDEO, VodOptions(fill_gaps=True, dry_run=True)
+    )
+    assert dry.status == "dry_run" and any(line.startswith("plan: 5 chunks") for line in dry.lines)
     assert await query(sessions, "SELECT * FROM vods") == []
+    out = await backfiller(sessions, store, ts_vod).vod(
+        VIDEO, VodOptions(fill_gaps=True, chat=False)
+    )
+    assert out.status == "done", out
+    filled = await query(sessions, "SELECT stream_id, seq FROM chunks WHERE source = 'backfill'")
+    assert {r.stream_id for r in filled} == {live.stream_id} and len(filled) == 5
+    (new_chunk,) = await query(sessions, "SELECT seq FROM chunks WHERE stream_id = :s", s=new_sid)
+    assert new_chunk.seq == 0
+    leases = await query(sessions, "SELECT resource, owner FROM leases")
+    assert [tuple(r) for r in leases] == [(recording_lease(live.channel_id), "recorder-1")]
 
 
 async def test_refused_for_a_live_seq_next_to_the_fill_base_or_leftover_fill_chunks(
@@ -865,7 +1015,10 @@ async def test_refused_for_a_live_seq_next_to_the_fill_base_or_leftover_fill_chu
     late = Interval(TRUE_T0 + timedelta(seconds=300), TRUE_T0 + timedelta(seconds=310))
     async with sessions.begin() as s:  # a live chunk at FILL_SEQ_BASE - 1 (after the VOD)
         await s.execute(
-            text("INSERT INTO chunks (stream_id, seq, start_utc, end_utc) VALUES (:s, :q, :a, :b)"),
+            text(
+                "INSERT INTO chunks (stream_id, seq, start_utc, end_utc, created_at) "
+                "VALUES (:s, :q, :a, :b, :b)"
+            ),
             {"s": live.stream_id, "q": FILL_SEQ_BASE - 1, "a": late.start, "b": late.end},
         )
     with pytest.raises(FillRefused, match=f"live seqs up to {FILL_SEQ_BASE - 1}"):

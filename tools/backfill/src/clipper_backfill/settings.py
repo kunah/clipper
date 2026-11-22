@@ -36,3 +36,6 @@ class BackfillSettings(BaseSettings):
     fill_t0_spread_s: float = Field(default=0.05, gt=0)
     fill_t0_min_windows: int = Field(default=2, ge=1)
     fill_t0_max_pdt_diff_s: float = Field(default=0.5, gt=0)
+    # `vod --fill-gaps` refuses while the recorder may still write the stream: its newest live
+    # chunk was committed, or a recorder heartbeat listed the stream, less than this ago
+    fill_quiet_s: float = Field(default=600.0, ge=0)

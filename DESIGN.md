@@ -767,12 +767,24 @@ stream we recorded live (`streams.source = 'live'`, matched by the platform stre
 gets its unrecorded parts filled from the VOD, on request only; anything recorded live stays as
 it is, and a gone VOD (or a hole outside it) leaves the hole. Refused with exit 2 (`[refused]`,
 `backfill.FillRefused`), nothing written: our stream still `live`, ended less than 5 min ago
-(`transcripts.ENDED_GRACE`), a recorder still holding the channel's `record:channel:{id}` lease,
-or the VOD still recording ("wait until it ended"); not our stream, or a backfilled one ("use
-`vod <id>` without --fill-gaps"); a live seq at or above `FILL_SEQ_BASE − 1`; on a first run
-(no fill vods row), chunks with `source = 'backfill'` or a seq ≥ `FILL_SEQ_BASE` already in the
-stream (left by a deleted vods row: their T0 is unknown); an untrusted T0 (below). Not with
-`--no-media`/`--start-offset`, and `--accept-t0` only with `--fill-gaps` (argparse errors). First targets: stream 803
+(`transcripts.ENDED_GRACE`), the recorder still writing THIS stream (a live chunk of it committed,
+`chunks.created_at`, or a recorder heartbeat listing it in `info.recording`, less than 10 min ago:
+`fill_quiet_s`), or the VOD still recording ("wait until it ended"); not our stream, or a
+backfilled one ("use `vod <id>` without --fill-gaps"); a live seq at or above `FILL_SEQ_BASE − 1`;
+on a first run (no fill vods row), chunks with `source = 'backfill'` or a seq ≥ `FILL_SEQ_BASE`
+already in the stream (left by a deleted vods row: their T0 is unknown); an untrusted T0 (below).
+The recorder checks are about the stream, on the database's clock (`now()`), not the channel's
+`record:channel:{id}` lease (changed 2026-11-22: that lease refused stream 803 while ohnepixel
+was live again as stream 1930; it is held for the channel's next broadcast too, and an ended
+stream is recorded again only if the controller reopens it, i.e. `status = 'live'`). An older
+recorder heartbeat (any age) that still lists the stream is a warning in the dry run and the run
+("worker X's last heartbeat (age …) still lists stream N: its spool may hold a chunk of it; start
+that recorder first"), not a refusal: stale native worker ids would block for ever. **Remaining
+risk**: a recorder that died while recording the stream commits its spooled chunk when it starts
+again, whenever that is; so start the recorder and let it finish its spool before filling a
+stream it may have died recording. A possible follow-up on the recorder's side: skip committing
+a spooled chunk that overlaps `source = 'backfill'` chunks. Not with `--no-media`/
+`--start-offset`, and `--accept-t0` only with `--fill-gaps` (argparse errors). First targets: stream 803
 (VOD 2934862154, live part ends 17:29:24Z), then stream 1412 (VOD 2936064102). Settled at build
 time:
 - **Ranges** (`planner.fill_ranges`, stored in `vods.flags.fill_ranges`): the stream's
@@ -884,15 +896,20 @@ time:
   (no match → only `--accept-t0 pdt`; a 100 ms disagreement, a single window, a PDT 0.8 s off,
   no PDT → refused, dry run still complete, `--accept-t0` writes; no PDT and no match →
   nothing); a failed match (undecodable audio, an S3 error) hands its seam to the next chunk;
-  refusals (live, ended < 5 min ago, a recorder lease, backfilled, not ours, a live seq at
-  `FILL_SEQ_BASE − 1`, leftover fill chunks; the CLI exits 2); empty chat pages with a next page;
-  `coverage()` over a filled stream; `status`; viewer clips on the fill's T0; the transcriber's
-  neighbour logic with fill seqs.
+  refusals (live, ended < 5 min ago, a live chunk committed 2 min ago, a recorder heartbeat
+  listing the stream, backfilled, not ours, a live seq at `FILL_SEQ_BASE − 1`, leftover fill
+  chunks; the CLI exits 2) and what doesn't refuse (the channel's next stream being recorded,
+  with the channel's lease held; an old recorder heartbeat listing the stream: a warning; another
+  service's heartbeat listing it; a resume minutes after the first run, its own chunks being
+  young); empty chat pages with a next page; `coverage()` over a filled stream; `status`; viewer
+  clips on the fill's T0; the transcriber's neighbour logic with fill seqs.
 - **To watch on the real runs**: 803's first live chunk starts 6 s into the VOD, so its ± 20 s
   window doesn't fit and the next chunk is tried; a muted stretch near a seam pushes its window to
-  a farther chunk (up to 3, else that seam has no match). With the stack up, a fill is refused
-  while the channel is live (the recorder holds its lease). Chat-ingest's outage edges differ from
-  the recorder's by seconds: a fill second gets chat only where chat-ingest has no row.
+  a farther chunk (up to 3, else that seam has no match). With the stack up, a fill runs while the
+  channel is live again (another stream), but not within 10 min of the recorder writing or
+  listing the stream itself; a warning about an old recorder heartbeat means: start that recorder
+  first (its spool). Chat-ingest's outage edges differ from the recorder's by seconds: a fill
+  second gets chat only where chat-ingest has no row.
 
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)
