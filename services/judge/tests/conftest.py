@@ -10,9 +10,12 @@ judge service with an injectable clock and model. Uses the root conftest's throw
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import json
+import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -31,6 +34,7 @@ from clipper_core.contracts import (
 from clipper_core.partitions import ensure_chat_partitions
 from clipper_core.storage import keys
 from clipper_core.timeline import Interval, utc_now
+from clipper_judge.claude_cli import ClaudeCliModel
 from clipper_judge.model import JudgeModel
 from clipper_judge.revisions import Revision
 from clipper_judge.samples import SCRIPT, WORD_GAP_S, WORD_S
@@ -368,3 +372,220 @@ def make_world(sessions, settings):
         return await World(sessions, settings, recording_mode=recording_mode).setup(**setup)
 
     return make
+
+
+# --------------------------------------------------------------------------- a fake `claude`
+
+FAKE_CLAUDE = Path(__file__).with_name("fake_claude.py")
+SESSION = "5b1c0e9e-4c1f-4c55-9d7e-1f3f0f6a9a01"
+RESETS = datetime(2026, 11, 22, 18, 0, tzinfo=UTC)
+WEEK_RESETS = datetime(2026, 11, 26, 9, 0, tzinfo=UTC)
+
+
+class FakeClaude:
+    """A scenario for `fake_claude.py` (recorded stream-json shapes of CLI 2.1.330, DESIGN §19)
+    and `ClaudeCliModel`s that run it: `command` = [python, fake_claude.py, scenario.json]."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.record_dir = root / "records"
+        self.scenario_path = root / "scenario.json"
+        self.config_dir = root / "judge-claude"
+        root.mkdir(parents=True, exist_ok=True)
+        self.scenario({"runs": [{"steps": self.success()}]})
+
+    @property
+    def command(self) -> list[str]:
+        return [sys.executable, str(FAKE_CLAUDE), str(self.scenario_path)]
+
+    def scenario(self, scenario: dict[str, Any]) -> FakeClaude:
+        data = {"record_dir": str(self.record_dir), "auth": self.auth(), **scenario}
+        self.scenario_path.write_text(json.dumps(data), encoding="utf-8")
+        return self
+
+    def runs(self, *runs: Sequence[dict[str, Any]] | dict[str, Any], **extra: Any) -> FakeClaude:
+        """Each run: a list of steps, or a dict with `steps`, `exit`, `heartbeat`."""
+        return self.scenario(
+            {"runs": [r if isinstance(r, dict) else {"steps": list(r)} for r in runs], **extra}
+        )
+
+    def model(self, **kw: Any) -> ClaudeCliModel:
+        kw.setdefault("command", self.command)
+        kw.setdefault("config_dir", self.config_dir)
+        kw.setdefault("oauth_token", "sk-ant-oat01-test-token")
+        kw.setdefault("timeout_s", 60.0)
+        return ClaudeCliModel(**kw)
+
+    def calls(self) -> list[dict[str, Any]]:
+        files = sorted(self.record_dir.glob("call-*.json"), key=lambda p: int(p.stem[5:]))
+        return [json.loads(p.read_text(encoding="utf-8")) for p in files]
+
+    def auth_calls(self) -> list[dict[str, Any]]:
+        return [json.loads(p.read_text(encoding="utf-8")) for p in self.record_dir.glob("auth-*")]
+
+    def auth(self, method: str = "oauth_token", *, login_expires_at: Any = None) -> dict[str, Any]:
+        """`claude auth status` JSON."""
+        return {
+            "loggedIn": method != "none",
+            "authMethod": method,
+            "apiProvider": "firstParty",
+            "configDirectory": str(self.config_dir.resolve() / ".claude"),
+            "loginExpiresAt": login_expires_at,
+        }
+
+    # stream-json lines
+
+    @staticmethod
+    def init(api_key_source: str = "none", model: str = "claude-opus-5-5") -> dict[str, Any]:
+        return {
+            "type": "system",
+            "subtype": "init",
+            "cwd": "/tmp/clipper-judge-x/cwd",
+            "session_id": SESSION,
+            "tools": ["StructuredOutput"],
+            "mcp_servers": [],
+            "model": model,
+            "permissionMode": "default",
+            "slash_commands": [],
+            "apiKeySource": api_key_source,
+            "claude_code_version": "2.1.330",
+            "output_style": "default",
+            "uuid": "u-init",
+        }
+
+    @staticmethod
+    def rate(
+        five_hour: float = 0.12,
+        seven_day: float = 0.31,
+        *,
+        status: str = "allowed",
+        resets: datetime = RESETS,
+        using_overage: bool = False,
+        overage_status: str = "rejected",
+    ) -> dict[str, Any]:
+        """As seen on the user's account (2026-11-22): `overageStatus` rejected,
+        `overageDisabledReason` org_level_disabled, `isUsingOverage` false."""
+        return {
+            "type": "rate_limit_event",
+            "rate_limit_info": {
+                "status": status,
+                "rateLimitType": "five_hour",
+                "resetsAt": int(resets.timestamp()),
+                "isUsingOverage": using_overage,
+                "overageStatus": overage_status,
+                "overageDisabledReason": "org_level_disabled",
+                "unifiedWindows": {
+                    "five_hour": {
+                        "utilization": five_hour,
+                        "resetsAt": int(resets.timestamp()),
+                        "status": status,
+                    },
+                    "seven_day": {
+                        "utilization": seven_day,
+                        "resetsAt": int(WEEK_RESETS.timestamp()),
+                        "status": "allowed",
+                    },
+                },
+            },
+            "uuid": "u-rate",
+            "session_id": SESSION,
+        }
+
+    @staticmethod
+    def assistant(answer: Any = None) -> dict[str, Any]:
+        """Turn 1: the StructuredOutput tool call (with the answer); turn 2 (`answer` None): the
+        closing text."""
+        content: list[dict[str, Any]] = (
+            [{"type": "tool_use", "id": "toolu_1", "name": "StructuredOutput", "input": answer}]
+            if answer is not None
+            else [{"type": "text", "text": "Done."}]
+        )
+        return {
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "claude-opus-5-5", "content": content},
+            "parent_tool_use_id": None,
+            "session_id": SESSION,
+        }
+
+    @staticmethod
+    def tool_result() -> dict[str, Any]:
+        """Between the turns: the CLI's answer to the StructuredOutput tool call."""
+        return {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "Structured output provided successfully",
+                    }
+                ],
+            },
+            "parent_tool_use_id": None,
+            "session_id": SESSION,
+        }
+
+    @staticmethod
+    def result(
+        structured: Any = None,
+        *,
+        subtype: str = "success",
+        is_error: bool = False,
+        text: str = "",
+        api_error_status: int | None = None,
+        credential_expires_at: Any = 1826000000000,
+    ) -> dict[str, Any]:
+        line: dict[str, Any] = {
+            "type": "result",
+            "subtype": subtype,
+            "is_error": is_error,
+            "duration_ms": 12345,
+            "duration_api_ms": 11800,
+            "num_turns": 2,
+            "result": text,
+            "stop_reason": "end_turn" if not is_error else None,
+            "terminal_reason": "completed",
+            "session_id": SESSION,
+            "total_cost_usd": 0.0612,
+            "usage": {
+                "input_tokens": 1450,
+                "cache_creation_input_tokens": 300,
+                "cache_read_input_tokens": 2900,
+                "output_tokens": 820,
+            },
+            "modelUsage": {"claude-opus-5-5": {"costUSD": 0.0612, "costBasis": "list"}},
+            "api_error_status": api_error_status,
+            "credential_expires_at": credential_expires_at,
+            "permission_denials": [],
+            "uuid": "u-result",
+        }
+        if structured is not None:
+            line["structured_output"] = structured
+        return line
+
+    @classmethod
+    def success(cls, answer: Any = None, **rate: Any) -> list[dict[str, Any]]:
+        answer = answer if answer is not None else CLIP_ANSWER
+        return [
+            {"line": cls.init()},
+            {"line": cls.rate(**rate)},
+            {"line": cls.assistant(answer)},  # turn 1: the StructuredOutput tool call
+            {"line": cls.tool_result()},
+            {"line": cls.assistant()},  # turn 2
+            {"line": cls.result(answer, text="")},
+        ]
+
+
+CLIP_ANSWER = {
+    "reasons": ["he jumps off the map"],
+    "verdict": "clip",
+    "confidence": 0.8,
+    "need_context": None,
+    "plan": {"in_s": -11.5, "out_s": 4.0, "title": "He jumped off the map", "hashtags": ["xqc"]},
+}
+
+
+@pytest.fixture
+def fake_claude(tmp_path) -> FakeClaude:
+    return FakeClaude(tmp_path / "fake-claude")

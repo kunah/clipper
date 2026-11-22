@@ -4,7 +4,7 @@
 #   docker compose up -d            # postgres + object storage + migrate + CPU services
 #   docker compose up -d transcriber   # the GPU worker (profile `gpu`; naming it enables it)
 #   docker compose up -d detector      # live detector (profile `detector`)
-#   docker compose up -d judge         # judge (profile `judge`; fake model until 6d)
+#   docker compose up -d judge         # judge (profile `judge`; CLIPPER_JUDGE_MODEL, fake by default)
 #   docker compose run --rm backfill vod <id> --dry-run   # one-off tool (profile `tools`)
 #   docker compose logs -f migrate
 #
@@ -178,20 +178,32 @@ services:
 
   # Judge (DESIGN §19): judge jobs -> clips, edit plans, render jobs; context rounds; revisions.
   # Profile `judge`: a bare `docker compose up -d` leaves it out; start it by name. Model `fake`
-  # (deterministic rules) until build item 6d adds the Claude Code CLI. Nothing enqueues judge
-  # jobs until the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=1; its `render` jobs queue
-  # until the renderer exists (§20). The usage guard is off (no caps set). Needs migration 0005.
+  # (deterministic rules) unless CLIPPER_JUDGE_MODEL=claude-cli in .env: the Claude Code CLI
+  # pinned in the image, on the user's subscription, with the token of `claude setup-token`
+  # (CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN in .env). It checks `claude auth status` at start and exits
+  # unless that shows the token (authMethod oauth_token), and runs one call at a time. Never
+  # give it an ANTHROPIC_API_KEY (the adapter builds the CLI's environment from scratch anyway).
+  # Nothing enqueues judge jobs until the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=1; its
+  # `render` jobs queue until the renderer exists (§20). The usage guard is off (no caps set).
+  # Needs migration 0005.
   judge:
     profiles: [judge]
     build:
       context: .
       dockerfile: services/judge/Dockerfile
     image: clipper/judge:dev
+    init: true   # tini as PID 1: reaps what a killed `claude` process tree leaves behind
     environment:
       <<: *app-env
       CLIPPER_SERVICE_NAME: judge
       CLIPPER_WORKER_ID: judge-1   # stable id: one heartbeat row across restarts
       CLIPPER_JUDGE_MODEL: ${CLIPPER_JUDGE_MODEL:-fake}
+      CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN: ${CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN:-}
+      CLIPPER_JUDGE_CLAUDE_MODEL: ${CLIPPER_JUDGE_CLAUDE_MODEL:-claude-opus-5-5}
+      CLIPPER_JUDGE_CLAUDE_EFFORT: ${CLIPPER_JUDGE_CLAUDE_EFFORT:-}   # empty: the CLI's default
+      CLIPPER_JUDGE_CLAUDE_CONFIG_DIR: /var/lib/clipper-judge
+    volumes:
+      - judge-claude:/var/lib/clipper-judge   # the CLI's own HOME/config (not the user's ~/.claude)
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -225,3 +237,4 @@ volumes:
   objectdata:
   spool:
   models:
+  judge-claude:

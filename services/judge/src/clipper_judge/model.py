@@ -8,13 +8,21 @@ the last usage-window reading (the Claude Code CLI's `rate_limit_event`, build i
 extras go into the call's S3 record only, never into the request hash, so a provider update
 doesn't re-judge anything.
 
-Errors: `ModelError` (the call failed: provider error, timeout, a run without an answer; the job
-retries with backoff), `UsageLimitError` (a rate or usage limit: the job waits for `resets_at`),
-`PermanentModelError` (retrying can't help: wrong credentials, a misconfigured adapter). An answer
-that arrives but isn't valid JSON or doesn't fit the schema is *not* an error here: the service
-parses it (`answer.parse_answer`) and spends the round's one retry on it.
+Errors: `ModelError` (the call failed: provider error, a run without an answer; the job
+retries with backoff), `CallTimeoutError` (the call timed out: one more attempt, then the clip
+fails), `UsageLimitError` (a rate or usage limit, or extra usage that isn't allowed: the job
+waits for `resets_at`), `PermanentModelError` (retrying can't help: a misconfiguration, a
+budget cap: the clip fails), `ModelUnavailableError` (the adapter switched itself off, e.g. it
+would bill an API key or its credentials were rejected: no further calls until a restart, the
+jobs are held and the clips keep their state). Every error carries what is known of the call
+(latency, request id, reading, usage and cost when the provider reported them: a failed run can
+be paid). An answer that arrives but isn't valid JSON or doesn't fit the schema is *not* an
+error here: the service parses it (`answer.parse_answer`) and spends the round's one retry on
+it.
 
-Adapters: the fakes (`clipper_judge.fakes`) now; `ClaudeCliModel` in 6d; API adapters later.
+Adapters: the fakes (`clipper_judge.fakes`), `ClaudeCliModel` (`clipper_judge.claude_cli`, 6d);
+API adapters later. An adapter with something to show in the heartbeat (CLI version, credential
+expiry, warnings) also implements `ReportsStatus`.
 """
 
 from __future__ import annotations
@@ -22,15 +30,20 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from clipper_judge.prompt import JudgeRequest
+
+# Reading statuses that let calls through (`rate_limit_info.status`, window statuses).
+ALLOWED_STATUSES = frozenset({"allowed", "allowed_warning"})
 
 
 @dataclass(frozen=True, slots=True)
 class Usage:
-    """Token counts of one call. `input_tokens` excludes cached input (as the Anthropic API and
-    the CLI's `usage` count them: cache reads are `cached_input_tokens`)."""
+    """Token counts of one call. `input_tokens` is the input not read from a prompt cache (cache
+    writes included), `cached_input_tokens` the input read from one; together the whole prompt.
+    The CLI's `usage` (as the Anthropic API counts): `input_tokens + cache_creation_input_tokens`
+    and `cache_read_input_tokens`."""
 
     input_tokens: int = 0
     cached_input_tokens: int = 0
@@ -49,14 +62,33 @@ class UsageWindow:
 @dataclass(frozen=True, slots=True)
 class RateLimitReading:
     """The provider's last usage reading (DESIGN §19 "Usage guard"). `observed_at` is when the
-    adapter saw it (wall clock); `status` is the provider's (`allowed`, ...)."""
+    adapter saw it (wall clock); `status` is the provider's (`allowed`, ...). `overage`: the call
+    is billed as extra usage beyond the plan (`isUsingOverage`, or the plan refusing while
+    `overageStatus` allows); `overage_status` as reported."""
 
     observed_at: datetime
     status: str = "allowed"
     resets_at: datetime | None = None
     five_hour: UsageWindow | None = None
     seven_day: UsageWindow | None = None
+    overage: bool = False
+    overage_status: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
+
+    def refusal_resets_at(self) -> datetime | None:
+        """When a refused (or exhausted) plan allows again: the window that refuses or is full,
+        else the reading's own reset when its status refuses; None when the reading shows no
+        refusal (a short 429 while the windows still allow: the caller's default wait)."""
+        for w in (self.five_hour, self.seven_day):
+            if w is None or w.resets_at is None:
+                continue
+            if (w.status is not None and w.status not in ALLOWED_STATUSES) or (
+                w.utilization is not None and w.utilization >= 1.0
+            ):
+                return w.resets_at
+        if self.status not in ALLOWED_STATUSES | {"unknown"}:
+            return self.resets_at
+        return None
 
     def as_dict(self) -> dict[str, Any]:
         def window(w: UsageWindow | None) -> dict[str, Any] | None:
@@ -74,6 +106,8 @@ class RateLimitReading:
             "resets_at": None if self.resets_at is None else self.resets_at.isoformat(),
             "five_hour": window(self.five_hour),
             "seven_day": window(self.seven_day),
+            "overage": self.overage,
+            "overage_status": self.overage_status,
         }
 
 
@@ -102,10 +136,18 @@ class JudgeModel(Protocol):
     async def judge(self, request: JudgeRequest) -> JudgeResponse: ...
 
 
+@runtime_checkable
+class ReportsStatus(Protocol):
+    """An adapter's state for the heartbeat (JSON values; `warnings`: name -> detail)."""
+
+    def status(self) -> Mapping[str, Any]: ...
+
+
 class ModelError(Exception):
-    """The call failed (provider error, timeout, no answer): the judge job retries with backoff;
-    its last attempt marks the clip `failed`. What is known of the failed call (latency, request
-    id, provider output) goes into the call's error row and S3 record."""
+    """The call failed (provider error, no answer): the judge job retries with backoff; its last
+    attempt marks the clip `failed`. What is known of the failed call (latency, request id,
+    provider output, and `usage`/`cost_usd` when the provider reported them: the run was paid)
+    goes into the call's error row and S3 record."""
 
     def __init__(
         self,
@@ -115,12 +157,21 @@ class ModelError(Exception):
         request_id: str | None = None,
         rate_limit: RateLimitReading | None = None,
         extras: Mapping[str, Any] | None = None,
+        usage: Usage | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         super().__init__(message)
         self.latency_s = latency_s
         self.request_id = request_id
         self.rate_limit = rate_limit
         self.extras = dict(extras or {})
+        self.usage = usage
+        self.cost_usd = cost_usd
+
+
+class CallTimeoutError(ModelError):
+    """The call ran past its timeout (the provider's process was killed): one more attempt of
+    the same request at most, then the clip fails (`calls.TIMEOUT_ATTEMPTS`)."""
 
 
 class UsageLimitError(ModelError):
@@ -133,5 +184,20 @@ class UsageLimitError(ModelError):
 
 
 class PermanentModelError(ModelError):
-    """Retrying can't help (wrong credentials, an adapter misconfiguration): the clip fails at
-    once."""
+    """Retrying can't help (an adapter misconfiguration, a run over its budget cap): the clip
+    fails at once."""
+
+
+class ModelUnavailableError(ModelError):
+    """The adapter switched itself off (latched): it would bill an API key instead of the plan,
+    its output didn't start as expected, or its credentials were rejected. It makes no further
+    calls until the service restarts; judge jobs are held (deferred by `retry_after_s`), clips keep
+    their state, the heartbeat shows the reason. `called`: this error came from a real call (its
+    row is recorded); False: refused without starting anything."""
+
+    def __init__(
+        self, message: str, *, called: bool = False, retry_after_s: float = 600.0, **kw: Any
+    ) -> None:
+        super().__init__(message, **kw)
+        self.called = called
+        self.retry_after_s = retry_after_s

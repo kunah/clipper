@@ -28,8 +28,11 @@ Per job (ref = candidate; the detector's `judge:{cand}` or the waiter's `judge:{
    waiter enqueues it). Terminal states mark the clip's own media requests fulfilled.
 Provider errors are retried by the job queue; the job's last attempt marks the clip `failed` (in
 the round the job handled; a job that failed before it loaded the clip leaves it to the waiter). A
-usage limit (refused call, or the guard with caps set) defers the job to the reset time, never
-past the hard deadline, where the clip becomes `rejected`/`budget`.
+usage limit (refused call, extra usage that isn't allowed and the guard's overage latch after it,
+or the guard with caps set) defers the job to the reset time, never past the hard deadline, where
+the clip becomes `rejected`/`budget`. A model that switched itself off (`ModelUnavailableError`:
+it would bill an API key, rejected credentials) holds the job (its `retry_after_s`, 10 min; no
+attempt used, the clip stays `judging`) until the service is restarted with a fix.
 """
 
 from __future__ import annotations
@@ -55,7 +58,13 @@ from clipper_core.timeline import utc_now
 from clipper_judge import reads, writes
 from clipper_judge.calls import NOT_COUNTED, Caller, CallOutcome
 from clipper_judge.guard import Defer, Reject, UsageGuard
-from clipper_judge.model import JudgeModel, ModelError, PermanentModelError, UsageLimitError
+from clipper_judge.model import (
+    JudgeModel,
+    ModelError,
+    ModelUnavailableError,
+    PermanentModelError,
+    UsageLimitError,
+)
 from clipper_judge.params import JudgeParams
 from clipper_judge.prompt import JudgeRequest, build_request, request_hash, retry_request
 from clipper_judge.reads import CandidateInfo, ClipRow, ObjectStore, StreamInfo
@@ -300,6 +309,14 @@ class JudgeHandler:
             self.stats.cached += 1
             log.info("answer reused from an earlier call", call_id=cached.call_id)
             return cached
+        held = self.guard.hold(now=self.clock(), hard_deadline=d.hard)
+        if isinstance(held, Reject):
+            await self._reject_budget(clip, held.reason)
+            return BUDGET
+        if isinstance(held, Defer):
+            self.stats.deferred += 1
+            log.info("usage guard holds the clip", until=held.until.isoformat())
+            raise RetryLater(held.until, f"usage guard: {held.reason}")
         if self.guard.enabled:
             async with self.sessions() as s:
                 counts = await reads.usage_counts(s, clip.stream_id, not_counted=NOT_COUNTED)
@@ -328,6 +345,13 @@ class JudgeHandler:
             )
         except ModelError as exc:
             self.guard.observe(exc.rate_limit)
+            if isinstance(exc, ModelUnavailableError):
+                until = self.clock() + timedelta(seconds=exc.retry_after_s)
+                self.stats.deferred += 1
+                log.error(
+                    "the model is switched off: job held", until=until.isoformat(), error=str(exc)
+                )
+                raise RetryLater(until, f"model unavailable: {exc}") from exc
             if isinstance(exc, UsageLimitError):
                 return await self._limit(clip, exc, d)
             if isinstance(exc, PermanentModelError):

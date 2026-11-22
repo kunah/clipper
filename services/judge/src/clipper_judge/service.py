@@ -6,8 +6,9 @@ waiter and a heartbeat, in one process.
 
 Runner i has worker id `<worker_id>-<i>` (`jobs.locked_by`); the usage guard and the counters are
 shared by the process. The heartbeat (`worker_heartbeats`, service `judge`) carries the model,
-prompt version, the usage guard's last reading and warnings, the round outcomes since start and
-the number of waiting clips.
+prompt version, the usage guard's last reading and warnings, the round outcomes since start,
+the number of waiting clips and, for an adapter that reports one (`model.ReportsStatus`), the
+model's status (the CLI adapter: version, auth method, credential expiry, warnings).
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from clipper_core.jobs import JobRunner
 from clipper_core.logs import get_logger
 from clipper_core.timeline import utc_now
 from clipper_judge.guard import UsageGuard
-from clipper_judge.model import JudgeModel
+from clipper_judge.model import JudgeModel, ReportsStatus
 from clipper_judge.prompt import load_prompt
 from clipper_judge.reads import ObjectStore, waiting_count
 from clipper_judge.revisions import ReviseHandler, RevisionSource
@@ -159,6 +160,9 @@ class JudgeService:
             "revisions": {"revised": self.revise.revised, "refused": self.revise.refused},
             "waiting_clips": waiting,
             "waiter": {"listening": self.waiter.listening, "enqueued": self.waiter.enqueued},
+            "model_status": (
+                dict(self.model.status()) if isinstance(self.model, ReportsStatus) else None
+            ),
         }
 
     async def beat(self) -> None:

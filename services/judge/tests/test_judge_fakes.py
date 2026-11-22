@@ -131,8 +131,10 @@ def test_settings_from_the_environment(monkeypatch):
 
 def test_make_model():
     assert make_model(JudgeSettings(_env_file=None)).name == "fake"
-    with pytest.raises(ValueError, match="unknown judge model"):
-        make_model(JudgeSettings(_env_file=None, model="claude-cli"))
+    cli = make_model(JudgeSettings(_env_file=None, model="claude-cli"))
+    assert cli.name == "claude-opus-5-5"  # the CLI adapter (6d, test_judge_claude_cli)
+    with pytest.raises(ValueError, match="model"):
+        JudgeSettings(_env_file=None, model="gpt")  # an unknown adapter fails in the settings
 
 
 def test_rejected_answers_resolve_without_a_plan():

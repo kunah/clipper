@@ -11,14 +11,19 @@ failure is logged and leaves `io_key` NULL (the row still saves the answer).
   That is the request's outcome: a repeat of the same request reuses it (the round's one retry is
   a different request, with the error stated). `answer` holds the decoded object when the text
   was a JSON object.
-- `provider: ...` the call failed (timeout, provider error): not an outcome, sent again.
-- `usage_limit: ...` refused for a rate or usage limit: sent again after the reset; not counted
-  by the usage guard.
-- `permanent: ...` retrying can't help (credentials, configuration).
-The failed calls (`provider`, `usage_limit`, `permanent`) record 0 tokens and cost, and each gets
-its own S3 record (`judge_io(..., suffix="error-<id>")`), so the request's next call doesn't
-overwrite it; `answer:` rows were answered (and paid): they record the call's usage and cost and
-share the request's record like a success.
+- `provider: ...` the call failed (a provider error): not an outcome, sent again.
+- `timeout: ...` the call timed out: sent once more at most; the request's second timeout
+  (`TIMEOUT_ATTEMPTS`) fails the clip (raised as `PermanentModelError`).
+- `usage_limit: ...` refused for a rate or usage limit (or extra usage that isn't allowed): sent
+  again after the reset; not counted by the usage guard.
+- `permanent: ...` retrying can't help (configuration, a budget cap).
+- `unavailable: ...` the adapter switched itself off on this call (it would bill an API key,
+  rejected credentials): the jobs are held. Later refusals start nothing and write no row.
+The failed calls record the usage and cost the provider reported for them (the CLI reports them
+for a run that was paid but failed), else 0, and each gets its own S3 record
+(`judge_io(..., suffix="error-<id>")`), so the request's next call doesn't overwrite it;
+`answer:` rows were answered (and paid): they record the call's usage and cost and share the
+request's record like a success.
 """
 
 from __future__ import annotations
@@ -38,11 +43,14 @@ from clipper_core.storage import keys
 from clipper_judge import reads, writes
 from clipper_judge.answer import AnswerError, JudgeAnswer, parse_answer
 from clipper_judge.model import (
+    CallTimeoutError,
     JudgeModel,
     JudgeResponse,
     ModelError,
+    ModelUnavailableError,
     PermanentModelError,
     RateLimitReading,
+    Usage,
     UsageLimitError,
 )
 from clipper_judge.prompt import JudgeRequest
@@ -53,8 +61,11 @@ log = get_logger(__name__)
 
 ANSWER_ERROR = "answer"
 PROVIDER_ERROR = "provider"
+TIMEOUT = "timeout"
 USAGE_LIMIT = "usage_limit"
 PERMANENT_ERROR = "permanent"
+UNAVAILABLE = "unavailable"
+TIMEOUT_ATTEMPTS = 2  # timeouts of one request before the clip fails
 REUSABLE = (ANSWER_ERROR,)  # error kinds that are a request's outcome (cached)
 NOT_COUNTED = (USAGE_LIMIT,)  # error kinds the usage guard doesn't count as calls
 
@@ -134,32 +145,40 @@ class Caller:
     ) -> CallOutcome:
         """One model call, recorded (S3 record, then the `judge_calls` row, committed alone).
         Model errors are recorded too, then raised again."""
-        self.calls += 1
         try:
             response = await self.model.judge(request)
+        except ModelUnavailableError as exc:
+            if not exc.called:  # refused without starting anything: no call, no row
+                raise
+            self.calls += 1
+            self.errors += 1
+            await self._record_error(request, request_hash, clip_id, stream_id, exc, UNAVAILABLE)
+            raise
         except ModelError as exc:
+            self.calls += 1
             self.errors += 1
             kind = (
                 USAGE_LIMIT
                 if isinstance(exc, UsageLimitError)
                 else PERMANENT_ERROR
                 if isinstance(exc, PermanentModelError)
+                else TIMEOUT
+                if isinstance(exc, CallTimeoutError)
                 else PROVIDER_ERROR
             )
-            await self._record(
-                request,
-                request_hash,
-                clip_id,
-                stream_id,
-                response=None,
-                answer=None,
-                error=f"{kind}: {exc}",
-                latency_s=exc.latency_s,
-                request_id=exc.request_id,
-                extras={**exc.extras, "rate_limit": _reading(exc.rate_limit)},
-                suffix=f"error-{uuid.uuid4().hex[:12]}",
-            )
+            await self._record_error(request, request_hash, clip_id, stream_id, exc, kind)
+            if kind == TIMEOUT:
+                async with self.sessions() as s:
+                    n = await reads.error_count(s, request_hash, TIMEOUT)
+                if n >= TIMEOUT_ATTEMPTS:
+                    raise PermanentModelError(
+                        f"the request timed out {n} times: {exc}",
+                        latency_s=exc.latency_s,
+                        request_id=exc.request_id,
+                        rate_limit=exc.rate_limit,
+                    ) from exc
             raise
+        self.calls += 1
         obj = _decode(response.text)
         try:
             answer: JudgeAnswer | None = _parse(obj, response.text, final=request.final)
@@ -180,6 +199,31 @@ class Caller:
         )
         return CallOutcome(call_id, answer, error, rate_limit=response.rate_limit)
 
+    async def _record_error(
+        self,
+        request: JudgeRequest,
+        request_hash: str,
+        clip_id: int | None,
+        stream_id: int,
+        exc: ModelError,
+        kind: str,
+    ) -> int:
+        return await self._record(
+            request,
+            request_hash,
+            clip_id,
+            stream_id,
+            response=None,
+            answer=None,
+            error=f"{kind}: {exc}",
+            latency_s=exc.latency_s,
+            request_id=exc.request_id,
+            extras={**exc.extras, "rate_limit": _reading(exc.rate_limit)},
+            suffix=f"error-{uuid.uuid4().hex[:12]}",
+            usage=exc.usage,
+            cost_usd=exc.cost_usd,
+        )
+
     async def _record(
         self,
         request: JudgeRequest,
@@ -194,7 +238,10 @@ class Caller:
         request_id: str | None,
         extras: Mapping[str, Any],
         suffix: str | None = None,
+        usage: Usage | None = None,
+        cost_usd: float | None = None,
     ) -> int:
+        """`usage`/`cost_usd`: of a failed call (no response) the provider reported them for."""
         io_key = await self._upload(
             request,
             request_hash,
@@ -205,18 +252,19 @@ class Caller:
             extras=extras,
             suffix=suffix,
         )
-        usage = response.usage if response is not None else None
+        if response is not None:
+            usage, cost_usd = response.usage, response.cost_usd
         tokens = (
             (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens)
             if usage is not None
             else (0, 0, 0)
         )
-        if response is None:
-            cost = 0.0
-        elif response.cost_usd is not None:
-            cost = response.cost_usd
-        else:
+        if cost_usd is not None:
+            cost = cost_usd
+        elif usage is not None:
             cost = self.settings.cost_usd(*tokens)
+        else:
+            cost = 0.0
         async with self.sessions.begin() as session:
             call_id = await writes.insert_call(
                 session,

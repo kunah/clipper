@@ -338,6 +338,19 @@ async def cached_call(
     return None if row is None else CallRow(row.id, row.answer, row.error)
 
 
+async def error_count(session: AsyncSession, request_hash: str, kind: str) -> int:
+    """How many calls of this request ended with an error of `kind` (`calls.TIMEOUT`, ...)."""
+    return (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM judge_calls"
+                " WHERE request_hash = :h AND NOT shadow AND split_part(error, ':', 1) = :k"
+            ),
+            {"h": request_hash, "k": kind},
+        )
+    ).scalar_one()
+
+
 @dataclass(frozen=True, slots=True)
 class UsageCounts:
     stream_last_hour: int  # this stream's calls in the last 60 min

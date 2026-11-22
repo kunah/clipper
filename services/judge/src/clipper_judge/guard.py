@@ -16,6 +16,11 @@ calls of the UTC day). Before a call (`check`), in this order:
    deadline it is rejected (`budget`).
 A call the provider refuses for a limit waits for `resetsAt` whether caps are set or not (the
 service handles that: `UsageLimitError`). Operator revisions are counted, never blocked.
+
+**Overage latch** (caps or not): a reading that shows extra usage beyond the plan
+(`RateLimitReading.overage`) while `claude_allow_overage` is off holds every further call
+(`hold`, before each real call) until the refusing window resets (else `limit_retry_s`), with a
+heartbeat warning `overage`; at a clip's hard deadline the clip is rejected (`budget`).
 """
 
 from __future__ import annotations
@@ -61,6 +66,7 @@ class UsageGuard:
         self.warnings: dict[str, str] = {}  # name -> since (ISO), for the heartbeat
         self._refreshing = False
         self.blocked = 0  # deferred or rejected calls since start
+        self.overage_until: datetime | None = None  # the overage latch
 
     @property
     def enabled(self) -> bool:
@@ -73,6 +79,36 @@ class UsageGuard:
             return
         self.reading = reading
         log.info("usage reading", guard=self.enabled, **_fields(reading))
+        if reading.overage and not self.settings.claude_allow_overage:
+            until = (
+                reading.refusal_resets_at()
+                or reading.resets_at
+                or reading.observed_at + self.retry_after
+            )
+            if self.overage_until is None or until > self.overage_until:
+                self.overage_until = until
+            self.warnings["overage"] = self.overage_until.isoformat()
+            log.error(
+                "extra usage (overage) reported: every call is held until the window resets",
+                until=self.overage_until.isoformat(),
+                overage_status=reading.overage_status,
+            )
+
+    def hold(self, *, now: datetime, hard_deadline: datetime) -> Defer | Reject | None:
+        """Before every real call, caps or not: the overage latch (None: go on)."""
+        until = self.overage_until
+        if until is None:
+            return None
+        if now >= until:
+            self.overage_until = None
+            self.warnings.pop("overage", None)
+            log.info("overage latch released: the window has reset")
+            return None
+        if now >= hard_deadline:
+            return self._blocked(Reject("extra usage (overage) reported, at the hard deadline"))
+        return self._blocked(
+            Defer(min(until, hard_deadline), "extra usage (overage) reported: held until reset")
+        )
 
     def call_done(self) -> None:
         """The call this guard let through finished without a reading."""
@@ -148,6 +184,7 @@ class UsageGuard:
                 "calls_per_day": s.calls_per_day,
             },
             "reading": None if self.reading is None else self.reading.as_dict(),
+            "overage_until": None if self.overage_until is None else self.overage_until.isoformat(),
             "blocked": self.blocked,
             "warnings": dict(self.warnings),
         }
@@ -167,4 +204,5 @@ def _fields(r: RateLimitReading) -> dict[str, Any]:
         "five_hour": None if r.five_hour is None else r.five_hour.utilization,
         "seven_day": None if r.seven_day is None else r.seven_day.utilization,
         "resets_at": None if r.resets_at is None else r.resets_at.isoformat(),
+        "overage": r.overage,
     }

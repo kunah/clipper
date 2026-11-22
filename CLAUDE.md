@@ -68,15 +68,27 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   (`CLIPPER_JUDGE_UPDATE_GOLDEN=1` rewrites them); tests pin the prompt files and the input format
   (a used `prompts/v{N}/` is frozen: add the next one). Service `clipper-judge` (6c): `model`
   (`JudgeModel` protocol, `JudgeResponse`, `ModelError`/`UsageLimitError`/`PermanentModelError`),
-  `fakes` (`FakeJudgeModel` rules, `ScriptedJudgeModel`; the only adapter until 6d's Claude Code
-  CLI), `settings` (`CLIPPER_JUDGE_*`, `MODEL=fake`; usage guard caps unset = off), `reads`/
+  `fakes` (`FakeJudgeModel` rules, `ScriptedJudgeModel`), `claude_cli` (6d: `ClaudeCliModel`,
+  headless `claude -p` stream-json on the user's subscription; child env built from scratch, no
+  `ANTHROPIC_*`/`CLAUDE_CODE_*` inherited; first event `system/init` with `apiKeySource` `none`,
+  else (or on 401/403) the adapter switches itself off and jobs are held; overage (extra usage)
+  kills the call and latches the guard unless `claude_allow_overage`; Popen +
+  threads, not asyncio subprocesses (Windows selector loop); `check_auth` = `claude auth
+  status`), `adapters`
+  (`make_model`, `settings_for_model`: concurrency 1 for the CLI, `check_model`), `settings`
+  (`CLIPPER_JUDGE_*`, `MODEL=fake|claude-cli`, `CLAUDE_*`; usage guard caps unset = off), `reads`/
   `writes`, `calls` (`judge_calls` cache by request hash, committed alone + S3 `judge_io`),
   `guard` (usage guard), `waiter` (LISTEN `clipper_transcripts` + 30 s sweep, pure `readiness`/
   deadlines), `rounds` (`JudgeHandler`: one judge job advances one clip), `revisions`
   (`ReviseHandler`: patches -> v+1 + render job; `RevisionSource`, `review_events` not built
   yet), `service` (`JudgeService`: N job runners on `judge` + `revise_plan`, waiter, heartbeat).
-  Compose service `judge` (profile `judge`). `render`/`notify` jobs queue until renderer/review
-  exist. Integration tests: `tests/conftest.py` (`world` fixture). Depends on core only.
+  `evalset` (eval fixtures: one round's `JudgeInputs` as JSON, labels TOML/JSON) + `evaluate`
+  (`clipper-judge eval`: read-only DB or fixtures -> agreement, repairs, latency, usage).
+  Compose service `judge` (profile `judge`; the image pins the native Claude Code CLI 2.1.330 by
+  sha256, runs as uid 10001, volume `judge-claude` = the CLI's own HOME). `render`/`notify` jobs
+  queue until renderer/review exist. Integration tests: `tests/conftest.py` (`world` fixture;
+  `fake_claude` = `tests/fake_claude.py`, a fake executable: tests never run the real CLI).
+  Depends on core only.
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
   (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then
@@ -119,7 +131,10 @@ uv run clipper-detector                     # live detector natively (CLIPPER_DE
 uv run clipper-detector backtest --stream 803 [--json]   # read-only: candidates vs viewer clips
 uv run clipper-detector backtest --channel x --since 2026-11-01 --grid z_open=3.5,4,5
 docker compose up -d --build detector       # profile detector, enabled by naming it
-docker compose up -d --build judge          # profile judge (fake model until 6d); needs 0005
+docker compose up -d --build judge          # profile judge (CLIPPER_JUDGE_MODEL, fake by default);
+                                            # claude-cli needs CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN in .env
+uv run clipper-judge eval --labels labels.toml [--report r.json --csv r.csv]   # read-only, fake model
+uv run clipper-judge eval --fixtures dir/ --labels labels.toml --model claude-cli --yes   # your plan
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).

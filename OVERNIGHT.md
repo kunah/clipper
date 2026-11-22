@@ -229,6 +229,30 @@ to stream 803 (top clip: 5794 views at 12:50:35Z ± 37 s). They're in `viewer_cl
 truth for the backtest. The live detector didn't run during stream 803, so the backtest needs the
 offline pass / detector unit 4.
 
+## First real backtest: stream 803 (2026-11-22, read-only)
+
+`clipper-detector backtest --stream 803`: 4.95 h of chat coverage (12:32–17:29Z), 99 viewer clips,
+truth 25 (21 scorable, 4 outside the recorded part), delay 8 s (default, none learned).
+- **Code defaults: 1 candidate in 5 h (0.2/h), recall 0.00** (chance level 0.14). The scorer
+  opened 1 episode.
+- **The viewer floor blocks it.** `floor_viewer_fraction` 0.005 means ~0.5 % of the viewers as
+  unique chatters per 10 s, far above ohnepixel's chat (unique chatters per second: median 7,
+  p90 17, p99 36). With 0 or 0.001: 1.2 candidates/h, hit@k 0.17 (chance 0.14), recall 0.02
+  (1 of 21).
+- **Looser thresholds don't help** (z_open 2.5–4, rho_open 1.2–2): with z_open 3 and no floor,
+  25 episodes in 5 h → 6 emitted, suppressed weak 7, subs 4, vote 4, raid 1, deduped 3.
+- **Cross-check with the live detector** (the main session's question: live 1412 had 17 emitted +
+  96 budget): all 119 live candidates on streams 1412 and 1930 are **signal-only candidates from
+  Helix viewer clips** (score 1.00, moment type `unknown`, `features.explicit.viewer_clips`;
+  capped at 4 per stream-hour, the rest `budget`). The live chat scorer emitted none there either,
+  so live and backtest agree. The backtest leaves explicit signals out on purpose (viewer clips
+  are its ground truth).
+- So most clipped moments on this channel don't show up as a unique-chatter spike. Tuning needs
+  more streams with viewer clips and probably other signals (message rate, emote share, audio
+  events). Suggestion for you: `clipper-backfill clips ohnepixel` (Helix metadata only, no media)
+  gives clips for streams 17, 1412 and later 1930 as more ground truth. Defaults are not changed
+  yet.
+
 ## Blocked / waiting for you
 
 - Detector unit 4 (backtest CLI): credentials and ground truth are there (99 viewer clips of
@@ -263,6 +287,15 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
   with `CLIPPER_DETECTOR_JUDGE_JOBS=0`; `render`/`notify` jobs would just queue). Core got
   `jobs.RetryLater`/`defer` (a job waits without using an attempt) and an error suffix for
   `keys.judge_io`; existing job kinds behave the same.
+- Done 2026-11-22: judge 6d's buildable part: `ClaudeCliModel` (headless `claude -p`
+  stream-json; clean child env; first event must be `system/init` with `apiKeySource: none`, else
+  the adapter switches itself off and holds the jobs; **overage (paid extra usage) is refused by
+  default** (`claude_allow_overage=false`) and latches the guard until the reset; 401/403 switch
+  it off; paid failures are recorded with their usage and not retried blindly), the startup
+  `claude auth status` check, the judge Dockerfile with the native CLI 2.1.330 by sha256 (+~363
+  MiB, image not built), compose (token from `.env`, default model still `fake`), `clipper-judge
+  eval` (read-only; `--yes` needed for the real CLI). Tested only with a fake `claude`; the real
+  CLI was never run by it. Its first real run has a "to verify" list in DESIGN §19.
 - **Waiting for the stack** (stopped since ~00:00Z on 11-22): the real fill runs, natively from
   this worktree (ffmpeg 9 here; the backfill image is still at 1778961):
   `uv run clipper-backfill vod 2934862154 --fill-gaps --dry-run` (stream 803), check the T0 lines,
@@ -283,7 +316,7 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
   clips) once the stack is up. Found: the live write path drops a real moment within 60 s of a
   *suppressed* candidate (e.g. a raid); on the synthetic stream `--grid dedupe_s=30` lifts recall
   0.50 → 0.80. Not changed live; decide with the 803 numbers.
-- Next: 6d's buildable part (Claude CLI adapter on a fake
+- Next: the fill-guard fix (per stream, not per channel), then the fills; then 6d leftovers (Claude CLI adapter on a fake
   executable + usage guard; also the stale `# cost guard (daily cap)` comment on
   `ClipRejectReason.BUDGET` in `contracts.py`), renderer §20 (contracts, pure ffmpeg graph
   builder, NVENC smoke test only while the GPU isn't busy with the backlog), review §21 (Discord)
@@ -308,6 +341,11 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-22 ~18:30Z: memory got tight (0.8–1.1 GB of 32 GB free; `vmmemWSL` holds ~15 GB after
+  the main session's rebuild of all images). Removed the throwaway test Postgres; tests now use
+  throwaway DBs on the compose Postgres again, package by package. Claude Code stopped one of my
+  check runs for low memory (it had passed core, twitch, db, chat-ingest, controller, detector and
+  judge; recorder, transcriber and backfill, which 6d doesn't touch, passed in the agent's run).
 - 2026-11-22: the five-hour usage limit paused the agents twice (~04:00Z and until 11:50Z);
   work continued after each reset. The stack is still stopped (checked 14:14Z).
 - 2026-11-22 ~00:00Z: the Clipper stack was stopped cleanly again (all containers exit 0, also

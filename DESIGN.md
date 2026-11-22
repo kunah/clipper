@@ -23,8 +23,11 @@ judges, edits and publishes short vertical clips.
 > resolver, pure code in `services/judge`) and 6c (the `clipper-judge` service with a
 > deterministic fake model, waiter, context rounds, call cache, usage guard off by default,
 > revisions by patch; compose profile `judge`, 2026-11-22) built; 6c is not deployed (no image
-> built, nothing enqueues judge jobs while the detector runs with `JUDGE_JOBS=0`); 6d (the
-> Claude Code CLI adapter) next. Migration 0006
+> built, nothing enqueues judge jobs while the detector runs with `JUDGE_JOBS=0`). 6d's buildable
+> part (the Claude Code CLI adapter `ClaudeCliModel`, its startup auth check, the image's pinned
+> CLI 2.1.330, `clipper-judge eval`) built 2026-11-22, tested on a fake `claude` only: the first
+> real run (the setup token in `.env`, the "to verify" points, the eval with Opus) is next.
+> Migration 0006
 > (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22, not on the live DB yet: it goes
 > on before the chat-ingest redeploy that ships it.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -178,7 +181,7 @@ Services talk only through Postgres and object storage.
 | recorder | HLS segments → ~60 s `.ts` + `.aac` (local spool first, crash-safe), gaps, enqueue transcription. Claims channels itself via leases. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
 | detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
-| judge | LLM verdict + edit plan, context requests, revisions (§19; contract + 0005 built; the service with a deterministic fake model built 2026-11-22, not deployed; the Claude Code CLI adapter is 6d). Enqueues `judge` rounds, `render`, `notify` | clips, clip_plans, judge_calls, own media_requests | slim (profile `judge`) |
+| judge | LLM verdict + edit plan, context requests, revisions (§19; contract + 0005 built; the service with a deterministic fake model built 2026-11-22, not deployed; the Claude Code CLI adapter built 2026-11-22 (6d), not run for real yet). Enqueues `judge` rounds, `render`, `notify` | clips, clip_plans, judge_calls, own media_requests | slim (profile `judge`) |
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Discord bot (§21) | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
@@ -297,8 +300,9 @@ built 2026-11-20, see §18.10, live since 2026-11-21 (judge jobs off); build ite
 backtest CLI, `clipper-detector backtest`) built 2026-11-22, not run on real data yet (first:
 stream 803), tuning the defaults needs that; judge build item 6a (contracts, migration 0005, lifecycle helper)
 built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, 6c (the judge service with a
-deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, see §19; next 6d (the
-Claude Code CLI adapter). Designs (all proposed 2026-11-19, not yet agreed):
+deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, 6d's buildable part
+(Claude Code CLI adapter, pinned CLI in the image, `clipper-judge eval`) 2026-11-22, see §19; next
+the first real CLI run and `clipper-judge eval` with Opus on ≥ 50 labelled candidates. Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -2065,7 +2069,9 @@ No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
 `clipper_core.lifecycle`) built 2026-11-20, on the live DB since 2026-11-21; build item 6b (input
 builder + resolver, pure) built 2026-11-21; build item 6c (the service with a deterministic fake
 model) built 2026-11-22, not deployed (image not built; compose service `judge` under profile
-`judge`); 6d (the Claude Code CLI adapter) next. **Decided by the user (2026-11-21):** the first real model
+`judge`); 6d's buildable part (`ClaudeCliModel`, the startup auth check, the pinned CLI in the
+image, `clipper-judge eval`) built 2026-11-22 against a fake `claude` (image not built, the real CLI
+never run); its first real run is next. **Decided by the user (2026-11-21):** the first real model
 runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
 **usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
 guard"). Also decided (2026-11-21): the model is **Opus** (pinned full id), **no usage
@@ -2208,8 +2214,11 @@ code.claude.com: headless, cli-reference, authentication, legal-and-compliance):
   - **Guards:** at start, `claude auth status` with that environment must report `authMethod`
     `oauth_token` (or `claude.ai` natively), else the service refuses to judge and sends a notice.
     The init event's `apiKeySource` must be `none` on every call, else the process is killed and
-    the job fails permanently. `--bare` can't be used: it never reads `CLAUDE_CODE_OAUTH_TOKEN`
-    (docs).
+    ~~the job fails permanently~~ (built, build item 4: the adapter switches itself off, jobs are
+    held, clips keep their state; the first JSON event must be the init event). The init event
+    precedes the model request, but the CLI may have sent it already: this bounds the spend to
+    at most one request, it can't guarantee none. `--bare` can't be used: it never reads
+    `CLAUDE_CODE_OAUTH_TOKEN` (docs).
   - **Container:** the judge image installs a pinned CLI version. The user runs `claude
     setup-token` once on the PC (browser login; it prints a one-year token that "can only make
     model requests" and isn't saved anywhere) and puts it in `.env` as
@@ -2217,19 +2226,37 @@ code.claude.com: headless, cli-reference, authentication, legal-and-compliance):
     heartbeat warning and a notice 14 days before expiry.
   - **Natively** (dev PC, the CLI is installed and logged in with `authMethod` `claude.ai`):
     the same token and a separate `CLAUDE_CONFIG_DIR`, so the service never touches the user's own
-    sessions or config. Falls back to the user's login only when no token is set (`loginExpiresAt`
-    is ~2 weeks, renewed by interactive use).
+    sessions or config. ~~Falls back to the user's login only when no token is set~~ (built
+    differently, build item 4: without a token the CLI uses a login stored in the judge's own
+    config dir, never the user's `~/.claude`; `loginExpiresAt` is ~2 weeks, renewed by
+    interactive use). The notice 14 days before expiry is not built yet (heartbeat + log only).
 - **Terms (docs, for the user):** the legal page says subscription OAuth is "designed to support
   ordinary use of Claude Code", and that products serving other people should use API keys
   ("route requests through Free, Pro, Max, or Ultra plan credentials on behalf of their users" is
   not permitted). The judge serves only the user, on the user's own plan; if that ever changes,
   switch to an API adapter.
-- **To verify in 6d:** whether an empty `--setting-sources` or a fresh `CLAUDE_CONFIG_DIR` keeps
-  user hooks/settings out without a first-run prompt; `apiKeySource` with the token; the `-p`
-  output when a usage limit is hit (not documented; it can't be provoked cheaply, so it gets
-  handled generically: `is_error` or `api_error_status` 429 → defer); the other values of
-  `rate_limit_info.status`; the install method and size in the image; `--system-prompt-file` (named
-  in `--help`'s `--bare` text) to keep prompts out of argv.
+- **To verify on the first real run** (6d's built part settled the rest, build item 4 below):
+  `claude auth status` with the token reports `authMethod` `oauth_token` (the start refuses
+  anything but `oauth_token`/`claude.ai`) and which expiry field it shows; `apiKeySource` is
+  `none` with the token (the adapter kills any other value); the format of
+  `credential_expires_at` (epoch s/ms and ISO are all read); `init.model` equals the pinned id
+  and `modelUsage` lists only it (mismatches are logged, not refused); a fresh
+  `CLAUDE_CONFIG_DIR` brings no first-run prompt or stray writes in `-p` (`--setting-sources`
+  is not passed: its empty form is unverified); `--system-prompt-file` acts like
+  `--system-prompt` (`CLIPPER_JUDGE_CLAUDE_SYSTEM_PROMPT_FILE=0` falls back); the env switches
+  taken from today's docs exist in 2.1.330 (`CLAUDE_CODE_DISABLE_CLAUDE_MDS`,
+  `_DISABLE_AUTO_MEMORY`, `_SKIP_PROMPT_HISTORY`, `_DISABLE_REFUSAL_FALLBACK`, `DISABLE_UPDATES`);
+  the `-p` output at a usage limit (not documented: handled generically, `is_error` + 429 / a
+  status other than `allowed`/`allowed_warning` / `rate_limit` retries / a limit message ->
+  defer) and the other values of `rate_limit_info.status`; Opus's latency and usage per clip, and
+  whether `--max-budget-usd 0.50` cuts legitimate runs at a high `--effort`; the image (build,
+  `claude --version` inside, size). **Canary CLAUDE.md**: put a `CLAUDE.md` saying e.g. "end every
+  answer's reasons with CANARY" in the judge's config dir (`<dir>/.claude/CLAUDE.md`) and in the
+  temp dir's parent, judge once, and check the reasons don't mention it
+  (`CLAUDE_CODE_DISABLE_CLAUDE_MDS` must exist and work in 2.1.330). **Overage**: the reading's
+  `isUsingOverage`/`overageStatus` (the user's account showed `overageStatus` `rejected`,
+  `overageDisabledReason` `org_level_disabled`, `isUsingOverage` false on 2026-11-22) and that
+  the `rate_limit_event` arrives before the second turn.
 
 **Provider options** (user's pick; per clip at ~4k uncached + 3k cached input, 1–3k output incl.
 reasoning; list prices 2026-11-19, verify; a context round adds ~50 %):
@@ -2268,7 +2295,12 @@ what limits the judge is the plan's usage windows (usage guard below).
   - **Stale readings:** a reading older than `usage_stale_s` (15 min; the user may have used Claude
     since) lets one call through to refresh it.
   - **Errors:** a call that fails with a rate or usage limit defers to `resetsAt` (else 15 min)
-    and writes an error row with 0 usage.
+    and writes an error row (with the usage the CLI reported for it, else 0).
+  - **Overage latch** (built 6d, caps or not): extra usage beyond the plan is billed money. A
+    reading with `isUsingOverage` (or the plan refusing while `overageStatus` allows) kills the
+    call (`UsageLimitError`, the window's reset) unless `claude_allow_overage` (default off), and
+    the guard holds every further call until that reset (at the hard deadline: `budget`), with
+    a heartbeat warning `overage`.
   - **Operator revisions** are counted but never blocked by our caps (a human is waiting); only the
     platform's own limit stops them, and then a notice says so.
   - Settings: `usage_five_hour_max`, `usage_seven_day_max`, `calls_per_stream_hour`,
@@ -2480,10 +2512,11 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
      media landed meanwhile.
    - **`judge_calls.error` kinds** (prefix): `answer:` (the model answered, but invalid JSON or
      schema; the request's outcome, reused), `provider:` (sent again), `usage_limit:` (sent again
-     after the reset; not counted by the guard), `permanent:`. `answer` holds the decoded object
-     also when it failed the schema. Failed calls (`provider`, `usage_limit`, `permanent`) carry
-     0 tokens and cost; `answer:` rows were answered and paid, so they carry the call's usage and
-     cost like a success. The cost is the CLI's list-price estimate when the adapter gives one,
+     after the reset; not counted by the guard), `permanent:` (6d adds `timeout:` and
+     `unavailable:`). `answer` holds the decoded object also when it failed the schema. Failed
+     calls (`provider`, `usage_limit`, `permanent`) carry 0 tokens and cost (6d: the usage and
+     cost the CLI reported for a paid failed run); `answer:` rows were answered and paid, so they
+     carry the call's usage and cost like a success. The cost is the CLI's list-price estimate when the adapter gives one,
      else the settings' price table (default 0). The S3 record has the request, the response,
      the options, the reading and the extras: at `judge_io(hash, clip)` for answers (an outcome,
      never re-sent), at `judge_io(hash, clip, suffix="error-<id>")` for each failed call, so the
@@ -2570,6 +2603,137 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
    refresh; the "to verify" points of the adapter checked by hand (also: Opus through the CLI on
    the user's plan); `clipper-judge eval` on ≥ 50 labelled candidates with Opus (agreement,
    repairs/clip, p50/p95 latency, usage per clip) for prompt work.
+   **Buildable part built 2026-11-22**, tested against a fake `claude` only (the image isn't
+   built, the real CLI was never run): the hand checks and the Opus eval are open ("To verify on
+   the first real run" above). The guard itself was built in 6c (its tests cover caps, deferral
+   and stale readings); 6d feeds it the CLI's readings. Built in `services/judge`: `claude_cli`
+   (`ClaudeCliModel`, `CliProcess`, `child_env`, `parse_reading`, `check_auth`), `adapters`
+   (`make_model`, `settings_for_model`, `check_model`, shared by the service and the eval),
+   `evalset` (fixtures, labels), `evaluate` (`clipper-judge eval`), `model.ReportsStatus` (the
+   adapter's heartbeat block `model_status`). Settled and deviations:
+   - **Process**: `subprocess.Popen` (no shell) with reader threads, not
+     `asyncio.create_subprocess_exec`: Windows' selector event loop (psycopg,
+     `clipper_core.runtime.run`) has no subprocess support. Linux: a new session, the tree is
+     killed with `killpg(SIGKILL)`; Windows: `CREATE_NEW_PROCESS_GROUP` and `taskkill /T /F`. The
+     tree is killed on the timeout (`claude_timeout_s` 180, counted to the process's exit), on a
+     refused init, on cancellation (service stop), and when the process stays more than 10 s
+     after its `result` line (the answer is kept). The executable is resolved on the child's
+     PATH; a Windows `.cmd`/`.bat` shim (npm) is refused (the schema would go through cmd.exe's
+     parsing); this PC has the native `claude.exe`.
+   - **Arguments**: as designed, with `--system-prompt-file` (the prompt written byte for byte to
+     the call's temp dir beside the empty working dir; in the system temp dir, so never inside a
+     git checkout whose `.claude/` would apply) and `--max-budget-usd 0.5` by default; the schema
+     as compact JSON in its property order (`reasons` first). Not passed: `--bare`,
+     `--fallback-model`, `--setting-sources`. Hashed `options` = `{adapter: "claude-cli", effort,
+     max_turns: 3}`; `name` = the pinned id.
+   - **Environment** (from scratch, asserted by a test): passed on are PATH, locale, TZ, temp
+     dirs, proxy and CA variables and on Windows `SYSTEMROOT`/`SYSTEMDRIVE`/`WINDIR`/`COMSPEC`/
+     `PATHEXT` (Python and the CLI need them); set: HOME (on Windows also USERPROFILE, APPDATA,
+     LOCALAPPDATA) = `claude_config_dir`, `CLAUDE_CONFIG_DIR` = `<it>/.claude`,
+     `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_MAX_RETRIES` (2) and fixed switches
+     `DISABLE_AUTOUPDATER`, `DISABLE_UPDATES`, `CLAUDE_CODE_DISABLE_CLAUDE_MDS` (the temp dir's
+     parents, e.g. the Windows user home, could hold a CLAUDE.md),
+     `CLAUDE_CODE_DISABLE_AUTO_MEMORY`, `CLAUDE_CODE_SKIP_PROMPT_HISTORY`,
+     `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK` (no silent model switch on a safety flag). Telemetry
+     stays at the CLI's default (turning it off also stops feature-flag fetching).
+   - **Mapping**: `cached_input_tokens` = `cache_read_input_tokens`; `input_tokens` =
+     `input_tokens + cache_creation_input_tokens` (cache writes are uncached input; the two add
+     up to the whole prompt); latency `duration_ms` (else the wall time); `extras.claude_cli` =
+     version, argv (schema and inline prompt elided), init event, rate-limit info, api retries,
+     the result line, event counts, exit code, wall time, stderr tail. A first event other than
+     the init event, or an `apiKeySource` other than `"none"`: killed and the adapter switched off
+     (review fixes below; first built as `PermanentModelError`). A run without a `result`,
+     `is_error`, or a subtype other than `success` -> `ModelError` (the queue retries; the budget,
+     turns and structured-output subtypes are mapped differently since the review fixes below).
+     **Deviation**: a successful result with a non-zero exit keeps its answer (it was paid;
+     logged). A usage limit
+     (see "To verify") -> `UsageLimitError` with `resets_at` = the refusing window's reset, else
+     the reading's when its status refuses, else none (the guard's `limit_retry_s`: a short 429
+     while the windows still allow).
+   - **Auth**: `check_auth` runs `claude auth status` with the same environment at the start of
+     the service and of `eval --model claude-cli`; anything but `oauth_token`/`claude.ai` (or no
+     JSON) is logged and the process exits 1 (compose restarts it; nothing is judged); a config
+     directory other than the judge's is logged. **Deviation**: natively without a token there is
+     no fallback to the user's own login (`~/.claude`): HOME and `CLAUDE_CONFIG_DIR` are always
+     the judge's directory (`claude_config_dir`, default `~/.clipper/judge-claude`), so a native
+     run without a token needs a login stored there once (`CLAUDE_CONFIG_DIR=<dir>/.claude
+     claude`, then /login). Expiry: `credential_expires_at` of the last result (else
+     `loginExpiresAt`) less than 14 days ahead -> a heartbeat warning
+     (`model_status.warnings.credential_expiring`) and one log line per value; **no notice yet**
+     (`NoticeKind` has no such kind: add `credential_expiring` with §21's notify consumer).
+   - **Concurrency** 1 with the CLI (`settings_for_model`; a warning only when
+     `CLIPPER_JUDGE_CONCURRENCY` asked for more).
+   - **Settings** (`CLIPPER_JUDGE_*`): `model` `fake` | `claude-cli`; `claude_path` (`claude`),
+     `claude_model` (`claude-opus-5-5`; aliases such as `opus` are refused), `claude_effort` (low …
+     max, or none: the CLI's default), `claude_oauth_token` (SecretStr), `claude_config_dir`,
+     `claude_timeout_s` 180, `claude_max_retries` 2, `claude_max_budget_usd` 0.50 (none: no cap),
+     `claude_system_prompt_file` true, `claude_allow_overage` false; an empty value (compose's
+     `${VAR:-}`) means unset.
+   - **Image** (Dockerfile; not built): the native binary of 2.1.330 per architecture
+     (`linux-x64`, `linux-arm64`) from the release bucket the native installer downloads from,
+     `ADD --checksum` with the sha256 listed in that release's manifest, whose signature was
+     checked (good signature by the release key `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E
+     CACE`; the manifest's win32-x64 checksum matches this PC's CLI). Chosen over npm (Node ≥ 22
+     for a package that only links the same native binary: bigger, the same pin) and the apt
+     repository (repository and key setup in the image, versions per channel). +363 MiB (381 MB)
+     over the slim image; the binary is root-owned, the judge runs as uid 10001 with
+     `/var/lib/clipper-judge` as the CLI's HOME (compose volume `judge-claude`). compose:
+     `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`, `_CLAUDE_MODEL`, `_CLAUDE_EFFORT` from `.env`, the config
+     dir, no `ANTHROPIC_*`; the model stays `fake` unless `.env` says `claude-cli`.
+   - **`clipper-judge eval`** (read-only: a READ ONLY database connection and object-storage
+     reads; no S3 records): cases from `--candidate`/`--stream`/`--channel` (emitted candidates)
+     or the labels' ids, or `--fixtures` (files from `--save-fixtures`, `evalset`: one round's
+     inputs, giving byte-identical requests). A case runs like the service, without waiting:
+     `no_video` without a call; a context not fully transcribed is `not_ready` (or judged with
+     `--partial`, as at the hard deadline); the resolver's one retry; `need_context` rounds from
+     the database (a fixture ends there). A model error ends the case; a usage limit or a
+     permanent error stops the run (the rest `not_run`, exit 1). Labels (TOML/JSON): verdict,
+     optional ideal cut. It prints outcomes, agreement (rate, confusion, clip precision/recall,
+     cut IoU), repairs per planned clip and per code, p50/p95 latency per call and per case,
+     usage per case (tokens, cost estimate) and the plan's utilization deltas between
+     consecutive readings of one window; `--report` (JSON), `--csv`. `--model claude-cli` needs
+     `--yes` and runs the auth check first.
+   - **Review fixes (2026-11-22)**:
+     - **Overage** (blocker): `RateLimitReading.overage` (`isUsingOverage`, or the plan refusing
+       while `overageStatus` allows); unless `claude_allow_overage` (default false) it kills the
+       call at the `rate_limit_event` (before the second turn) with `UsageLimitError` (the full
+       window's reset) and latches the guard (`UsageGuard.hold`, before every real call, caps or
+       not) until then, heartbeat warning `overage`; at a clip's hard deadline `budget`.
+     - **Switching off**: the first JSON event must be `system/init` (a result, retry, reading,
+       message or hook first -> off); a wrong `apiKeySource`, `api_error_status` 401/403,
+       `authentication_failed`-type retries or an authentication text switch the adapter off
+       (`ModelUnavailableError`): the call's row is `unavailable:`, later calls start nothing and
+       write no row, the jobs are held every 10 min (`RetryLater`, no attempt used), clips stay
+       `judging`, heartbeat `model_status.warnings.model_off`; a restart with a fix resumes them.
+     - **Paid failures**: a `structured_output` is the answer whatever the subtype (logged);
+       `error_max_turns`/`error_max_structured_output_retries` without one are an invalid answer
+       (the resolver's one retry, then `failed`; no queue retries); `error_max_budget_usd` ->
+       `PermanentModelError` (the clip fails, the request isn't sent again); every error row
+       records the usage and cost the result line reported; a timeout is `CallTimeoutError`
+       (`timeout:` rows) and the request's second one fails the clip (`TIMEOUT_ATTEMPTS` 2).
+     - **Config dir** (`settings.check_config_dir`, also in `ClaudeCliModel`): blank -> the
+       default; refused: the home dir, the user's `~/.claude` (and `$CLAUDE_CONFIG_DIR`), a dir
+       above or inside it, a dir inside a git work tree.
+     - **Also**: "usage limit reached|<epoch>" is a usage limit in any result without an answer
+       (the epoch is `resets_at`); the token (and anything shaped `sk-ant-…`) is removed from the
+       stderr tail, result text, messages and extras, each stderr line cut to 500 chars;
+       `claude_path` absolute is best, a bare name is looked up on PATH's absolute entries only
+       (never the working dir, unlike `shutil.which` on Windows); `check_auth` also requires
+       `apiProvider` `firstParty` when reported; the tree is killed once, in a worker thread
+       (Linux: `killpg` always, ESRCH ignored); compose `judge` has `init: true`; the fake plays
+       both turns (tool use, tool result, closing message).
+   - **Tests**: 50 in `test_judge_claude_cli.py` (31 before the review fixes) (the fake executable `tests/fake_claude.py`
+     plays stream-json lines in the shapes recorded with 2.1.330: success, no
+     `structured_output`, `is_error` and the budget/turns/structured-output subtypes, no result,
+     success with a non-zero exit, 429 with and without a refusing window, `rate_limit` retries
+     and limit text, timeout and cancellation killing the tree (the fake and its child stop
+     writing heartbeats), a process lingering after its result, a wrong `apiKeySource`, a message
+     before init, argv/stdin/empty cwd/system prompt file, the environment from scratch, auth
+     status accepted and refused, expiry warnings, settings; one round through the 6c service path
+     on Postgres), 14 in `test_judge_eval.py` (fixture round trip, labels, arguments, runs with the
+     fake model and the CLI adapter incl. utilization deltas, retries and the stop at a usage
+     limit, the database mode on a READ ONLY engine with context growth and unchanged tables,
+     `not_ready`/`--partial`, `no_video`, `amain`'s engine).
 
 ### Proposed decision-log rows
 
@@ -2802,10 +2966,11 @@ soon as their migrations ran (7a, 21a, 22a only add tests against the real table
 kept for evals and prompt work).
 
 **Outside core.** `services/judge` (`CLIPPER_JUDGE_*`: provider, model, api key `SecretStr`, prices
-per 1M, `budget_usd_per_stream_hour`, `daily_usd` (for a later API adapter); CLI adapter (6d):
+per 1M, `budget_usd_per_stream_hour`, `daily_usd` (for a later API adapter); CLI adapter (6d, built):
 `claude_path`, `claude_oauth_token` `SecretStr` (env `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN`, from `claude
 setup-token`), `claude_model` (Opus, a pinned full id such as `claude-opus-5-5`), `claude_effort`,
-`claude_timeout_s` 180, `claude_max_budget_usd` 0.50; usage guard (off by default): `usage_five_hour_max`,
+`claude_config_dir`, `claude_timeout_s` 180, `claude_max_retries` 2, `claude_max_budget_usd` 0.50,
+`claude_system_prompt_file`; usage guard (off by default): `usage_five_hour_max`,
 `usage_seven_day_max`, `calls_per_stream_hour`, `calls_per_day` (all `None`), `usage_stale_s` 900;
 `soft_wait_s` 240, `hard_wait_s` 1800,
 `max_rounds` 2, `max_before_s` 600, `max_after_s` 120, `min_clip_s` 10, `max_clip_s` 60,
