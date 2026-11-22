@@ -255,20 +255,23 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
 
 - Done 2026-11-21 after the resume: `channel` list-only (b556ed4); `calibrate` reads fMP4 VODs
   (91abaeb) and its rerun on 2934862154 gave the audio T0 (above).
-- Backfill `--fill-gaps` (your answer, 2026-11-21; DESIGN §15 row + §17 "Fill the gaps of a
-  live-recorded stream", proposed): `clipper-backfill vod <id> --fill-gaps` fills only a
-  live-recorded stream's `not_recorded` gaps (and its unrecorded tail) from the VOD while it
-  exists, on request only, never touching live parts. After the fMP4 `calibrate` fix (fill uses
-  the calibrated T0). First targets: stream 803 (VOD 2934862154, live part ends 17:29:24Z), then
-  the 7134 s gap in stream 1412. Measured from the VOD listing: 803's VOD runs to ~22:14Z
-  (unrecorded tail ~4.7 h after 17:29Z); 1412's VOD ends ~21:07Z, and besides its gaps (22 s,
-  7134 s, 576 s) the recording stopped at 19:06:47Z (the stack was down ~19:07–21:58Z: chat stops
-  then too), so a ~2 h tail. Audio for both ≈ 0.7 GB, ~9 h to transcribe at BACKFILL priority.
-  Older ohnepixel streams have unrecorded tails too (stream 17, 2026-11-19: recorded to 18:36Z,
-  VOD to ~22:32Z); only on your request.
-- Chat-ingest: the extra IRC tags as columns (second batch, answer 5): migration + chat-ingest +
-  backfill (writes null) + tests; it ships with a chat-ingest redeploy, which you time
-  (chat-ingest restarts lose a few seconds of chat).
+- Done 2026-11-22: `--fill-gaps` built (f5c5b43; refuses to write unless the audio T0 is
+  trusted: >= 2 seam windows within 50 ms and within 0.5 s of the playlist PDT, else
+  `--accept-t0`); IRC tag columns + migration 0006 (57b6801; not on the live DB yet).
+- **Waiting for the stack** (stopped since ~00:00Z on 11-22): the real fill runs, natively from
+  this worktree (ffmpeg 9 here; the backfill image is still at 1778961):
+  `uv run clipper-backfill vod 2934862154 --fill-gaps --dry-run` (stream 803), check the T0 lines,
+  then without `--dry-run`; then the same for 2936064102 (stream 1412). Measured from the VOD
+  listing: 803's VOD runs to ~22:14Z (unrecorded tail ~4.7 h after 17:29Z); 1412's VOD ends
+  ~21:07Z, and besides its gaps (22 s, 7134 s, 576 s) the recording stopped at 19:06:47Z (the
+  stack was down ~19:07–21:58Z), so a ~2 h tail. Audio for both ≈ 0.7 GB, ~9 h to transcribe at
+  BACKFILL priority. 803's 6 s head stays unfilled (no whole segment fits). Older ohnepixel
+  streams have unrecorded tails too (stream 17, 2026-11-19: recorded to 18:36Z, VOD to ~22:32Z);
+  only on your request.
+- **Deploy when you say so** (the main session does deploys): migration 0006 alone first
+  (`docker compose up --build migrate`, while the old chat-ingest runs; it's catalog-only, 5 s
+  lock timeout), then `docker compose up -d --build chat-ingest` (a restart loses a few seconds
+  of chat; best while ohnepixel is offline). The backfill doesn't need 0006.
 - Judge 6c (service with the fake model: waits for transcripts, context rounds, one
   transaction per plan + render job), then 6d's buildable part (Claude CLI adapter on a fake
   executable + usage guard; also the stale `# cost guard (daily cap)` comment on
