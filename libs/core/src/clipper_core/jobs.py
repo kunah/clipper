@@ -5,7 +5,8 @@
 - pg_notify wakes idle workers instantly (sent on commit); they also poll as a fallback.
 - Priority can only go up: re-enqueueing or bumping uses GREATEST(old, new).
 - A failing handler is retried with backoff up to max_attempts; raising PermanentJobError
-  fails the job at once (retrying can't help, e.g. a broken input file).
+  fails the job at once (retrying can't help, e.g. a broken input file); raising RetryLater
+  puts it back until a given time without using an attempt (e.g. a usage limit that resets).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from clipper_core.contracts import JobStatus
 from clipper_core.logs import get_logger, log_context
+from clipper_core.timeline import ensure_utc
 
 log = get_logger(__name__)
 
@@ -36,6 +38,18 @@ class PermanentJobError(Exception):
     """Raised by a handler when retrying can't help (a broken input file, an impossible
     payload): JobRunner marks the job failed at once instead of using its remaining attempts.
     Subclass it or raise it `from` the original error."""
+
+
+class RetryLater(Exception):
+    """Raised by a handler when the job can't run *yet* and it knows until when (a usage limit
+    that resets, media that may still arrive): JobRunner puts the job back (`defer`) to run again
+    at `run_after`, without counting the attempt."""
+
+    def __init__(self, run_after: datetime, reason: str = "") -> None:
+        run_after = ensure_utc(run_after)  # naive datetimes are rejected
+        super().__init__(reason or f"retry at {run_after.isoformat()}")
+        self.run_after = run_after
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +197,38 @@ async def fail(
     return status
 
 
+DEFER_MIN = timedelta(seconds=1)  # a deferral never runs again sooner (no spinning on the past)
+
+
+async def defer(
+    session: AsyncSession, job: ClaimedJob, run_after: datetime, reason: str, *, worker_id: str
+) -> bool:
+    """Put a claimed job back to run at `run_after` (at least `DEFER_MIN` from now, database
+    time); the attempt `claim` counted is given back (a deferral is not a failure), `last_error`
+    keeps the reason. Only while `worker_id` still holds the job (a stale-lock requeue may have
+    handed it to another worker): False if it doesn't. (`complete` and `fail` have no such
+    guard.)"""
+    result = await session.execute(
+        sql_text(
+            """
+            UPDATE jobs SET status = 'queued', locked_by = NULL,
+                            run_after = GREATEST(:run_after, now() + :floor),
+                            attempts = GREATEST(attempts - 1, 0), last_error = :reason,
+                            updated_at = now()
+             WHERE id = :id AND status = 'running' AND locked_by = :worker
+            """
+        ),
+        {
+            "id": job.id,
+            "run_after": ensure_utc(run_after),
+            "floor": DEFER_MIN,
+            "reason": reason[-4000:],
+            "worker": worker_id,
+        },
+    )
+    return bool(result.rowcount)
+
+
 async def requeue_stale(session: AsyncSession, kind: str, older_than: timedelta) -> int:
     """Put back jobs whose worker died mid-job (locked too long). Run periodically."""
     result = await session.execute(
@@ -248,6 +294,17 @@ class JobRunner:
             started = time.monotonic()
             try:
                 await self._handlers[job.kind](job)
+            except RetryLater as exc:
+                async with self._sessions.begin() as session:
+                    deferred = await defer(
+                        session, job, exc.run_after, f"deferred: {exc}", worker_id=self._worker_id
+                    )
+                log.info(
+                    "job deferred" if deferred else "job not deferred: another worker holds it",
+                    run_after=exc.run_after.isoformat(),
+                    reason=str(exc),
+                    duration_s=round(time.monotonic() - started, 3),
+                )
             except PermanentJobError as exc:
                 async with self._sessions.begin() as session:
                     await fail(session, job, f"{type(exc).__name__}: {exc}", permanent=True)

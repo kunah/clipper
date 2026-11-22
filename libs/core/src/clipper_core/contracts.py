@@ -233,7 +233,7 @@ class ClipRejectReason(StrEnum):
     MODEL = "model"  # the model said no
     NO_VIDEO = "no_video"  # nothing renderable (audio_only), no LLM call
     NO_MEDIA = "no_media"  # hard deadline passed without a transcribed core
-    BUDGET = "budget"  # cost guard (daily cap)
+    BUDGET = "budget"  # the usage guard (was: cost guard), §19
 
 
 class Verdict(StrEnum):

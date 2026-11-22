@@ -142,6 +142,13 @@ def test_judge_io_storage_key_is_the_request_hash():
     for bad in ("", "AB12", "../x", "ab/cd"):
         with pytest.raises(ValueError):
             keys.judge_io(bad, clip_id=7)
+    # several records of one request (each failed call its own)
+    assert (
+        keys.judge_io(digest, 7, suffix="error-1a2b") == f"clips/7/judge/{digest}.error-1a2b.json"
+    )
+    for bad in ("", "-x", "A", "a/b", "a.b"):
+        with pytest.raises(ValueError):
+            keys.judge_io(digest, 7, suffix=bad)
 
 
 # --------------------------------------------------------------------------- EditPlan

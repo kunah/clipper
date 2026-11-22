@@ -4,7 +4,7 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-21):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
+> **Status (2026-11-22):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
 > unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill).
 > **Deployed for testing 2026-11-21** (user's OK; from branch `transcriber` @1778961, so compose runs
 > from that worktree until it is merged): live DB migrated to 0005; controller, chat-ingest and
@@ -18,8 +18,12 @@ judges, edits and publishes short vertical clips.
 > the judge on Opus via the Claude Code CLI in Docker with no usage limits for now, and publishing
 > per user-filled route (backfilled clips included). Detector build items 1–3 (contracts + 0004,
 > scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21. Judge
-> build items 6a (contracts + 0005 + `clipper_core.lifecycle`, §19) and 6b (input builder +
-> resolver, pure code in `services/judge`) built; no judge service yet (6c next). Migration 0006
+> build items 6a (contracts + 0005 + `clipper_core.lifecycle`, §19), 6b (input builder +
+> resolver, pure code in `services/judge`) and 6c (the `clipper-judge` service with a
+> deterministic fake model, waiter, context rounds, call cache, usage guard off by default,
+> revisions by patch; compose profile `judge`, 2026-11-22) built; 6c is not deployed (no image
+> built, nothing enqueues judge jobs while the detector runs with `JUDGE_JOBS=0`); 6d (the
+> Claude Code CLI adapter) next. Migration 0006
 > (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22, not on the live DB yet: it goes
 > on before the chat-ingest redeploy that ships it.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -173,7 +177,7 @@ Services talk only through Postgres and object storage.
 | recorder | HLS segments → ~60 s `.ts` + `.aac` (local spool first, crash-safe), gaps, enqueue transcription. Claims channels itself via leases. **Rarely redeployed** | chunks, stream_gaps | slim + ffmpeg |
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
 | detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
-| judge | LLM verdict + edit plan, context requests (§19; contract + 0005 built, service not yet) | clips, clip_plans, judge_calls, own media_requests | slim |
+| judge | LLM verdict + edit plan, context requests, revisions (§19; contract + 0005 built; the service with a deterministic fake model built 2026-11-22, not deployed; the Claude Code CLI adapter is 6d). Enqueues `judge` rounds, `render`, `notify` | clips, clip_plans, judge_calls, own media_requests | slim (profile `judge`) |
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Discord bot (§21) | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
@@ -289,7 +293,9 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
 context requests) → renderer (9:16, captions) → review (Discord + web) → publisher →
 analytics loop. Then Kick/YouTube. Detector build items 1–3 (contracts, scorer, live service)
 built 2026-11-20, see §18.10, live since 2026-11-21 (judge jobs off); judge build item 6a (contracts, migration 0005, lifecycle helper)
-built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, see §19. Designs (all proposed 2026-11-19, not yet agreed):
+built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, 6c (the judge service with a
+deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, see §19; next 6d (the
+Claude Code CLI adapter). Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -1932,8 +1938,9 @@ No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
 
 **Status:** proposal (not yet agreed); build item 6a (contracts + migration 0005 +
 `clipper_core.lifecycle`) built 2026-11-20, on the live DB since 2026-11-21; build item 6b (input
-builder + resolver, pure) built 2026-11-21; the service (6c) not built. The service can be built
-now with a deterministic fake model. **Decided by the user (2026-11-21):** the first real model
+builder + resolver, pure) built 2026-11-21; build item 6c (the service with a deterministic fake
+model) built 2026-11-22, not deployed (image not built; compose service `judge` under profile
+`judge`); 6d (the Claude Code CLI adapter) next. **Decided by the user (2026-11-21):** the first real model
 runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
 **usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
 guard"). Also decided (2026-11-21): the model is **Opus** (pinned full id), **no usage
@@ -2300,10 +2307,135 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
        frozen (edit by adding `prompts/v2/`), a format change needs an `INPUT_FORMAT` bump.
    - Open (for 6c): the title blocklist's words; `split_gap_max_s` and `teaser_min_s` are guesses;
      whether operator patches may jump a long hole (they can't now).
-3. **6c Service with the fake.** *Done (integration):* partial transcripts → waiting; transcript +
-   NOTIFY → `planned` + render job in one transaction; `need_context` → `request_media(100)` bumps
-   queued transcribe jobs, round 2 must decide; crash between call and commit → no second call;
-   soft/hard deadlines; budget → `rejected`/`budget`; a patch → v+1 + render job, a stale base refused.
+3. ✅ **6c Service with the fake** (built 2026-11-22, not deployed). *Done (integration):* partial
+   transcripts → waiting; transcript + NOTIFY → `planned` + render job in one transaction;
+   `need_context` → `request_media(100)` bumps queued transcribe jobs, round 2 must decide; crash
+   between call and commit → no second call; soft/hard deadlines; budget → `rejected`/`budget`; a
+   patch → v+1 + render job, a stale base refused. Built in `services/judge` (`clipper-judge`,
+   entry `main.py`): `model` (the `JudgeModel` protocol: `name`, `options` (provider settings that
+   change the answer, hashed), `async judge(JudgeRequest) -> JudgeResponse` with the JSON text,
+   usage in/cached/out, latency, request id, an optional cost estimate of the provider's own, the
+   last `RateLimitReading` (five-hour/seven-day windows, `resetsAt`, status) and `extras` for the
+   S3 record only; errors `ModelError` (retried), `UsageLimitError(resets_at)`,
+   `PermanentModelError`), `fakes` (`FakeJudgeModel`: rules on the request text: reject below
+   `min_score`, `need_context` in rounds below `context_rounds`, else clip the core moment titled
+   after its first sentence; `ScriptedJudgeModel`: scripted texts, answers, responses or
+   exceptions in order, records requests), `settings` (`CLIPPER_JUDGE_*`), `reads`/`writes` (the
+   judge's SQL), `calls` (cache + call + record), `guard` (usage guard), `waiter`, `rounds`
+   (`JudgeHandler`), `revisions` (`ReviseHandler`), `service` (`JudgeService`: `concurrency` job
+   runners on `judge` + `revise_plan`, the waiter, a heartbeat with model, prompt version, the
+   guard's last reading and warnings, outcomes since start, waiting clips). Dockerfile (slim) and
+   compose service `judge` (profile `judge`, `CLIPPER_JUDGE_MODEL=fake`, worker id `judge-1`); not
+   built or started. If a job runner or the waiter ends on its own (a runner's claim failing on
+   a database error), the service stops and exits 1, so compose restarts it. Settled and
+   deviations (incl. the review fixes of 2026-11-22):
+   - **Core additions** (additive, no other service uses them): `jobs.RetryLater(run_after,
+     reason)` (+ `jobs.defer`): a handler puts its job back until a given time without using an
+     attempt (`JobRunner` handles it). `run_after` must be timezone-aware; `defer` sets it to at
+     least 1 s from the database's now (a past time can't make a job spin) and only while the
+     worker still holds the job (`status = 'running' AND locked_by`; `complete` and `fail` have no
+     such guard). The judge defers with it for usage limits, the guard and a round job whose clip
+     isn't ready. `storage.keys.judge_io(..., suffix=None)`: several S3 records of one request.
+   - **Jobs per round**: the detector's `judge:{cand}` creates the clip and judges at once when the
+     context is covered, else ends (the clip waits). The waiter enqueues `judge:{cand}:r{round}`;
+     it claims and checks each waiting clip in a short transaction of its own (`FOR UPDATE SKIP
+     LOCKED`, so judge jobs never wait behind a sweep) and skips clips whose round job is queued
+     or running. A round job doesn't end while its clip waits in that round: one that finds its
+     clip not ready any more (late chunks) defers itself by at most the sweep interval. One that
+     ended anyway (its last attempt failed before it loaded the clip) can't be enqueued again, so
+     the waiter marks that clip `failed` with the reason: its only write to `clips`; the job
+     applies the same `readiness` rule and does every other state change.
+   - **`need_context`'s next round job** is enqueued in the round's transaction only when the
+     grown context is covered already (often: the time before T is transcribed); otherwise the
+     waiter enqueues it on the transcripts NOTIFY. An unconditional job would run at once, find
+     nothing to do and leave its key unusable.
+   - **Cache before the guard** (the draft's order was guard, cache, call): a reused answer costs no
+     call, so the guard only stands before a real call. The cache key is the request hash alone;
+     a re-run after a crash is free while the inputs are the same, and sends a new request if more
+     media landed meanwhile.
+   - **`judge_calls.error` kinds** (prefix): `answer:` (the model answered, but invalid JSON or
+     schema; the request's outcome, reused), `provider:` (sent again), `usage_limit:` (sent again
+     after the reset; not counted by the guard), `permanent:`. `answer` holds the decoded object
+     also when it failed the schema. Failed calls (`provider`, `usage_limit`, `permanent`) carry
+     0 tokens and cost; `answer:` rows were answered and paid, so they carry the call's usage and
+     cost like a success. The cost is the CLI's list-price estimate when the adapter gives one,
+     else the settings' price table (default 0). The S3 record has the request, the response,
+     the options, the reading and the extras: at `judge_io(hash, clip)` for answers (an outcome,
+     never re-sent), at `judge_io(hash, clip, suffix="error-<id>")` for each failed call, so the
+     request's next call doesn't overwrite it; each row's `io_key` names its own record. An
+     upload failure leaves `io_key` NULL and is logged.
+   - **The retry** (invalid answer or `Unrepairable`): `prompt.retry_request` appends "Retry: your
+     previous answer could not be used: <error>" after the task (one cleaned line, angle brackets
+     replaced, ≤ 600 chars); normal requests and the goldens are unchanged.
+   - **No `clip_plans` row without a call**: `no_video`, `no_media` and `budget` only set the
+     clip's status and reason; every answered round writes its row.
+   - **`no_video`** (with `judge_audio_only` off): less than CLIP_MIN of video over `[moment_from −
+     30 s, moment_to + 30 s]` and none to come: that range is fully recorded (`coverage()` has no
+     unrecorded part) or the channel doesn't record video (`recording_mode` not `full`). Checked
+     each time a waiting clip is woken, so an audio_only channel's clip is rejected on the first
+     job. With `judge_audio_only` the resolver cuts on the audio ranges.
+   - **Deadlines** use the injected clock (wall clock); `waiting_since` restarts with every round.
+     The soft rule is checked before the hard one, so a core that is all gap (an ad) is judged at
+     the soft deadline with `partial_context`.
+   - **Priorities**: round and render jobs at the clip's priority (= the detector job's,
+     TRIGGER); revision renders and notices at JUDGE_CONTEXT. `need_context` doesn't raise the
+     clip's priority (its media request is at 100). One media request per round over the whole
+     grown context; the clip's earlier requests are marked fulfilled then, all of them at a
+     terminal state.
+   - **Takeover**: a job that finds its clip `judging` (a dead worker's job, requeued by the
+     controller after 10 min, or a deferred job) takes it over; the outcome commit is
+     compare-and-set on `(judging, round)`, so a duplicate drops its result. A job's last attempt
+     marks the clip `failed` (waiting or judging), compare-and-set on the round the job loaded, so
+     a stale job of an earlier round can't fail a clip a later round handles; malformed payloads
+     fail permanently. `PermanentModelError` fails clip and job at once.
+   - **Usage guard built now** (the logic is the provider's; 6d feeds it readings): off by default.
+     Counts in database time (non-shadow calls, usage-limit rows left out; the stream's last 60 min,
+     the UTC day); the hour's median = the stream's emitted candidates of the last 60 min. A
+     missing or stale reading lets one call through at a time (others wait 30 s, or are rejected
+     at the hard deadline: never a deferral dated in the past); a fresh reading
+     over a cap or with a status other than `allowed` defers to the window's `resetsAt`; never past
+     the hard deadline, where the clip becomes `rejected`/`budget`. A `UsageLimitError` defers to
+     `resets_at` (else `limit_retry_s`, 15 min) also with every cap unset. Readings are logged
+     and in the heartbeat either way.
+   - **Revisions: patches only.** A free-text `instruction` is refused with a notice for now: it
+     needs a prompt version with a revision section (6d or later). Where the patch comes from is a
+     `RevisionSource`; the default reads `review_events.details` and fails the job permanently
+     while that table doesn't exist (§21, 0008). Idempotent by `clip_plans.review_event_id`.
+     Refused (`notify(REVISION_REFUSED)`, deduped per event, no plan): the event belongs to
+     another clip, the clip isn't `planned`, the base isn't the clip's latest plan
+     (`clips.plan_version`; re-checked in the write transaction), the event has both or neither
+     of patch and instruction, the patch doesn't validate (unknown fields), `PatchRefused`. "The
+     video is gone" is `resolve_patch` on the chunks that still have video (retention and §20's
+     pins don't exist yet).
+   - **Not in 6c**: the CLI adapter and its settings (6d), shadow runs (`CLIPPER_JUDGE_SHADOW`),
+     the assets volume (SFX tags come from the setting `sfx_tags`, empty until §20's manifest),
+     the USD caps of a later API adapter, the token-expiry notice (6d). The controller already had
+     `STALE_AFTER` for `judge` and `revise_plan`. `render` and `notify` jobs queue until the
+     renderer and review exist; nothing enqueues `judge` jobs while the detector runs with
+     `CLIPPER_DETECTOR_JUDGE_JOBS=0`.
+   - Settings (`CLIPPER_JUDGE_*`): `model` (`fake`), `prompt` (`v1`), `concurrency` 4,
+     `render_jobs` true, `judge_audio_only` false, `soft_wait_s` 240, `hard_wait_s` 1800,
+     `sweep_interval_s` 30, `heartbeat_interval_s` 15, `poll_interval_s` 10, the `JudgeParams`
+     ones (`max_rounds` 2, `max_before_s` 600, `max_after_s` 120, `min_clip_s` 10, `max_clip_s` 60,
+     `max_output_tokens` 4000, `sfx_tags`, `title_blocklist`), the guard's (`usage_five_hour_max`,
+     `usage_seven_day_max`, `calls_per_stream_hour`, `calls_per_day`: None; `usage_stale_s` 900,
+     `limit_retry_s` 900) and the price table (`price_input_per_mtok`,
+     `price_cached_input_per_mtok`, `price_output_per_mtok`: 0).
+   - Tests: 30 integration (`test_judge_service.py`, throwaway database, fakes, injected clock:
+     the *Done* list plus the next round at once when covered, the call's S3 record, invalid
+     answers retried once then `failed`, provider errors up to the last attempt, a usage cap
+     deferring to the reset and `budget` at the hard deadline, a stale reading refreshed, a
+     refused call waiting for `resetsAt` with caps unset, a high reading blocking nothing with caps
+     unset, audio_only and video-less chunks → `no_video` without a call (and judged with
+     `judge_audio_only`), the waiter skipping locked clips, refused revisions (stale base,
+     instruction, unknown patch field), the heartbeat; after the review: a round job deferring
+     itself, two jobs on one judging clip committing once, `PermanentModelError`, giving up on a
+     waiting clip only in its round, a waiting clip with an ended round job failed, failed calls
+     keeping their own S3 records, the media request in the need_context transaction, the
+     service exiting 1 when a runner dies and 0 on stop); 14 waiter state transitions, 9 guard
+     decisions, 8 fakes/retry note/settings (pure); core tests for `RetryLater`/`defer` and the
+     `judge_io` suffix. `FakeJudgeModel` keeps only its last 50 requests (it also runs as the
+     service's model).
 4. **6d `ClaudeCliModel` + usage guard + `clipper-judge eval`** (decided 2026-11-21: Claude Code CLI on
    the user's subscription, model Opus, no usage limits by default, in Docker; needs the user's
    `claude setup-token` token in `.env`). *Done:* contract tests on a fake `claude` executable

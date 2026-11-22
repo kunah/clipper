@@ -258,6 +258,11 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
 - Done 2026-11-22: `--fill-gaps` built (f5c5b43; refuses to write unless the audio T0 is
   trusted: >= 2 seam windows within 50 ms and within 0.5 s of the playlist PDT, else
   `--accept-t0`); IRC tag columns + migration 0006 (57b6801; not on the live DB yet).
+- Done 2026-11-22: judge 6c, the `clipper-judge` service with a deterministic fake model
+  (compose profile `judge`, not started; nothing enqueues judge jobs while the detector runs
+  with `CLIPPER_DETECTOR_JUDGE_JOBS=0`; `render`/`notify` jobs would just queue). Core got
+  `jobs.RetryLater`/`defer` (a job waits without using an attempt) and an error suffix for
+  `keys.judge_io`; existing job kinds behave the same.
 - **Waiting for the stack** (stopped since ~00:00Z on 11-22): the real fill runs, natively from
   this worktree (ffmpeg 9 here; the backfill image is still at 1778961):
   `uv run clipper-backfill vod 2934862154 --fill-gaps --dry-run` (stream 803), check the T0 lines,
@@ -272,8 +277,8 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
   (`docker compose up --build migrate`, while the old chat-ingest runs; it's catalog-only, 5 s
   lock timeout), then `docker compose up -d --build chat-ingest` (a restart loses a few seconds
   of chat; best while ohnepixel is offline). The backfill doesn't need 0006.
-- Judge 6c (service with the fake model: waits for transcripts, context rounds, one
-  transaction per plan + render job), then 6d's buildable part (Claude CLI adapter on a fake
+- Next: detector unit 4 (backtest CLI; real run on stream 803's 99 viewer clips once the stack is
+  up), then 6d's buildable part (Claude CLI adapter on a fake
   executable + usage guard; also the stale `# cost guard (daily cap)` comment on
   `ClipRejectReason.BUDGET` in `contracts.py`), renderer §20 (contracts, pure ffmpeg graph
   builder, NVENC smoke test only while the GPU isn't busy with the backlog), review §21 (Discord)

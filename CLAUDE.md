@@ -8,8 +8,9 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
 ## Layout
 
 - `libs/core/` (`clipper_core`): the contract between services. Settings, `timeline` (UTC),
-  `contracts` (priorities, job kinds, payloads), `models` (all tables), `jobs` (queue),
-  `media` (time-range requests that raise priorities), `leases`, `heartbeat`, `storage`
+  `contracts` (priorities, job kinds, payloads), `models` (all tables), `jobs` (queue;
+  `RetryLater` defers a job without using an attempt), `media` (time-range requests that raise
+  priorities), `leases`, `heartbeat`, `storage`
   (S3 + key layout), `partitions` (daily chat partitions), `logs` (unified structured
   logging), `runtime` (entry helpers); shared by live services and backfill: `chunks`
   (`commit_chunk`: chunk + gaps + transcribe job), `chat` (chat rows, `SecondAggregator`,
@@ -52,14 +53,24 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `settings` (`CLIPPER_DETECTOR_*`: `MODE` live|offline|all, offline not built yet; `JUDGE_JOBS`
   default 0 until the judge exists). Viewer clips only with `CLIPPER_TWITCH_*` credentials.
   Compose service `detector` (profile `detector`). Needs migration 0004.
-  `services/judge/` (`clipper_judge`, DESIGN §19), pure part only so far (6b; no service,
-  Dockerfile or compose yet): `params` (`JudgeParams`), `inputs` (`JudgeInputs`, one round in
-  memory), `transcript` (sentences `S1…`, snapping lookups), `answer` (`JudgeAnswer`, the model's
-  schema), `prompt` (`build_request` -> versioned, byte-stable `JudgeRequest` + `request_hash`;
-  prompt text in `prompts/v{N}/`), `resolver` (answer or `PlanPatch` -> repaired `EditPlan`,
-  reject, context request; repair codes), `samples` (fixture candidate). Goldens in
-  `tests/fixtures/` (`CLIPPER_JUDGE_UPDATE_GOLDEN=1` rewrites them); tests pin the prompt files
-  and the input format (a used `prompts/v{N}/` is frozen: add the next one). Depends on core only.
+  `services/judge/` (`clipper_judge`, DESIGN §19). Pure part (6b): `params` (`JudgeParams`),
+  `inputs` (`JudgeInputs`, one round in memory), `transcript` (sentences `S1…`, snapping
+  lookups), `answer` (`JudgeAnswer`, the model's schema), `prompt` (`build_request` -> versioned,
+  byte-stable `JudgeRequest` + `request_hash`, `retry_request`; prompt text in `prompts/v{N}/`),
+  `resolver` (answer or `PlanPatch` -> repaired `EditPlan`, reject, context request; repair
+  codes), `samples` (fixture candidate). Goldens in `tests/fixtures/`
+  (`CLIPPER_JUDGE_UPDATE_GOLDEN=1` rewrites them); tests pin the prompt files and the input format
+  (a used `prompts/v{N}/` is frozen: add the next one). Service `clipper-judge` (6c): `model`
+  (`JudgeModel` protocol, `JudgeResponse`, `ModelError`/`UsageLimitError`/`PermanentModelError`),
+  `fakes` (`FakeJudgeModel` rules, `ScriptedJudgeModel`; the only adapter until 6d's Claude Code
+  CLI), `settings` (`CLIPPER_JUDGE_*`, `MODEL=fake`; usage guard caps unset = off), `reads`/
+  `writes`, `calls` (`judge_calls` cache by request hash, committed alone + S3 `judge_io`),
+  `guard` (usage guard), `waiter` (LISTEN `clipper_transcripts` + 30 s sweep, pure `readiness`/
+  deadlines), `rounds` (`JudgeHandler`: one judge job advances one clip), `revisions`
+  (`ReviseHandler`: patches -> v+1 + render job; `RevisionSource`, `review_events` not built
+  yet), `service` (`JudgeService`: N job runners on `judge` + `revise_plan`, waiter, heartbeat).
+  Compose service `judge` (profile `judge`). `render`/`notify` jobs queue until renderer/review
+  exist. Integration tests: `tests/conftest.py` (`world` fixture). Depends on core only.
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
   (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then
@@ -100,6 +111,7 @@ docker compose up -d --build transcriber    # GPU (profile gpu, enabled by namin
                                             # downloads ~1.5 GB of weights into the `models` volume
 uv run clipper-detector                     # live detector natively (CLIPPER_DETECTOR_JUDGE_JOBS=0)
 docker compose up -d --build detector       # profile detector, enabled by naming it
+docker compose up -d --build judge          # profile judge (fake model until 6d); needs 0005
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).

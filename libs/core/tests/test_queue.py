@@ -265,6 +265,47 @@ async def test_permanent_error_fails_the_job_at_once(sessions):
     assert row.status == JobStatus.QUEUED and row.attempts == 1 and row.finished_at is None
 
 
+async def test_retry_later_defers_without_using_an_attempt(sessions):
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session)
+        job_id = await enqueue_transcribe(session, await add_chunk(session, stream_id, 0))
+    until = utc_now() + timedelta(hours=2)
+
+    async def handler(job: jobs.ClaimedJob) -> None:
+        raise jobs.RetryLater(until, "usage limit until reset")
+
+    runner = jobs.JobRunner(sessions, "unused", "runner-1", {JobKind.TRANSCRIBE: handler})
+    for _ in range(3):  # deferring again and again never uses up the attempts
+        assert await runner.run_once()
+        row = await job_row(sessions, job_id)
+        assert row.status == JobStatus.QUEUED and row.attempts == 0 and row.locked_by is None
+        assert row.run_after == until and row.last_error == "deferred: usage limit until reset"
+        assert not await runner.run_once()  # not runnable before run_after
+        async with sessions.begin() as session:
+            await session.execute(
+                text("UPDATE jobs SET run_after = now() WHERE id = :id"), {"id": job_id}
+            )
+
+
+async def test_defer_never_dates_a_job_in_the_past_and_needs_the_lock(sessions):
+    from datetime import datetime
+
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session)
+        job_id = await enqueue_transcribe(session, await add_chunk(session, stream_id, 0))
+    with pytest.raises(ValueError, match="naive"):
+        jobs.RetryLater(datetime(2026, 11, 22, 12, 0))
+    job = await claim_one(sessions)
+    async with sessions.begin() as session:  # another worker can't defer it
+        assert not await jobs.defer(session, job, utc_now(), "x", worker_id="someone-else")
+    before = utc_now()
+    async with sessions.begin() as session:  # a past run_after: at least DEFER_MIN from now
+        assert await jobs.defer(session, job, before - timedelta(hours=1), "x", worker_id="w1")
+    row = await job_row(sessions, job_id)
+    assert row.status == JobStatus.QUEUED and row.attempts == 0
+    assert row.run_after >= before + jobs.DEFER_MIN - timedelta(seconds=1)
+
+
 async def test_fail_permanent_ignores_remaining_attempts(sessions):
     async with sessions.begin() as session:
         stream_id = await make_stream(session)

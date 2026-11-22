@@ -7,6 +7,9 @@ dependencies = [
     "clipper-core",
 ]
 
+[project.scripts]
+clipper-judge = "clipper_judge.main:main"
+
 [tool.uv.sources]
 clipper-core = { workspace = true }
 

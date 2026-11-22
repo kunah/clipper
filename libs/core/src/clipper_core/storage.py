@@ -35,16 +35,21 @@ class keys:
         return f"streams/{stream_id}/transcripts/{seq:06d}.json"
 
     @staticmethod
-    def judge_io(request_hash: str, clip_id: int | None = None) -> str:
+    def judge_io(request_hash: str, clip_id: int | None = None, suffix: str | None = None) -> str:
         """Request + raw response of a judge call (`judge_calls.io_key`; evals, prompt work).
 
         Keyed on the call's `request_hash` (hex sha256), so the judge uploads it before the
-        `judge_calls` row exists; calls outside a clip (evals) go under `judge/`. A repeated
-        request (a retry after an error) overwrites the earlier object."""
+        `judge_calls` row exists; calls outside a clip (evals) go under `judge/`. `suffix`
+        (lowercase letters, digits, `-`) keeps several records of one request apart: the judge
+        gives each failed call (provider error, usage limit) its own, so the request's next call
+        doesn't overwrite it (`{request_hash}.{suffix}.json`)."""
         if not re.fullmatch(r"[0-9a-f]+", request_hash):
             raise ValueError(f"request hash must be lowercase hex: {request_hash!r}")
+        if suffix is not None and not re.fullmatch(r"[0-9a-z][0-9a-z-]*", suffix):
+            raise ValueError(f"suffix must be lowercase letters, digits and '-': {suffix!r}")
         prefix = "judge" if clip_id is None else f"clips/{clip_id}/judge"
-        return f"{prefix}/{request_hash}.json"
+        name = request_hash if suffix is None else f"{request_hash}.{suffix}"
+        return f"{prefix}/{name}.json"
 
 
 class ObjectStore:

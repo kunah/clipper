@@ -26,7 +26,7 @@ import math
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import cache
 from importlib import resources
@@ -139,6 +139,23 @@ def build_request(
         schema=answer_schema(final),
         max_tokens=params.max_output_tokens,
     )
+
+
+RETRY_ERROR_CHARS = 600  # the stated error is cut to this length
+
+
+def retry_request(request: JudgeRequest, error: str) -> JudgeRequest:
+    """The round's one retry (§19: invalid JSON or an unrepairable plan): `request` (built for
+    the retry: `final=True` after `Unrepairable(final=True)`) with the error stated after the
+    task. The error is one cleaned line, angle brackets replaced (it may quote the model's own
+    output, which may quote the stream)."""
+    note = _cut(clean_text(error), RETRY_ERROR_CHARS) or "the answer could not be used"
+    user = (
+        f"{request.user.rstrip()}\n\n"
+        f"Retry: your previous answer could not be used: {note}\n"
+        "Answer again with one JSON object that follows the schema."
+    )
+    return replace(request, user=user)
 
 
 def render_user(
