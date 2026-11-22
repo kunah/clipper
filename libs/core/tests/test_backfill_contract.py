@@ -116,3 +116,20 @@ async def test_chat_writer_can_leave_other_streams_metrics_alone(sessions):
             )
         ).one()
     assert tuple(first) == (3, 7)
+
+
+@pytest.mark.integration
+async def test_chat_writer_can_keep_every_existing_metrics_row(sessions):
+    """`--fill-gaps` (a live stream): metrics are insert-only, also against the same stream's
+    live seconds; seconds without a row are written."""
+    t = datetime(2025, 3, 4, 12, 0, tzinfo=UTC)
+    async with sessions.begin() as s:
+        await ChatWriter().write(s, [], [], [MetricRow(1, t, 3, 5, 4, {}, {})], [])
+    fill = [MetricRow(1, t + timedelta(seconds=i), 3, 1, 1, {"KEKW": 1}, {}) for i in range(2)]
+    async with sessions.begin() as s:
+        await ChatWriter(keep_existing_metrics=True).write(s, [], [], fill, [])
+    async with sessions() as s:
+        stored = (
+            await s.execute(text("SELECT stream_id, messages FROM chat_metrics_1s ORDER BY ts"))
+        ).all()
+    assert [tuple(r) for r in stored] == [(3, 5), (3, 1)]  # the live second as it was

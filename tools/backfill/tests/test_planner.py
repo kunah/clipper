@@ -6,8 +6,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from clipper_backfill.planner import PlanError, PlannedGap, at, check_aligned, plan_units
+from clipper_backfill.planner import (
+    PlanError,
+    PlannedGap,
+    at,
+    check_aligned,
+    fill_ranges,
+    plan_fill,
+    plan_units,
+)
 from clipper_core.contracts import GapReason
+from clipper_core.timeline import Interval
 from clipper_twitch.hls import parse_vod_playlist
 
 T0 = datetime(2026, 11, 18, 6, 27, 49, 784000, tzinfo=UTC)
@@ -172,3 +181,98 @@ def test_done_must_be_a_segment_boundary_of_the_playlist():
     assert plan_units(other, done_s=36.0, first_seq=3).units[0].start_s == 36.0
     # a start offset inside a segment is fine: it only moves forward from done_s
     assert plan_units(other, done_s=24.0, start_s=30.0).units[0].start_s == 24.0
+
+
+# --------------------------------------------------------------------------- --fill-gaps
+
+
+def t(seconds: float) -> datetime:
+    return T0 + timedelta(seconds=seconds)
+
+
+def iv(a: float, b: float) -> Interval:
+    return Interval(t(a), t(b))
+
+
+LIVE_CHUNKS = [iv(23.3, 53.3), iv(53.3, 83.3), iv(121.7, 151.7)]
+LIVE_GAPS = [(iv(-3, 23.3), "not_recorded"), (iv(83.3, 121.7), "not_recorded")]
+
+
+def test_fill_ranges_are_not_recorded_gaps_head_and_tail_inside_the_vod():
+    ranges = fill_ranges(vod=iv(0, 200), chunks=LIVE_CHUNKS, gaps=LIVE_GAPS)
+    assert [(r.kind, r.interval, r.gap_row) for r in ranges] == [
+        ("head", iv(0, 23.3), True),  # the gap row cut to the VOD's start
+        ("gap", iv(83.3, 121.7), True),
+        ("tail", iv(151.7, 200), False),  # no gap row: the recorder never wrote one
+    ]
+    # an ad is no hole to fill, a chunk without audio is live media, gaps beyond the VOD are cut,
+    # a hole between live chunks without a gap row is not filled (the recorder leaves none)
+    gaps = [*LIVE_GAPS, (iv(90, 95), "ad"), (iv(190, 230), "not_recorded")]
+    chunks = [*LIVE_CHUNKS, iv(170, 175)]
+    ranges = fill_ranges(vod=iv(0, 200), chunks=chunks, gaps=gaps)
+    assert [(r.kind, r.interval) for r in ranges] == [
+        ("head", iv(0, 23.3)),
+        ("gap", iv(83.3, 90)),
+        ("gap", iv(95, 121.7)),
+        ("tail", iv(175, 200)),
+    ]
+    # an unrecorded head without a gap row; nothing recorded at all; a VOD inside live media
+    ranges = fill_ranges(vod=iv(0, 200), chunks=LIVE_CHUNKS, gaps=[])
+    assert [(r.kind, r.interval, r.gap_row) for r in ranges] == [
+        ("head", iv(0, 23.3), False),
+        ("tail", iv(151.7, 200), False),
+    ]
+    assert [(r.kind, r.interval) for r in fill_ranges(vod=iv(0, 50), chunks=[], gaps=[])] == [
+        ("all", iv(0, 50))
+    ]
+    assert fill_ranges(vod=iv(30, 50), chunks=LIVE_CHUNKS, gaps=LIVE_GAPS) == []
+
+
+def fill_shape(plan):
+    return [(u.seq, [s.index for s in u.segments], u.gaps, u.mark_s) for u in plan.units]
+
+
+def test_fill_plan_takes_only_segments_inside_and_never_plans_a_gap():
+    segs = playlist(20, muted={18}, disc={10})
+    ranges = fill_ranges(vod=iv(0, 200), chunks=LIVE_CHUNKS, gaps=LIVE_GAPS)
+    plan = plan_fill(segs, ranges, T0, first_seq=1_000_000, chunk_s=20)
+    assert fill_shape(plan) == [
+        (1_000_000, [0, 1], (), None),  # [20, 30) crosses the live chunk at 23.3: unfilled
+        (1_000_001, [9], (), None),  # the discontinuity before 10 splits
+        (1_000_002, [10, 11], (), None),
+        (1_000_003, [16, 17], (), None),  # 18 muted: skipped, no gap
+        (1_000_004, [19], (), None),
+    ]
+    assert plan.complete and plan.vod_end_s == 200.0
+    for unit in plan.chunks:  # never across a live chunk, always inside a range
+        span = unit.interval(T0)
+        assert not any(span.overlaps(c) for c in LIVE_CHUNKS)
+        assert any(r.interval.start <= span.start and span.end <= r.interval.end for r in ranges)
+    head, gap, tail = plan.parts
+    assert (head.segments, head.first_s, head.last_s) == (2, 0, 20)
+    assert head.unfilled_edges_s == pytest.approx(3.3)
+    assert (gap.segments, gap.chunks, gap.unfilled_edges_s) == (3, 2, pytest.approx(8.4))
+    assert (tail.segments, tail.muted_s, tail.chunks, tail.planned_s) == (4, 10.0, 2, 30.0)
+
+    # resume from any committed point: the same units, the same seqs
+    for unit in plan.units[:-1]:
+        nxt = plan.units.index(unit) + 1
+        again = plan_fill(segs, ranges, T0, done_s=unit.done_s, first_seq=unit.seq + 1, chunk_s=20)
+        assert fill_shape(again) == fill_shape(plan)[nxt:]
+
+
+def test_fill_plan_marks_lost_segments_and_the_end():
+    segs = playlist(20)
+    ranges = fill_ranges(vod=iv(0, 200), chunks=LIVE_CHUNKS[:2], gaps=LIVE_GAPS[:1])
+    plan = plan_fill(segs, ranges, T0, first_seq=7, chunk_s=60, lost=frozenset({9, 19}))
+    assert fill_shape(plan) == [
+        (7, [0, 1], (), None),
+        (8, [10, 11, 12, 13, 14, 15], (), None),  # lost 9 counted with the chunk after it
+        (9, [16, 17, 18], (), None),
+        (None, [], (), 200.0),  # lost 19 at the end: counted by the mark
+    ]
+    assert [u.lost for u in plan.units] == [0, 1, 0, 1]
+    # nothing inside any range (the VOD's segments all cross live media): only the end mark
+    plan = plan_fill(playlist(3), [], T0, first_seq=7)
+    assert fill_shape(plan) == [(None, [], (), 30.0)] and plan.chunks == []
+    assert plan_fill(playlist(3), [], T0, done_s=30.0, first_seq=7).units == []

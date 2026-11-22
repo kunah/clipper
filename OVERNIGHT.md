@@ -295,6 +295,12 @@ with `docker builder prune` if needed); all throwaway e2e data (DBs, buckets, vo
 
 ## Environment events
 
+- 2026-11-22 ~00:00Z: the Clipper stack was stopped cleanly again (all containers exit 0, also
+  the main session's `clipper-filer-ui`), not by this session. Not restarted; the real
+  `--fill-gaps` runs wait for the stack. Tests meanwhile use a throwaway Postgres container
+  `clipper-orch-testpg` on 127.0.0.1:5434 (tmpfs, removed when done).
+- 2026-11-21 ~19:07–21:58Z: from the data, the stack was down then too (no chunks or chat after
+  19:06:47Z in stream 1412 until the restart at ~21:58Z).
 - 2026-11-21 ~21:58Z: the whole stack was restarted by someone (all containers recreated,
   `migrate` ran again as a no-op), not by this session; images were not rebuilt (still the
   15:13 CET images from 1778961). Postgres refused connections for ~2 min; a test run in

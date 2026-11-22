@@ -19,6 +19,7 @@ from sqlalchemy import text
 import clipper_transcriber.handler as handler_mod
 from clipper_core import jobs, transcripts
 from clipper_core.contracts import (
+    FILL_SEQ_BASE,
     TRANSCRIPTS_NOTIFY_CHANNEL,
     JobKind,
     JobStatus,
@@ -549,6 +550,38 @@ async def test_no_takeover_across_a_hole(env):
     assert not out.plan.takeover and out.plan.window_start == at(cut + 0.8)
     assert await env.transcript(a) == ta and ta.tail_from is not None  # A keeps its tail
     assert (await env.transcript(b)).owned_from == at(cut + 0.8)
+
+
+async def test_fill_gaps_chunks_hand_over_only_inside_their_range(env):
+    """Backfill `--fill-gaps` (DESIGN §17): a live chunk, fill chunks (seqs from FILL_SEQ_BASE)
+    starting 0.2 s after it (within the jitter) and one in a later range. Neighbours are read by
+    seq: nothing is taken from the live chunk, the usual handover runs inside a range, none
+    across ranges."""
+    pcm, expected = synth_speech(SCRIPT)
+    total = len(pcm) / SAMPLE_RATE
+    c1, c2, c3 = (cut_inside(expected, w) for w in ("w5.", "w11", "w15"))
+    backfill = Priority.BACKFILL
+    live = await env.add_chunk(0, 0.0, c1, pcm[: samples(c1)])
+    f0 = await env.add_chunk(
+        FILL_SEQ_BASE, c1 + 0.2, c2, pcm[samples(c1 + 0.2) : samples(c2)], priority=backfill
+    )
+    f1 = await env.add_chunk(
+        FILL_SEQ_BASE + 1, c2, c3, pcm[samples(c2) : samples(c3)], priority=backfill
+    )
+    f2 = await env.add_chunk(
+        FILL_SEQ_BASE + 2, c3 + 1.0, total, pcm[samples(c3 + 1.0) :], priority=backfill
+    )
+    await env.handler.transcribe(live)
+    t_live = await env.transcript(live)
+    assert t_live.tail_from is not None
+    outs = [await env.handler.transcribe(c) for c in (f0, f1, f2)]
+    assert not outs[0].plan.takeover and outs[0].plan.window_start == at(c1 + 0.2)
+    assert outs[1].plan.takeover  # inside one range: the usual handover
+    assert not outs[2].plan.takeover and outs[2].plan.window_start == at(c3 + 1.0)
+    assert await env.transcript(live) == t_live  # the live chunk keeps its row, tail and all
+    t0, t1 = await env.transcript(f0), await env.transcript(f1)
+    assert t0.owned_to == t1.owned_from and t0.tail_from is None
+    assert t1.tail_from is not None  # no contiguous next chunk: it keeps its tail
 
 
 async def test_takeover_across_a_jitter_hole_keeps_times_exact(env):

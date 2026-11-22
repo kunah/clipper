@@ -156,7 +156,9 @@ async def coverage(
       started (or before its first chunk, if that starts earlier) and, once the stream has
       ended, after `ended_at` (or after its last chunk, if that ends later). From
       `ended_at + ended_grace` on (`now` defaults to the current time) the recorder writes
-      nothing more, so everything after the stream's last chunk is gap.
+      nothing more, so everything after the stream's last chunk is gap, and so is a hole between
+      chunks that has no gap row (the recorder never leaves one; a backfill `--fill-gaps` run
+      does at the unfilled edges of a stream's unrecorded tail or head, DESIGN §17).
     - unrecorded: the rest, i.e. no chunk there yet (still being recorded, or a gap whose row
       isn't written yet: the recorder writes it with the chunk after the gap).
     Holes up to `max_jitter` with known parts on both sides are chunk-boundary jitter: next to an
@@ -225,6 +227,7 @@ async def coverage(
     media_start = min([stream.started_at, *(c.start_utc for c in chunks)])
     if outer.start < media_start:
         never.append(Interval(outer.start, media_start))
+    recorder_done = False
     if stream.ended_at is not None:
         last_end = max(stream.started_at, stream.last_end or stream.started_at)
         recorder_done = ensure_utc(now or utc_now()) >= stream.ended_at + ended_grace
@@ -241,7 +244,8 @@ async def coverage(
     for hole in uncovered(outer, known + gap):
         inside = outer.start < hole.start and hole.end < outer.end  # known parts on both sides
         if not inside or hole.duration > max_jitter:
-            unrecorded.append(hole)
+            # nothing will be recorded there any more: no row, and the recorder is done
+            (gap if recorder_done else unrecorded).append(hole)
         elif hole.start in u_edges or hole.end in u_edges:
             untranscribed.append(hole)
         elif hole.start in t_ends and hole.end in t_starts:

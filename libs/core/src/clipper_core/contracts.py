@@ -28,6 +28,12 @@ TRANSCRIPTS_NOTIFY_CHANNEL = "clipper_transcripts"
 # `transcripts.coverage()` doesn't wait for them.
 CHUNK_JITTER = timedelta(seconds=0.5)
 
+# `chunks.seq` of the chunks a `clipper-backfill vod --fill-gaps` run adds to a LIVE stream
+# (`source='backfill'`, DESIGN §17) start here, in time order; the recorder's seqs stay below it.
+# So their storage keys (stream id + seq) never collide, and no fill chunk is ever a seq neighbour
+# (`seq ± 1`, the transcriber's handover) of a live chunk.
+FILL_SEQ_BASE = 1_000_000
+
 
 class Priority(IntEnum):
     """Higher runs first. Effective priority of a job = max of everything that asked for it."""

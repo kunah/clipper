@@ -27,3 +27,12 @@ class BackfillSettings(BaseSettings):
     clips_top: int = Field(default=100, ge=1, le=1000)  # viewer clips per broadcast, by views
     lease_ttl_s: float = Field(default=120.0, ge=10)  # renewed every third of it
     temp_dir: Path | None = None  # parent of the per-run temp dir (default: the system's)
+    # `vod --fill-gaps` T0: live chunks next to the fill ranges, searched +/- this in the VOD,
+    # up to `fill_seam_tries` per seam (nearest first, the next one when a match fails). A fill
+    # writes only with a trusted T0 (else `--accept-t0`): at least `fill_t0_min_windows` good
+    # matches, at most `fill_t0_spread_s` apart, within `fill_t0_max_pdt_diff_s` of T0_pdt
+    fill_search_s: float = Field(default=20.0, gt=0)
+    fill_seam_tries: int = Field(default=3, ge=1)
+    fill_t0_spread_s: float = Field(default=0.05, gt=0)
+    fill_t0_min_windows: int = Field(default=2, ge=1)
+    fill_t0_max_pdt_diff_s: float = Field(default=0.5, gt=0)

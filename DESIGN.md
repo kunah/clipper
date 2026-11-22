@@ -175,7 +175,7 @@ Services talk only through Postgres and object storage.
 | renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
 | review | FastAPI UI + Discord bot (§21) | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
-| tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c), chat_messages, chat_metrics_1s (5d); viewer_clips (5d, all streams) | slim + ffmpeg (profile `tools`) |
+| tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c), chat_messages, chat_metrics_1s (5d); viewer_clips (5d, all streams); in an ended live stream (`--fill-gaps`, §17): vods, `source='backfill'` chunks, chat rows of seconds without live chat | slim + ffmpeg (profile `tools`) |
 
 Rules:
 - **One writer per table**, anyone reads.
@@ -275,7 +275,9 @@ Discord bot (review, §21), Claude Code CLI as the judge's first LLM (§19). Own
    of clips and `calibrate` 2026-11-21 on ohnepixel 2934862154 (clips: 99 kept; calibrate: chat
    clock confirmed, audio T0 failed on the fMP4 VOD, fixed the same day; rerun: `T0_pdt` is 16 ms
    before `T0_audio`, i.e. within one AAC frame). `channel
-   <login>` only lists a channel's archives (2026-11-21: backfill runs only on a named VOD). Design:
+   <login>` only lists a channel's archives (2026-11-21: backfill runs only on a named VOD).
+   `vod <id> --fill-gaps` (built 2026-11-22, not run on real data yet) fills an ended live
+   stream's `not_recorded` gaps and unrecorded tail/head from its VOD, live rows untouched. Design:
    [§17](#17-backfill-tool-step-5--proposed-2026-11-19-not-yet-agreed) (proposed 2026-11-19, not
    yet agreed).
 
@@ -443,7 +445,8 @@ judge uses for "transcripts cover T−90 s … T+30 s". Coverage splits the inte
   failed),
 - `gap` (`stream_gaps`, chunks without audio, before the stream started or its first chunk, after
   `ended_at` or the last chunk of an ended stream; from `ended_at + 5 min` (`ended_grace`) on,
-  everything after the last chunk, since the recorder writes nothing more),
+  everything after the last chunk, since the recorder writes nothing more, and, since 2026-11-22
+  (backfill `--fill-gaps`, §17), any hole between chunks that has no gap row),
 - `unrecorded` (no chunk there yet).
 `pending` = untranscribed + unrecorded; `complete` = nothing pending (provisional counts as done).
 
@@ -740,38 +743,139 @@ published per route like any clip; `muted` gaps, no `chat_events` from replay, "
 yesterday's ohnepixel VOD if it is still available; the main session runs `calibrate` and `clips` on
 it once the stack is up. The section as a whole stays proposed until the user has reviewed it.
 
-**Fill the gaps of a live-recorded stream (decided by the user 2026-11-21; design proposed, not
-built).** Today a VOD of a stream we recorded live gets its clips only. `vod <id> --fill-gaps`
-fills that stream's `not_recorded` gaps from the VOD, on request only. It never writes inside a
-range recorded live, and a gone VOD (or a gap outside it) leaves the gap as it is. First targets:
-stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in stream 1412.
-- **Which ranges**: the live stream's `not_recorded` gaps, plus its tail after the last live
-  chunk when the stream ended unrecorded (803), each cut to the VOD's span. Only ended streams;
-  while the stream is live the recorder still writes it.
-- **Media**: `audio_only` by default (`--video` as for any run), cut at whole VOD segments that
-  lie inside the gap, so a fill never overlaps a live chunk (up to one segment at each edge stays
-  unfilled; finer trimming later if it matters). Chunks get `source = 'backfill'` in the live
-  stream, with `muted` gaps as usual and BACKFILL-priority transcribe jobs.
-- **Time**: the VOD's T0 measured by `calibrate` against the live chunks when there is one
-  (±21 ms, it lines up with the live clock), else `T0_pdt` with a flag. The fMP4 `calibrate`
-  fix this needed is built (2026-11-21); its rerun on 2934862154 put `T0_pdt` 16 ms before
-  `T0_audio`, so the PDT fallback is good to about one AAC frame.
-- **Chat** (the whole stack was down in both cases, chat included): replay messages only for
-  seconds without live chat. `sent_at = createdAt` equals `tmi-sent-ts` (verified 205/205), so the
-  PK already skips messages logged live. Metrics are written only for seconds without a live
-  row (`keep_foreign_metrics`).
-- **Writer rule**: "one writer per table *and source*" extends to rows inside a live stream.
-  `chunks`/`chat_messages` rows with `source = 'backfill'` belong to the backfill tool, everything
-  else to the live services, and neither side updates the other's rows (the recorder's gap rows
-  stay as written).
-- **To settle at build time**:
-  - `chunks.seq` for fill chunks (unique per stream; above the stream's last seq, or a separate
-    range).
-  - How `coverage()` and the transcriber's takeover treat a filled range: chunks taking
-    precedence over a `not_recorded` gap row, or a marker on the gap, and contiguity across the
-    live/backfill seam.
-  - The `vods` row of a live stream (`t0_utc` isn't `started_at` there).
-  - Resume per gap.
+**Fill the gaps of a live-recorded stream: `vod <id> --fill-gaps` (decided by the user
+2026-11-21; built 2026-11-22, not run on real data yet).** Without the flag nothing changes: a VOD
+of a stream we recorded live gets its clips only (also once a fill row exists). With it, an ENDED
+stream we recorded live (`streams.source = 'live'`, matched by the platform stream id as before)
+gets its unrecorded parts filled from the VOD, on request only; anything recorded live stays as
+it is, and a gone VOD (or a hole outside it) leaves the hole. Refused with exit 2 (`[refused]`,
+`backfill.FillRefused`), nothing written: our stream still `live`, ended less than 5 min ago
+(`transcripts.ENDED_GRACE`), a recorder still holding the channel's `record:channel:{id}` lease,
+or the VOD still recording ("wait until it ended"); not our stream, or a backfilled one ("use
+`vod <id>` without --fill-gaps"); a live seq at or above `FILL_SEQ_BASE − 1`; on a first run
+(no fill vods row), chunks with `source = 'backfill'` or a seq ≥ `FILL_SEQ_BASE` already in the
+stream (left by a deleted vods row: their T0 is unknown); an untrusted T0 (below). Not with
+`--no-media`/`--start-offset`, and `--accept-t0` only with `--fill-gaps` (argparse errors). First targets: stream 803
+(VOD 2934862154, live part ends 17:29:24Z), then stream 1412 (VOD 2936064102). Settled at build
+time:
+- **Ranges** (`planner.fill_ranges`, stored in `vods.flags.fill_ranges`): the stream's
+  `not_recorded` gap rows, its unrecorded tail (last live chunk's end → T0 + the VOD's duration;
+  the recorder writes no row for it) and head (VOD start → first live chunk), each cut to the
+  VOD's span, minus every live chunk (with audio or not) and every gap row of another reason (ads
+  are no holes). A hole between live chunks without a gap row is not filled (the recorder leaves
+  none). In offset order, which is also time order.
+- **T0** (first run only, then frozen in `vods.t0_utc`; `fill.measure_t0`): measured in-process
+  against the live chunks at the seams, i.e. the live chunk ending at a range's start and the one
+  starting at its end (the tail: the last live chunk), nearest first, up to 3 per seam
+  (`fill_seam_tries`): a chunk whose ± 20 s search window around `T0_pdt` leaves the VOD or holds
+  a muted segment or an init section change, or whose match fails (download, object storage or
+  decode error, score < 0.5; also a truncated last live chunk), makes way for the next one of
+  that seam; each live chunk is matched once. The matching is calibrate's, moved to
+  `clipper_backfill.audio_match` (`calibrate` itself stays read-only, same report; S3 errors are
+  a note per window there too). `T0_audio` = the median of the good matches; `t0_candidates`
+  gets `audio`, `audio_windows`, `audio_spread_s`, `pdt_minus_audio_s` next to every usual
+  candidate; `flags.fill_audio` has every window tried (seq, VOD offset, score, T0), the spread
+  and the notes. **Trust** (a wrong T0 would be frozen by the first run, review 2026-11-22): a run
+  writes only with `T0_audio` from ≥ 2 good windows (`fill_t0_min_windows`) at most 50 ms apart
+  (`fill_t0_spread_s`, else also `flags.fill_t0_spread`) and within 0.5 s of `T0_pdt`
+  (`fill_t0_max_pdt_diff_s`; no PDT = not trusted), `t0_method = 'audio'`. Otherwise it refuses
+  (exit 2, the reasons in the message); the dry run still prints everything, plus the verdict
+  (`T0 check: …`). After looking at it the user may pass `--accept-t0 audio` (the median anyway)
+  or `--accept-t0 pdt` (`T0_pdt`, `t0_method = 'pdt'`, `flags.fill_t0_pdt`); either is recorded
+  in `flags.fill_t0_accepted` with the problems. The fallback is only ever PDT, never the chat
+  anchor or `created_at`: without PDT and without a match, nothing (not even a dry run). The
+  first run, also a `--dry-run`, needs the `audio_only` playlist, ffmpeg and object storage (the
+  live audio); its report shows every T0 candidate and the row's flags (`pdt_max_dev_s`,
+  `pdt_steps`, `timeline_uncertain_s`, ...).
+- **Media** (`planner.plan_fill`, `pipeline.MediaRunner.run_fill`): `audio_only` by default
+  (`--video` as for any run). Only VOD segments whose UTC span `[T0 + offset, T0 + end)` lies
+  inside a range, compared exactly on the µs grid the rows use (instead of a ~1 ms tolerance: a
+  fill chunk never overlaps a live chunk at all); up to one segment at each edge stays unfilled
+  (the dry run prints it per range). They are cut by the usual planner into chunks of
+  `chunk_seconds` (a discontinuity, init change, muted or lost segment or the range's edge ends a
+  chunk; fMP4 as in `_build`). Muted segments are skipped, also with `--video` (no video-only
+  chunks), lost ones (404 twice) skipped and counted in `flags.lost_segments`; `flags.fill_muted_s`
+  sums the muted seconds inside the ranges. **No gap rows at all**: under a recorder
+  `not_recorded` row the reason stays `not_recorded`, also where the VOD is muted; in a tail or
+  head without a row, `coverage()` reads unfilled edges and skipped segments as gap (below).
+- **Rows**: the chunks go into the LIVE stream with `chunks.source = 'backfill'` through
+  `commit_chunk` (chunk + transcribe job in one transaction, `priority_for_range(default=
+  BACKFILL)`, no gaps). `chunks.seq` = `contracts.FILL_SEQ_BASE` (1,000,000) + n in time order
+  (`chunks.seq` is int4; storage keys `{seq:06d}` just get 7 digits, so they never collide with
+  the live ones; a stream with a live seq ≥ `FILL_SEQ_BASE − 1`, a seq neighbour of the first
+  fill chunk, is refused). `--no-transcribe` works as usual; `enqueue_missing_jobs` now looks at
+  backfill chunks only. Not changed: the recorder resumes a stream at `max(seq) + 1` and
+  `max(end_utc)` over ALL its chunks, so a filled stream that went live again would continue
+  above the fill's seqs from its end (can't happen for an ended broadcast with a complete VOD;
+  `source = 'live'` in `_tracker_and_seq` would fix it with a recorder redeploy).
+- **vods row** (`rows.create_fill_vod`): one per stream (`vods.stream_id` is UNIQUE), referencing
+  the live stream; `t0_utc` = the T0 the fill uses, **not** `streams.started_at` there (Vod
+  docstring); `flags.mode = 'fill_gaps'`. Resume: `vods.media_done_s` (ranges in offset order) and
+  the lease `backfill:vod:{id}`; a complete fill ends with a watermark-only unit at the VOD's end
+  (`media_done_s` = its duration, `media_status = 'done'`). The `streams` row is never touched (the
+  controller's `ended_at` stays, e.g. 803's next-day one). No migration.
+- **Transcriber** (no change): neighbours are read by seq (P = seq − 1, S = seq + 1, takeover only
+  within `CHUNK_JITTER`). Fill chunks of two ranges get consecutive seqs but don't touch: no
+  handover between them; inside a range the usual handover runs; a live chunk is never a fill
+  chunk's seq neighbour, so even a fill chunk starting within the jitter of a live chunk takes
+  nothing over, and the live chunk keeps its provisional tail (tests: `plan_window` and the
+  handler against Postgres).
+- **`coverage()`**: chunk audio already wins over gap rows (`gap = uncovered(never, known)`), so
+  a filled range reads as untranscribed, then transcribed; `off_air` uses the max chunk end, so
+  the filled tail counts. **One change in core**: once the recorder is done (`ended_at` + 5 min),
+  a hole between chunks without a gap row is gap instead of unrecorded (the recorder never leaves
+  one; a fill does at a tail's or head's unfilled edges and skipped segments, which read as gap
+  before the fill and would otherwise stay pending for ever).
+- **Chat** (`ChatRunner.run_ranges`): only the whole seconds inside the ranges
+  (`chat.chat_spans`), each range paged from `resume_offset(its start)`. The watermark there is the
+  time `vods.chat_metrics_to` alone (messages with `sent_at` before it and the metrics of the
+  seconds before it commit together; `chat_done_s` only records the offset reached; resume = page
+  again from the watermark, `--max-minutes`/`--chat-max-minutes` count range seconds). A second
+  that already has a `chat_metrics_1s` row (chat-ingest ran) is left to it: neither its metrics
+  nor its messages are written (`flags.fill_chat_live_seconds`), so live and fill seconds never
+  mix; metrics are insert-only (new `ChatWriter(keep_existing_metrics=True)`: the old
+  `keep_foreign_metrics` protects other streams' rows only, not the same stream's live ones);
+  messages are insert-only by the PK, and `sent_at = createdAt = tmi-sent-ts` (205/205) skips
+  logged ones there too. Guard 2 is not applied. Rows: `source = 'backfill'`, the live stream id;
+  partitions as usual. An empty page that says a next page follows doesn't end a range: the same
+  request is asked again, and after 3 in a row the run gives up (`GqlUnavailable`, a re-run
+  resumes). The chat clock is the sampled anchor, else T0 + 3.9 s (now also for an
+  `audio` T0).
+- **Writer rule**: "one writer per table *and source*" extends to rows inside a live stream:
+  `chunks`/`chat_messages` with `source = 'backfill'` and the `chat_metrics_1s` seconds a fill
+  inserted belong to the backfill tool, everything else to the live services; neither side updates
+  or deletes the other's rows, and the fill writes no gap rows (model docstrings updated).
+- **Clips**: the usual step at the end; through the fill row a clip is linked to the live stream
+  on the fill's T0 (`time_source = vod_t0`).
+- **Elsewhere**: `calibrate` compares against live chunks only (`source = 'live'`); `status`
+  counts the backfill's own chunks and jobs, and for a fill row no gaps or muted seconds (it
+  writes none) and as chat seconds those of its own messages, with a line saying so; S3 errors
+  (`ClientError`, `BotoCoreError`) are in the CLI's handled errors. The dry run prints the live
+  stream, the T0 with each
+  window, every range (UTC, offsets, segments inside, muted, unfilled edges, gap row or not), the
+  plan (chunks, seqs, downloads) and the chat ranges with how many of their seconds are live.
+- **Deviations from the proposal**: the exact µs comparison instead of ~1 ms tolerance; muted
+  segments skipped also with `--video`; the `coverage()` change above; messages of seconds with a
+  live metrics row are left out too (not only by the PK).
+- **Tests** (`tools/backfill/tests/test_fill_gaps.py`, synthetic noise from one AAC encode as in
+  `test_calibrate`, TS and fMP4 VODs; plus planner, chat, core and transcriber tests): exactly
+  the segments inside the ranges become `backfill` chunks with seqs from the base and queued
+  BACKFILL jobs, no gap row, every live row unchanged (all columns), muted segment never fetched,
+  T0 within 2 ms of the truth (PDT 137 ms off), the vods row; chat only in the ranges' free
+  seconds, live seconds and messages untouched; dry run writes nothing; crash mid-media and
+  mid-chat + `--chat-max-minutes` slices = one clean run; `--max-minutes` slices; the T0 check
+  (no match → only `--accept-t0 pdt`; a 100 ms disagreement, a single window, a PDT 0.8 s off,
+  no PDT → refused, dry run still complete, `--accept-t0` writes; no PDT and no match →
+  nothing); a failed match (undecodable audio, an S3 error) hands its seam to the next chunk;
+  refusals (live, ended < 5 min ago, a recorder lease, backfilled, not ours, a live seq at
+  `FILL_SEQ_BASE − 1`, leftover fill chunks; the CLI exits 2); empty chat pages with a next page;
+  `coverage()` over a filled stream; `status`; viewer clips on the fill's T0; the transcriber's
+  neighbour logic with fill seqs.
+- **To watch on the real runs**: 803's first live chunk starts 6 s into the VOD, so its ± 20 s
+  window doesn't fit and the next chunk is tried; a muted stretch near a seam pushes its window to
+  a farther chunk (up to 3, else that seam has no match). With the stack up, a fill is refused
+  while the channel is live (the recorder holds its lease). Chat-ingest's outage edges differ from
+  the recorder's by seconds: a fill second gets chat only where chat-ingest has no row.
 
 **Role.** `tools/backfill` (`clipper-backfill`) runs natively (ffmpeg on PATH) or via
 `docker compose run --rm backfill` (`tools` profile). It writes archives (VOD media + chat replay)

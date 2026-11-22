@@ -4,6 +4,7 @@
     uv run clipper-backfill vod https://www.twitch.tv/videos/2932113307 --max-minutes 5
     uv run clipper-backfill vod 2932113307 --video 720p60    # video + its audio (default: audio)
     uv run clipper-backfill vod 2932113307 --no-media --chat-max-minutes 30   # chat only
+    uv run clipper-backfill vod 2934862154 --fill-gaps --dry-run   # a live stream's holes
     uv run clipper-backfill channel xqc --since 2026-11-01 --limit 3   # lists only (Helix)
     uv run clipper-backfill clips xqc | clips 2932113307    # viewer clips (Helix credentials)
     uv run clipper-backfill calibrate 2932113307            # read-only: VOD vs our live recording
@@ -16,6 +17,11 @@ A `vod` run does media (audio_only by default), then the chat replay (into the l
 then viewer clips (only with Helix credentials, else skipped with a note). Idempotent: a re-run
 resumes where the last one committed (`vods.media_done_s`, `vods.chat_done_s`). Needs ffmpeg on
 PATH (`CLIPPER_BACKFILL_FFMPEG`) for media and `calibrate`; `--no-media` needs no object storage.
+`vod <id> --fill-gaps` fills the `not_recorded` gaps and the unrecorded tail/head of an ended
+stream WE recorded live from its VOD (DESIGN §17), and never touches what was recorded live; it
+needs object storage and ffmpeg even for `--dry-run` (it measures its T0 on the live audio). Not
+our live stream, a backfilled one, still live, or a T0 that isn't trustworthy (see the dry run;
+`--accept-t0 audio|pdt` overrides): exit 2.
 A third-party emote provider that can't be reached (FFZ is unreachable from the dev PC) doesn't
 stop the chat: its emotes aren't counted and `vods.flags.emote_sets_failed` names it. Viewer-clip
 failures never fail a `vod` run (logged, `vods.flags.clips_error`).
@@ -32,11 +38,13 @@ import sys
 from datetime import UTC, datetime
 
 import httpx
+from botocore.exceptions import BotoCoreError, ClientError
 
 from clipper_backfill import rows
 from clipper_backfill.backfill import (
     NO_HELIX,
     Backfiller,
+    FillRefused,
     UsageError,
     VodOptions,
     VodOutcome,
@@ -155,6 +163,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sub = p.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("vod", parents=[media], help="backfill archives by id or URL")
     v.add_argument("refs", nargs="+", metavar="ID_OR_URL")
+    v.add_argument(
+        "--fill-gaps",
+        action="store_true",
+        help="a broadcast WE recorded live (ended): fill its not_recorded gaps and unrecorded "
+        "tail/head from the VOD; nothing recorded live is touched",
+    )
+    v.add_argument(
+        "--accept-t0",
+        choices=("audio", "pdt"),
+        help="--fill-gaps: write with this T0 although the check refuses it (look at the "
+        "--dry-run first): audio = the median of the live audio matches, pdt = the playlist's PDT",
+    )
     c = sub.add_parser(
         "channel",
         help="list a channel's archives, newest first, and what we have of each (Helix; "
@@ -178,7 +198,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     s = sub.add_parser("status", help="backfilled VODs and their progress")
     s.add_argument("video_ids", nargs="*")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.cmd == "vod" and args.fill_gaps and (args.no_media or args.start_offset):
+        v.error(
+            "--fill-gaps takes its ranges from the live stream: not with --no-media/--start-offset"
+        )
+    if args.cmd == "vod" and args.accept_t0 and not args.fill_gaps:
+        v.error("--accept-t0 goes with --fill-gaps")
+    return args
 
 
 def options(args: argparse.Namespace) -> VodOptions:
@@ -192,6 +219,8 @@ def options(args: argparse.Namespace) -> VodOptions:
         transcribe=not args.no_transcribe,
         chat=not args.no_chat,
         clips=not args.no_clips,
+        fill_gaps=getattr(args, "fill_gaps", False),
+        accept_t0=getattr(args, "accept_t0", None),
     )
 
 
@@ -228,6 +257,11 @@ def status_lines(found: list) -> list[str]:
             f"{f'{r.chat_done_s}/{r.duration_s:.0f}s {min(100, chat_pct):.0f}%':>15} "
             f"{r.chat_seconds:>7} {r.clips:>5}"
         )
+        if getattr(r, "stream_source", "backfill") == "live":
+            out.append(
+                f"{'':<12} --fill-gaps of live stream {r.stream_id}: chunks, jobs and chat "
+                "seconds are the fill's own; the recorder's gaps are not counted"
+            )
         if r.flags:
             out.append(f"{'':<12} flags: {r.flags}")
     return out
@@ -397,7 +431,16 @@ async def _calibrate(args: argparse.Namespace, settings: Settings, backfiller) -
     except (UsageError, ValueError) as exc:  # ValueError: e.g. no T0 candidate at all
         error(f"[error] {args.ref}: {type(exc).__name__}: {exc}")
         return 2
-    except (DownloadError, MediaError, VodError, GqlError, HelixError, httpx.HTTPError) as exc:
+    except (
+        DownloadError,
+        MediaError,
+        VodError,
+        GqlError,
+        HelixError,
+        httpx.HTTPError,
+        ClientError,
+        BotoCoreError,
+    ) as exc:
         log.exception("calibrate failed", ref=args.ref)
         error(f"[failed] {args.ref}: {type(exc).__name__}: {exc}"[:300])
         return 1
@@ -408,7 +451,8 @@ async def _calibrate(args: argparse.Namespace, settings: Settings, backfiller) -
 async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> int:
     bs = BackfillSettings()
     opts = options(args) if args.cmd != "calibrate" else VodOptions(dry_run=True)
-    needs_ffmpeg = args.cmd == "calibrate" or (opts.media and not opts.dry_run)
+    # --fill-gaps measures its T0 on the live audio even in a dry run (ffmpeg + object storage)
+    needs_ffmpeg = args.cmd == "calibrate" or opts.fill_gaps or (opts.media and not opts.dry_run)
     if needs_ffmpeg and shutil.which(bs.ffmpeg) is None:
         log.error("ffmpeg not found, set CLIPPER_BACKFILL_FFMPEG", ffmpeg=bs.ffmpeg)
         return 1
@@ -422,9 +466,11 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
     if not opts.dry_run and opts.media:  # chat and clips need no object storage
         store = ObjectStore(settings)
         await asyncio.to_thread(store.ensure_bucket)
+    elif opts.fill_gaps:  # a dry run reads the live chunks' audio only
+        store = ObjectStore(settings)
     gql = GqlChatReplay.from_settings(twitch)
     stop = stop_event_on_signals()
-    failed = 0
+    failed = refused = 0
     try:
         async with httpx.AsyncClient(timeout=bs.http_timeout_s, follow_redirects=True) as http:
             backfiller = Backfiller(
@@ -446,6 +492,10 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
                     break
                 try:
                     outcome = await backfiller.vod(ref, opts)
+                except FillRefused as exc:
+                    error(f"[refused] {ref}: {exc}")
+                    refused += 1
+                    continue
                 except UsageError as exc:
                     error(f"[error] {ref}: {exc}")
                     failed += 1
@@ -461,6 +511,8 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
                     GqlError,
                     HelixError,
                     httpx.HTTPError,
+                    ClientError,  # object storage (botocore)
+                    BotoCoreError,
                     ValueError,
                 ) as exc:
                     log.exception("vod failed, a re-run resumes", ref=ref)
@@ -471,7 +523,7 @@ async def _backfill(args: argparse.Namespace, settings: Settings, sessions) -> i
         await gql.aclose()
         if helix is not None:
             await helix.aclose()
-    return 1 if failed else 0
+    return 2 if refused else 1 if failed else 0
 
 
 def main() -> None:

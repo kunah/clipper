@@ -128,7 +128,10 @@ class ViewerSnapshot(Base):
 class Chunk(Base):
     """~60 s of recorded media. Storage unit only; everything else uses UTC times.
 
-    Writer: recorder for live streams, backfill tool for backfilled ones (by the stream's source).
+    Writer: recorder (`source='live'`), backfill tool (`source='backfill'`): the chunks of
+    backfilled streams, and the chunks a `--fill-gaps` run adds to an ended LIVE stream inside its
+    `not_recorded` gaps and unrecorded tail/head (seq >= `contracts.FILL_SEQ_BASE`, DESIGN §17).
+    Neither side ever updates the other's rows.
     """
 
     __tablename__ = "chunks"
@@ -155,6 +158,8 @@ class StreamGap(Base):
     """Time ranges with no media (ads, reconnects, muted VOD parts).
 
     Writer: recorder for live streams, backfill tool for backfilled ones (by the stream's source).
+    A `--fill-gaps` run writes none: a live stream's gap rows stay as the recorder wrote them, also
+    where fill chunks now lie inside them (chunks with audio win in `transcripts.coverage()`).
     """
 
     __tablename__ = "stream_gaps"
@@ -175,7 +180,8 @@ class ChatMessage(Base):
     """Raw chat. Partitioned by day on sent_at (see clipper_core.partitions).
 
     No foreign keys on purpose: this is the highest-volume table. Writer: chat-ingest
-    (`source='live'`), backfill tool (`source='backfill'`, for backfilled streams).
+    (`source='live'`), backfill tool (`source='backfill'`: backfilled streams, and the seconds of
+    a live stream's `--fill-gaps` ranges that have no live chat; insert-only).
     """
 
     __tablename__ = "chat_messages"
@@ -223,7 +229,9 @@ class ChatMetricSecond(Base):
     """Per-second chat stats; the live detector reads these.
 
     Writer: chat-ingest for live streams, backfill tool for backfilled ones (by the stream's
-    source). Both compute them with `clipper_core.chat.SecondAggregator`.
+    source), plus the seconds of a live stream's `--fill-gaps` ranges that had no row (insert-only:
+    a `--fill-gaps` run never overwrites a row). Both compute them with
+    `clipper_core.chat.SecondAggregator`.
     """
 
     __tablename__ = "chat_metrics_1s"
@@ -246,6 +254,9 @@ class Vod(Base):
 
     `t0_utc` = UTC of VOD offset 0 (= the stream's `started_at`), frozen on the first run; every
     backfilled time is `t0_utc + offset` (shifted per part after a timeline step, see flags).
+    A `--fill-gaps` row (`flags.mode = 'fill_gaps'`) references the LIVE stream it fills; its
+    `t0_utc` is the T0 measured against that stream's live audio (`t0_method = 'audio'`, else
+    'pdt' + `flags.fill_t0_pdt`), not `streams.started_at`.
     - `t0_method`: a `contracts.T0Method`; `t0_candidates` holds every estimate, e.g.
       `{"helix": iso, "path_epoch": iso, "chat": iso, "chat_spread_s": 1.0, "comments": 812}`.
     - `media_status` / `chat_status`: `contracts.VodMediaStatus` / `contracts.VodChatStatus`.

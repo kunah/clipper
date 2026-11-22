@@ -10,6 +10,9 @@ Per unit of the plan (`planner.plan_units`), in order:
    `media_status`.
 A crash loses at most the unit in progress: nothing of it is committed, and a re-run plans again
 from `media_done_s` with the next seq (same chunk boundaries, same keys).
+
+`run_fill` (`vod --fill-gaps`, DESIGN §17) does the same with `planner.plan_fill`'s units: chunks
+inside a live stream's fill ranges, seqs from `FILL_SEQ_BASE`, and no gap rows at all.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from clipper_backfill import rows
 from clipper_backfill.download import Downloader
-from clipper_backfill.planner import EPS_S, Unit, plan_units
+from clipper_backfill.planner import EPS_S, FillRange, Unit, plan_fill, plan_units
 from clipper_core import chunks, leases
 from clipper_core import ffmpeg as ffm
 from clipper_core.contracts import DataSource, Priority, VodMediaStatus
@@ -249,6 +252,71 @@ class MediaRunner:
                 result.status = VodMediaStatus.DONE
             return result
 
+    async def run_fill(
+        self,
+        vod: rows.VodRow,
+        segments: Sequence[VodSegment],
+        ranges: Sequence[FillRange],
+        *,
+        budget_s: float | None = None,
+    ) -> MediaResult:
+        """`--fill-gaps` (DESIGN §17): commit the `planner.plan_fill` units from
+        `vod.media_done_s` into the live stream (seqs from `FILL_SEQ_BASE`, no gap rows), until
+        the end or until `budget_s` seconds of chunks are committed (`--max-minutes`). Lost
+        segments are skipped (re-planned on the fly, `flags.lost_segments`); muted ones never
+        fetched."""
+        async with self.sessions() as s:
+            seq = await rows.next_fill_seq(s, vod.stream_id)
+        done_s = vod.media_done_s
+        vod_end = segments[-1].end_s if segments else 0.0
+        lost: set[int] = set()
+        result = MediaResult(done_s=done_s, status=vod.media_status)
+        spent = 0.0
+        while True:
+            plan = plan_fill(
+                segments,
+                ranges,
+                vod.t0_utc,
+                done_s=done_s,
+                first_seq=seq,
+                chunk_s=self.chunk_s,
+                lost=frozenset(lost),
+            )
+            replan = False
+            for unit in plan.units:
+                if self.stop is not None and self.stop.is_set():
+                    result.stopped = True
+                    return result
+                if unit.seq is not None and budget_s is not None and spent >= budget_s - EPS_S:
+                    return result  # `--max-minutes`: a re-run goes on from here
+                files = ChunkFiles()
+                try:
+                    if unit.seq is not None:
+                        files = await self._build(vod, unit)
+                        if files.lost:
+                            lost |= files.lost
+                            result.lost_segments = len(lost)
+                            replan = True
+                            break
+                    status = (
+                        VodMediaStatus.DONE
+                        if unit.done_s >= vod_end - EPS_S
+                        else VodMediaStatus.PENDING
+                    )
+                    await self._commit(vod, unit, files, status, result)
+                finally:
+                    for path in files.paths:
+                        path.unlink(missing_ok=True)
+                done_s = unit.done_s
+                result.done_s, result.status = done_s, status
+                if unit.seq is not None:
+                    seq = unit.seq + 1
+                    spent += unit.end_s - unit.start_s
+                if self.after_commit is not None:
+                    await self.after_commit(unit)
+            if not replan:
+                return result
+
     async def _build(self, vod: rows.VodRow, unit: Unit) -> ChunkFiles:
         files = ChunkFiles()
         init = b""
@@ -356,8 +424,10 @@ class MediaRunner:
                 video_mb=round((video_bytes or 0) / 1e6, 2),
                 transcribe_priority=priority,
             )
-        else:
+        elif unit.gaps:
             log.info("gaps saved", gaps=[f"{g.reason}:{g.seconds:.0f}s" for g in unit.gaps])
+        else:  # a `--fill-gaps` watermark (past skipped segments, or the end)
+            log.info("fill watermark saved", done_s=round(unit.done_s, 3), lost=unit.lost)
 
 
 def write_media(path: Path, init: bytes, parts: Sequence[bytes | None]) -> None:

@@ -451,6 +451,28 @@ async def test_coverage_of_an_ended_stream_whose_last_chunk_ends_later(sessions)
 
 
 @pytest.mark.integration
+async def test_coverage_of_a_hole_without_a_gap_row_once_the_recorder_is_done(sessions):
+    """A backfill `--fill-gaps` run (DESIGN §17) leaves holes without gap rows between chunks: the
+    unfilled edges of an unrecorded tail, its muted segments. Once the recorder is done they are
+    gap (nothing will come), before that they are unrecorded, as any hole."""
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session, ended_at=200)
+        c0 = await add_chunk(session, stream_id, 0, 0, 60)  # live
+        await add_transcript(session, None, stream_id, 0, c0, owned=(0, 60))
+        await add_chunk(session, stream_id, 1_000_000, 68, 90)  # filled from the VOD
+        await add_chunk(session, stream_id, 1_000_001, 100, 120)  # (a muted segment before it)
+    for now in (200 + 300, 200 + 3600):
+        cov = await cover(sessions, stream_id, 0, 130, now=now)
+        assert cov.unrecorded == ()  # waits only for the fill chunks' transcripts
+        assert cov.transcribed == (iv(0, 60),)
+        assert cov.untranscribed == (iv(68, 90), iv(100, 120))
+        assert cov.gap == (iv(60, 68), iv(90, 100), iv(120, 130))
+    cov = await cover(sessions, stream_id, 0, 130, now=200 + 60)  # the recorder may still upload
+    assert cov.unrecorded == (iv(60, 68), iv(90, 100), iv(120, 130))
+    assert cov.gap == ()
+
+
+@pytest.mark.integration
 async def test_coverage_of_an_unknown_stream(sessions):
     with pytest.raises(LookupError):
         await cover(sessions, 12345, 0, 60)

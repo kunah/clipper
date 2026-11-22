@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 import pytest
 
+from clipper_core.contracts import FILL_SEQ_BASE
 from clipper_transcriber.audio import SAMPLE_RATE
 from clipper_transcriber.engines import RecognizedWord
 from clipper_transcriber.fakes import FakeSoundTagger, FakeSpeechEngine
@@ -145,6 +146,29 @@ def test_retake_after_an_earlier_takeover():
     assert plan(n_done, chunk(0, 0, 60, owned=(0, 60))).window_start == at(60)
     # N's earlier attempt didn't take anything over
     assert not plan(chunk(1, 60, 120, owned=(60, 120)), p_done).retake
+
+
+def test_fill_gaps_seqs_hand_over_only_inside_one_contiguous_range():
+    """Backfill `--fill-gaps` chunks (DESIGN §17) get seqs from `FILL_SEQ_BASE` in time order:
+    the chunks of two ranges are seq neighbours without touching (no handover between them), and
+    a live chunk is never a fill chunk's `seq - 1` or `seq + 1`."""
+    base = FILL_SEQ_BASE
+    a0 = chunk(base, 160, 180, owned=(160, 180), tail=178.5)  # range A: [160, 200) of the VOD
+    a1 = chunk(base + 1, 180, 200)
+    b0 = chunk(base + 2, 260, 280)  # range B, 60 s later: P = a1 (seq - 1), not contiguous
+    p = plan(a1, a0, b0)  # inside a range: the usual takeover
+    assert (
+        p.takeover and p.window_start == at(178.5) and (p.owned_to, p.keep_tail) == (at(200), True)
+    )
+    a1_done = chunk(base + 1, 180, 200, owned=(178.5, 200), tail=199)
+    p = plan(b0, a1_done, None)
+    assert p == WindowPlan(window_start=at(260), owned_to=at(280), keep_tail=True)
+    # ... also when B is transcribed first: A's last chunk keeps its own end and tail
+    b0_done = chunk(base + 2, 260, 280, owned=(260, 280))
+    assert plan(a1, a0, b0_done).owned_to == at(200) and plan(a1, a0, b0_done).keep_tail
+    # a fill chunk right after a live chunk (within the jitter): the handler never hands it the
+    # live chunk as P (`load_neighbourhood` goes by seq), so the window starts at its own start
+    assert plan(a0, None, a1) == WindowPlan(window_start=at(160), owned_to=at(180), keep_tail=True)
 
 
 def test_next_chunk_already_transcribed_bounds_ownership():

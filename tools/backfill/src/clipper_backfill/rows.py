@@ -10,6 +10,10 @@
   `clipper_core.chat.ChatWriter`, one transaction per batch with `vods.chat_done_s`/
   `chat_metrics_to`). Never `chat_events`, never `viewer_snapshots` (replay has neither).
 - `viewer_clips` (`upsert_clips`): the backfill tool is their only writer.
+- `vod --fill-gaps` (an ended LIVE stream, DESIGN §17): only a `vods` row referencing the live
+  stream (`create_fill_vod`), chunks with `source='backfill'` and seq >= `FILL_SEQ_BASE`, and chat
+  rows/metrics of seconds without live chat (insert-only). Never the stream row, its live chunks,
+  its gap rows or its live chat.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from clipper_backfill.t0 import T0Estimate
 from clipper_core import jobs, media
 from clipper_core.chunks import GapLike
 from clipper_core.contracts import (
+    FILL_SEQ_BASE,
     DataSource,
     JobKind,
     Priority,
@@ -70,6 +75,12 @@ class VodRow:
     chat_metrics_to: datetime | None
     flags: dict[str, Any]
     channel_user_id: str | None = None  # the channel's Twitch user id (third-party emote sets)
+    stream_source: str = str(DataSource.BACKFILL)  # `live`: a `--fill-gaps` row of a live stream
+
+    @property
+    def fill(self) -> bool:
+        """A `--fill-gaps` row: its stream was recorded live (DESIGN §17)."""
+        return self.stream_source == DataSource.LIVE
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,8 +122,10 @@ _VOD_SELECT = (
         Vod.chat_metrics_to,
         Vod.flags,
         Channel.platform_user_id.label("channel_user_id"),
+        Stream.source.label("stream_source"),
     )
     .join(Channel, Channel.id == Vod.channel_id)
+    .join(Stream, Stream.id == Vod.stream_id)
     .where(Channel.platform == PLATFORM)
 )
 
@@ -269,6 +282,125 @@ async def create_vod(session: AsyncSession, new: NewVod) -> VodRow:
     return found
 
 
+async def create_fill_vod(
+    session: AsyncSession, new: NewVod, *, channel_id: int, stream_id: int
+) -> VodRow:
+    """The `vods` row of a `--fill-gaps` run, referencing our LIVE stream (DESIGN §17), in the
+    caller's transaction. Writes nothing else: the stream row belongs to the controller.
+
+    Raises ValueError when the stream already has a vods row of another video (`stream_id` is
+    UNIQUE) or the stream is not a live one."""
+    source = (
+        await session.execute(select(Stream.source).where(Stream.id == stream_id))
+    ).scalar_one()
+    if source != DataSource.LIVE:
+        raise ValueError(f"stream {stream_id} is not a live stream ({source})")
+    created = (
+        await session.execute(
+            pg_insert(Vod)
+            .values(
+                channel_id=channel_id,
+                stream_id=stream_id,
+                platform_video_id=new.video_id,
+                title=new.title,
+                platform_created_at=ensure_utc(new.created_at),
+                duration_s=new.duration_s,
+                t0_utc=ensure_utc(new.t0.t0),
+                t0_method=str(new.t0.method),
+                t0_candidates=new.t0.candidates,
+                rendition=new.rendition,
+                media_status=new.media_status,
+                chat_status=new.chat_status,
+                flags=new.flags,
+            )
+            .on_conflict_do_nothing()
+            .returning(Vod.id)
+        )
+    ).scalar_one_or_none()
+    if created is None:
+        owner = (
+            await session.execute(select(Vod.platform_video_id).where(Vod.stream_id == stream_id))
+        ).scalar_one_or_none()
+        raise ValueError(f"stream {stream_id} already has the vods row of video {owner}")
+    found = await find_vod(session, new.video_id)
+    assert found is not None
+    return found
+
+
+@dataclass(frozen=True, slots=True)
+class LiveMedia:
+    """What the recorder wrote for a live stream: its chunks (with or without audio) and gaps."""
+
+    chunks: list[Any]  # seq, start_utc, end_utc, audio_key (source = 'live'), by seq
+    gaps: list[Any]  # start_utc, end_utc, reason, by start
+
+    @property
+    def max_seq(self) -> int | None:
+        return max((c.seq for c in self.chunks), default=None)
+
+
+async def live_media(session: AsyncSession, stream_id: int) -> LiveMedia:
+    chunks = (
+        await session.execute(
+            text(
+                "SELECT seq, start_utc, end_utc, audio_key FROM chunks "
+                "WHERE stream_id = :s AND source = :live ORDER BY seq"
+            ),
+            {"s": stream_id, "live": str(DataSource.LIVE)},
+        )
+    ).all()
+    gaps = (
+        await session.execute(
+            text(
+                "SELECT start_utc, end_utc, reason FROM stream_gaps WHERE stream_id = :s "
+                "AND end_utc > start_utc ORDER BY start_utc, end_utc"
+            ),
+            {"s": stream_id},
+        )
+    ).all()
+    return LiveMedia(list(chunks), list(gaps))
+
+
+async def fill_leftovers(session: AsyncSession, stream_id: int) -> int:
+    """Chunks of the stream that look like a fill's (`source='backfill'` or seq >=
+    `FILL_SEQ_BASE`): a first `--fill-gaps` run (no vods row yet) refuses when there are any
+    (left by a deleted vods row: their T0 is unknown, the next seq would follow them)."""
+    return (
+        await session.execute(
+            text(
+                "SELECT count(*) FROM chunks WHERE stream_id = :s "
+                "AND (source = :backfill OR seq >= :base)"
+            ),
+            {"s": stream_id, "backfill": str(DataSource.BACKFILL), "base": FILL_SEQ_BASE},
+        )
+    ).scalar_one()
+
+
+async def next_fill_seq(session: AsyncSession, stream_id: int) -> int:
+    """The next `chunks.seq` of a `--fill-gaps` run: `FILL_SEQ_BASE` + the fill chunks so far."""
+    return (
+        await session.execute(
+            text(
+                "SELECT COALESCE(MAX(seq) + 1, :base) FROM chunks "
+                "WHERE stream_id = :s AND seq >= :base"
+            ),
+            {"s": stream_id, "base": FILL_SEQ_BASE},
+        )
+    ).scalar_one()
+
+
+async def metric_seconds(
+    session: AsyncSession, *, channel_id: int, window: Interval
+) -> set[datetime]:
+    """The seconds of `window` that already have a `chat_metrics_1s` row of the channel (any
+    stream, or none)."""
+    found = await session.execute(
+        text("SELECT ts FROM chat_metrics_1s WHERE channel_id = :c AND ts >= :a AND ts < :b"),
+        {"c": channel_id, "a": window.start, "b": window.end},
+    )
+    return {ensure_utc(r.ts) for r in found}
+
+
 async def next_seq(session: AsyncSession, stream_id: int) -> int:
     return (
         await session.execute(
@@ -353,28 +485,35 @@ async def flag_number(session: AsyncSession, vod_id: int, key: str) -> float:
 
 
 async def stream_message_count(session: AsyncSession, stream_id: int) -> int:
+    """The stream's backfilled chat messages (a `--fill-gaps` stream also has live ones)."""
     return (
         await session.execute(
-            text("SELECT count(*) FROM chat_messages WHERE stream_id = :s"), {"s": stream_id}
+            text("SELECT count(*) FROM chat_messages WHERE stream_id = :s AND source = :b"),
+            {"s": stream_id, "b": str(DataSource.BACKFILL)},
         )
     ).scalar_one()
 
 
 async def enqueue_missing_jobs(session: AsyncSession, stream_id: int) -> int:
-    """`transcribe` jobs for the stream's chunks with audio that have none (committed with
-    `--no-transcribe` earlier). Returns how many were added."""
+    """`transcribe` jobs for the stream's backfilled chunks with audio that have none (committed
+    with `--no-transcribe` earlier; a `--fill-gaps` stream's live chunks are the recorder's).
+    Returns how many were added."""
     missing = (
         await session.execute(
             text(
                 """
                 SELECT c.id, c.start_utc, c.end_utc FROM chunks c
-                 WHERE c.stream_id = :s AND c.audio_key IS NOT NULL
+                 WHERE c.stream_id = :s AND c.audio_key IS NOT NULL AND c.source = :backfill
                    AND NOT EXISTS (SELECT 1 FROM jobs j
                                     WHERE j.kind = :kind AND j.ref_id = c.id)
                  ORDER BY c.seq
                 """
             ),
-            {"s": stream_id, "kind": str(JobKind.TRANSCRIBE)},
+            {
+                "s": stream_id,
+                "kind": str(JobKind.TRANSCRIBE),
+                "backfill": str(DataSource.BACKFILL),
+            },
         )
     ).all()
     for chunk in missing:
@@ -428,7 +567,10 @@ async def mark_restricted(session: AsyncSession, vod: VodRow) -> bool:
 
 
 async def status_rows(session: AsyncSession, video_ids: Sequence[str] = ()) -> list[Any]:
-    """One summary row per backfilled VOD (all, or the given ids), oldest first."""
+    """One summary row per backfilled VOD (all, or the given ids), oldest first. For a
+    `--fill-gaps` row (`stream_source = 'live'`) every count is the fill's own: its chunks and
+    their jobs, no gaps (it writes none; the recorder's are not counted), and as chat seconds the
+    seconds of its messages (each has the metrics row the fill wrote)."""
     where = "AND v.platform_video_id = ANY(:ids)" if video_ids else ""
     return (
         await session.execute(
@@ -437,25 +579,34 @@ async def status_rows(session: AsyncSession, video_ids: Sequence[str] = ()) -> l
                 SELECT v.platform_video_id AS video_id, c.login, v.stream_id, v.t0_utc,
                        v.t0_method, v.duration_s, v.rendition, v.media_status, v.media_done_s,
                        v.chat_status, v.chat_done_s, v.chat_metrics_to, v.flags, v.updated_at,
-                       (SELECT count(*) FROM chat_metrics_1s m
-                         WHERE m.stream_id = v.stream_id) AS chat_seconds,
+                       s.source AS stream_source,
+                       CASE WHEN s.source = 'backfill'
+                            THEN (SELECT count(*) FROM chat_metrics_1s m
+                                   WHERE m.stream_id = v.stream_id)
+                            ELSE (SELECT count(DISTINCT date_trunc('second', cm.sent_at))
+                                    FROM chat_messages cm
+                                   WHERE cm.stream_id = v.stream_id AND cm.source = 'backfill')
+                       END AS chat_seconds,
                        (SELECT count(*) FROM viewer_clips vc
                          WHERE vc.stream_id = v.stream_id) AS clips,
-                       (SELECT count(*) FROM chunks k WHERE k.stream_id = v.stream_id) AS chunks,
+                       (SELECT count(*) FROM chunks k WHERE k.stream_id = v.stream_id
+                           AND k.source = 'backfill') AS chunks,
                        (SELECT count(*) FROM stream_gaps g
-                         WHERE g.stream_id = v.stream_id) AS gaps,
+                         WHERE g.stream_id = v.stream_id AND s.source = 'backfill') AS gaps,
                        (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM g.end_utc - g.start_utc)), 0)
                           FROM stream_gaps g
-                         WHERE g.stream_id = v.stream_id AND g.reason = 'muted') AS muted_s,
+                         WHERE g.stream_id = v.stream_id AND g.reason = 'muted'
+                           AND s.source = 'backfill') AS muted_s,
                        (SELECT count(*) FILTER (WHERE j.status = 'done') FROM jobs j
                           JOIN chunks k ON k.id = j.ref_id
-                         WHERE j.kind = 'transcribe' AND k.stream_id = v.stream_id)
-                         AS transcribed,
+                         WHERE j.kind = 'transcribe' AND k.stream_id = v.stream_id
+                           AND k.source = 'backfill') AS transcribed,
                        (SELECT count(*) FILTER (WHERE j.status IN ('queued', 'running'))
                           FROM jobs j JOIN chunks k ON k.id = j.ref_id
-                         WHERE j.kind = 'transcribe' AND k.stream_id = v.stream_id)
-                         AS transcribe_pending
+                         WHERE j.kind = 'transcribe' AND k.stream_id = v.stream_id
+                           AND k.source = 'backfill') AS transcribe_pending
                   FROM vods v JOIN channels c ON c.id = v.channel_id
+                  JOIN streams s ON s.id = v.stream_id
                  WHERE c.platform = :platform {where}
                  ORDER BY v.created_at, v.id
                 """
@@ -630,6 +781,7 @@ class StreamRow:
     started_at: datetime
     ended_at: datetime | None
     source: str
+    status: str = str(StreamStatus.ENDED)
 
 
 _STREAM_SELECT = select(
@@ -639,6 +791,7 @@ _STREAM_SELECT = select(
     Stream.started_at,
     Stream.ended_at,
     Stream.source,
+    Stream.status,
 )
 
 
@@ -661,6 +814,11 @@ async def find_stream(
             )
         )
     ).first()
+    return StreamRow(**found._mapping) if found else None
+
+
+async def stream_by_id(session: AsyncSession, stream_id: int) -> StreamRow | None:
+    found = (await session.execute(_STREAM_SELECT.where(Stream.id == stream_id))).first()
     return StreamRow(**found._mapping) if found else None
 
 
@@ -708,14 +866,15 @@ async def upsert_clips(session: AsyncSession, clips: Sequence[dict[str, Any]]) -
 
 
 async def stream_chunks(session: AsyncSession, stream_id: int) -> list[Any]:
-    """The stream's chunks with audio, in order (seq, start_utc, end_utc, audio_key)."""
+    """The stream's live chunks with audio, in order (seq, start_utc, end_utc, audio_key); never
+    the chunks a `--fill-gaps` run cut from the VOD itself."""
     return (
         await session.execute(
             text(
                 "SELECT seq, start_utc, end_utc, audio_key FROM chunks "
-                "WHERE stream_id = :s AND audio_key IS NOT NULL ORDER BY seq"
+                "WHERE stream_id = :s AND audio_key IS NOT NULL AND source = :live ORDER BY seq"
             ),
-            {"s": stream_id},
+            {"s": stream_id, "live": str(DataSource.LIVE)},
         )
     ).all()
 

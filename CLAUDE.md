@@ -62,7 +62,13 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then
   the chat replay into `chat_messages`/`chat_metrics_1s` (same `SecondAggregator` as live, resume
   from `vods.chat_done_s`/`chat_metrics_to`, skipped where the channel has live chat), then viewer
-  clips into `viewer_clips` (Helix credentials, else skipped). `clips`, `calibrate` (read-only:
+  clips into `viewer_clips` (Helix credentials, else skipped). `vod <id> --fill-gaps`: an ended
+  stream WE recorded live instead gets its `not_recorded` gaps + unrecorded tail/head filled from
+  the VOD (`planner.fill_ranges`/`plan_fill`, T0 measured on the live audio by `fill` +
+  `audio_match`; chunks `source='backfill'` with seq >= `contracts.FILL_SEQ_BASE`, no gap rows,
+  chat only in seconds without live chat; one `vods` row referencing the live stream; live rows
+  never touched; not ours / backfilled / still live / an untrusted T0 -> exit 2, see `--dry-run`,
+  then `--accept-t0 audio|pdt`). `clips`, `calibrate` (read-only:
   VOD vs our live recording), `status`, `channel` (list only: backfill runs only on a named VOD).
   Needs ffmpeg on PATH natively (`CLIPPER_BACKFILL_*`); compose service `backfill` (profile
   `tools`, `docker compose run --rm`).
@@ -85,6 +91,7 @@ uv run clipper-backfill channel <login>               # lists archives + what we
 uv run clipper-backfill vod <id> --no-media --chat-max-minutes 30   # chat only (no object storage)
 uv run clipper-backfill clips <login|id>              # viewer clips (Helix credentials)
 uv run clipper-backfill calibrate <id>                # read-only: VOD vs our live recording of it
+uv run clipper-backfill vod <id> --fill-gaps   # fill a live stream's not_recorded gaps from its VOD
 docker compose up -d --build controller chat-ingest recorder
 docker compose up -d --build transcriber    # GPU (profile gpu, enabled by naming it); first start
                                             # downloads ~1.5 GB of weights into the `models` volume

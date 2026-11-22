@@ -14,6 +14,7 @@ from clipper_backfill.chat import (
     BAND_MID_S,
     SENT_AT_TOLERANCE_S,
     ChatClock,
+    chat_spans,
     clock_for,
     map_comment,
     window_for,
@@ -22,6 +23,7 @@ from clipper_backfill.t0 import ChatPoint, chat_anchor
 from clipper_chat_ingest.mapping import ChannelState
 from clipper_chat_ingest.service import ChatIngest
 from clipper_core.chat import SecondAggregator, second_of
+from clipper_core.timeline import Interval
 from clipper_twitch.gql import Comment, Fragment, parse_page
 from clipper_twitch.irc import parse
 
@@ -152,6 +154,9 @@ def test_clock_choice():
         datetime.fromisoformat(chat), "chat_anchor"
     )
     assert clock_for(t0, "pdt", {}).t0 == t0 + timedelta(seconds=3.9)
+    # a --fill-gaps T0 measured on the live audio is the media clock too
+    assert clock_for(t0, "audio", {}).t0 == t0 + timedelta(seconds=3.9)
+    assert clock_for(t0, "audio", {"chat": chat}).source == "chat_anchor"
     assert clock_for(t0, "helix", {}) == ChatClock(t0, "helix")
     window = window_for(t0, "pdt", {"chat": chat}, 100.0)
     assert window.start == t0 - timedelta(seconds=10)
@@ -174,3 +179,19 @@ def test_watermark_math_never_loses_or_repeats_a_second():
         assert earliest_unseen >= final + timedelta(seconds=1)
         latest_before_start = clock.expected(start - 1) + timedelta(seconds=SENT_AT_TOLERANCE_S)
         assert start == 0 or latest_before_start < final
+
+
+def test_chat_spans_are_the_whole_seconds_inside_each_range():
+    a = datetime(2026, 11, 18, 6, 27, 49, 500000, tzinfo=UTC)
+    s = timedelta(seconds=1)
+    ranges = [
+        Interval(a, a + 23.3 * s),  # :49.5 .. :12.8 -> [:50, :12)
+        Interval(a + 30.5 * s, a + 31.4 * s),  # no whole second inside
+        Interval(a + 40.5 * s, a + 42.5 * s),  # exactly two seconds
+    ]
+    whole = a.replace(microsecond=0)
+    assert chat_spans(ranges) == [
+        Interval(whole + s, whole + 23 * s),
+        Interval(whole + 41 * s, whole + 43 * s),
+    ]
+    assert chat_spans([]) == []

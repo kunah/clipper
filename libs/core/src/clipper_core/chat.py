@@ -343,11 +343,18 @@ class ChatWriter:
     `keep_foreign_metrics=True` (the backfill tool): an existing metrics row of another stream, or
     of no stream (live chat while offline), is left as it is instead of overwritten, so a writer
     never replaces the other source's seconds (one writer per table and source, DESIGN §17).
+
+    `keep_existing_metrics=True` (a backfill `--fill-gaps` run in a LIVE stream): metrics rows are
+    insert-only, so no existing second is ever overwritten, not even the same stream's (its live
+    seconds belong to chat-ingest).
     """
 
-    def __init__(self, *, keep_foreign_metrics: bool = False) -> None:
+    def __init__(
+        self, *, keep_foreign_metrics: bool = False, keep_existing_metrics: bool = False
+    ) -> None:
         self._partition_days: set[date] = set()
         self.keep_foreign_metrics = keep_foreign_metrics
+        self.keep_existing_metrics = keep_existing_metrics
 
     async def write(
         self,
@@ -365,7 +372,11 @@ class ChatWriter:
             )
         if events:
             await session.execute(insert(ChatEvent), [asdict(e) for e in events])
-        if metrics:
+        if metrics and self.keep_existing_metrics:
+            await session.execute(
+                insert(ChatMetricSecond).on_conflict_do_nothing(), [asdict(m) for m in metrics]
+            )
+        elif metrics:
             stmt = insert(ChatMetricSecond)
             stmt = stmt.on_conflict_do_update(
                 index_elements=["channel_id", "ts"],
