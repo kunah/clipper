@@ -19,6 +19,11 @@ that write in the chat. `clipper-judge eval --save-fixtures DIR` writes them fro
     "805" = { verdict = "clip", in_s = -12.0, out_s = 5.5 }   # the ideal cut, seconds from T
 
 A fixture's own `label` is used when the labels file has no entry for its id.
+
+**Drafts** (`clipper-detector backtest --export-drafts`, format `clipper-detector-drafts` v1):
+detector drafts that aren't live candidates (looser params, suppressed ones), as eval cases with
+ids `d<stream>-<peak epoch s>`; `load_drafts` turns each into a `CandidateInfo` (id 0: no
+`candidates` row) that the database loader judges like a candidate.
 """
 
 from __future__ import annotations
@@ -105,6 +110,72 @@ def load_labels(path: Path) -> dict[str, Label]:
     if not isinstance(data, Mapping):
         raise EvalSetError(f"{path}: expected a table of case id -> label")
     return {str(k).strip(): parse_label(v, f"{path}: {k}") for k, v in data.items()}
+
+
+# --------------------------------------------------------------------------- drafts
+
+DRAFTS_FORMAT = "clipper-detector-drafts"
+DRAFTS_VERSION = 1
+DRAFT_PREFIX = "d"
+
+
+def is_draft_id(case_id: str) -> bool:
+    """`d<stream>-<peak epoch s>` (a detector draft), not a candidate id."""
+    return case_id.startswith(DRAFT_PREFIX)
+
+
+@dataclass(frozen=True, slots=True)
+class Draft:
+    id: str
+    candidate: CandidateInfo  # id 0: no candidates row
+    raw: Mapping[str, Any]  # the draft as exported (written back into a label set)
+
+
+def draft_candidate(d: Mapping[str, Any]) -> CandidateInfo:
+    c = {k: d[k] for k in CANDIDATE_FIELDS if k != "id"}
+    for name in _CANDIDATE_TIMES:
+        c[name] = _dt(c[name])
+    c["features"] = dict(c.get("features") or {})
+    c["chat_delay_s"] = float(c["chat_delay_s"])
+    c["score"] = float(c["score"])
+    return CandidateInfo(id=0, **c)
+
+
+def drafts_doc(drafts: Sequence[Draft], **meta: Any) -> dict[str, Any]:
+    return {
+        "format": DRAFTS_FORMAT,
+        "version": DRAFTS_VERSION,
+        **meta,
+        "drafts": [dict(d.raw) for d in drafts],
+    }
+
+
+def load_drafts(path: Path) -> list[Draft]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise EvalSetError(f"{path}: {exc}") from exc
+    if not isinstance(data, Mapping) or data.get("format") != DRAFTS_FORMAT:
+        raise EvalSetError(f"{path}: not a {DRAFTS_FORMAT} file")
+    if data.get("version") != DRAFTS_VERSION:
+        raise EvalSetError(f"{path}: version {data.get('version')!r}, this judge reads 1")
+    out: list[Draft] = []
+    seen: set[str] = set()
+    for i, d in enumerate(data.get("drafts") or ()):
+        try:
+            draft_id = str(d["id"])
+            if not is_draft_id(draft_id):
+                raise EvalSetError(f"draft id {draft_id!r} doesn't start with {DRAFT_PREFIX!r}")
+            cand = draft_candidate(d)
+        except EvalSetError as exc:
+            raise EvalSetError(f"{path}: drafts[{i}]: {exc}") from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EvalSetError(f"{path}: drafts[{i}]: {type(exc).__name__}: {exc}") from exc
+        if draft_id in seen:
+            raise EvalSetError(f"{path}: draft id {draft_id!r} appears twice")
+        seen.add(draft_id)
+        out.append(Draft(draft_id, cand, dict(d)))
+    return out
 
 
 # --------------------------------------------------------------------------- inputs <-> JSON

@@ -13,7 +13,10 @@ stderr), `--report` (JSON: summary + every case) and `--csv` (a row per case) on
 `--save-fixtures DIR` (each database case's round-0 inputs as a fixture file, `evalset`).
 
 **Cases.** `--candidate`/`--stream`/`--channel` (emitted candidates, by peak) or the labels file's
-ids; `--fixtures` files or directories instead of the database. A case runs as the service
+ids; `--fixtures` files or directories instead of the database. `--drafts FILE` adds detector
+drafts (`clipper-detector backtest --export-drafts`, or a label set's `drafts.json`): every draft
+of the file with a selection, else the labelled ones (ids `d<stream>-<s>`; judged like a
+candidate, from the database). A case runs as the service
 judges a clip, without waiting: round 0 = the candidate's window; a `no_video` clip is rejected
 without a call (unless `judge_audio_only`); a context whose transcript isn't complete is
 `not_ready` (no call), or with `--partial` judged as the service does at its hard deadline (flag
@@ -66,6 +69,8 @@ from clipper_judge.evalset import (
     EvalSetError,
     Label,
     case_to_json,
+    is_draft_id,
+    load_drafts,
     load_fixtures,
     load_labels,
     write_fixture,
@@ -145,6 +150,10 @@ def add_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     e.add_argument("--since", type=_day, metavar="YYYY-MM-DD", help="--channel: started since")
     e.add_argument("--until", type=_day, metavar="YYYY-MM-DD", help="--channel: started before")
     e.add_argument("--labels", type=Path, metavar="FILE", help="labels (TOML or JSON)")
+    e.add_argument(
+        "--drafts", type=Path, metavar="FILE",
+        help="detector drafts as cases too (clipper-detector backtest --export-drafts)",
+    )  # fmt: skip
     e.add_argument("--limit", type=int, metavar="N", help="at most N cases")
     e.add_argument("--model", choices=MODELS, default="fake", help="the adapter (default fake)")
     e.add_argument("--yes", action="store_true", help="allow --model claude-cli (your plan)")
@@ -185,6 +194,8 @@ def check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Non
                      "pass --yes")  # fmt: skip
     if (args.claude_model or args.effort) and args.model != CLAUDE_CLI:
         parser.error("--claude-model/--effort go with --model claude-cli")
+    if getattr(args, "drafts", None) and args.fixtures:
+        parser.error("--drafts are database cases: not with --fixtures")
     if args.save_fixtures and args.fixtures:
         parser.error("--save-fixtures writes database cases: not with --fixtures")
     if args.limit is not None and args.limit <= 0:
@@ -545,12 +556,15 @@ async def select_candidates(
         if not ids:
             raise UsageError("no emitted candidates there")
     else:
+        keys = [k for k in labels if not is_draft_id(k)]
         try:
-            ids = sorted({int(k) for k in labels})
+            ids = sorted({int(k) for k in keys})
         except ValueError:
-            raise UsageError("database cases: the labels' ids must be candidate ids") from None
+            raise UsageError(
+                "database cases: the labels' ids must be candidate ids (or draft ids d<stream>-<s>)"
+            ) from None
         if not ids:
-            raise UsageError("the labels file has no cases")
+            return []  # drafts only (checked by the caller)
     found = {
         r.id
         for r in (
@@ -562,7 +576,7 @@ async def select_candidates(
     missing = [i for i in ids if i not in found]
     if missing:
         raise UsageError(f"unknown candidate id(s): {', '.join(map(str, missing))}")
-    return ids[: args.limit] if args.limit else ids
+    return ids
 
 
 class DbLoader:
@@ -653,8 +667,21 @@ async def db_cases(
     *,
     now: datetime,
 ) -> list[Case]:
+    drafts = load_drafts(args.drafts) if getattr(args, "drafts", None) else []
+    selected = bool(args.candidate or args.stream or args.channel)
+    if not selected:  # the labelled drafts only
+        wanted = {k for k in labels if is_draft_id(k)}
+        unknown = sorted(wanted - {d.id for d in drafts})
+        if unknown:
+            raise UsageError(
+                f"labelled draft id(s) not in --drafts: {', '.join(unknown[:5])}"
+                + (" ..." if len(unknown) > 5 else "")
+            )
+        drafts = [d for d in drafts if d.id in wanted]
     async with sessions() as s:
         ids = await select_candidates(s, args, labels)
+        if not ids and not drafts:
+            raise UsageError("the labels file has no cases")
         cases = []
         for cid in ids:
             cand = await reads.candidate(s, cid)
@@ -672,7 +699,30 @@ async def db_cases(
                     loader=loader,
                 )
             )
-    return cases
+        for d in drafts:
+            stream_info = await reads.stream(s, d.candidate.stream_id)
+            loader = DbLoader(
+                sessions,
+                store,
+                settings,
+                params,
+                d.candidate,
+                stream_info,
+                now=now,
+                partial=args.partial,
+            )
+            cases.append(
+                Case(
+                    d.id,
+                    None,
+                    labels.get(d.id),
+                    context=Interval(
+                        ensure_utc(d.candidate.window_from), ensure_utc(d.candidate.window_to)
+                    ),
+                    loader=loader,
+                )
+            )
+    return cases[: args.limit] if args.limit else cases
 
 
 async def save_fixtures(cases: Sequence[Case], directory: Path) -> int:

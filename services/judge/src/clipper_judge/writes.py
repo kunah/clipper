@@ -195,10 +195,10 @@ _INSERT_PLAN = text(
     """
     INSERT INTO clip_plans (clip_id, version, round, verdict, plan, context_request, confidence,
                             reasons, repairs, model, prompt_version, judge_call_id, author,
-                            parent_id, review_event_id, instruction)
+                            parent_id, review_event_id, instruction, shadow)
     VALUES (:clip_id, :version, :round, :verdict, :plan, :context_request, :confidence,
             :reasons, :repairs, :model, :prompt_version, :judge_call_id, :author,
-            :parent_id, :review_event_id, :instruction)
+            :parent_id, :review_event_id, :instruction, :shadow)
     RETURNING id
     """
 ).bindparams(
@@ -228,6 +228,7 @@ async def insert_plan(
     parent_id: int | None = None,
     review_event_id: int | None = None,
     instruction: str | None = None,
+    shadow: bool = False,
 ) -> int:
     return (
         await session.execute(
@@ -249,6 +250,7 @@ async def insert_plan(
                 "parent_id": parent_id,
                 "review_event_id": review_event_id,
                 "instruction": instruction,
+                "shadow": shadow,
             },
         )
     ).scalar_one()
@@ -271,6 +273,7 @@ async def insert_call(
     error: str | None,
     io_key: str | None,
     provider_request_id: str | None,
+    shadow: bool = False,
 ) -> int:
     """One `judge_calls` row; the caller commits it alone, right after the call (§19)."""
     return (
@@ -280,10 +283,10 @@ async def insert_call(
                 INSERT INTO judge_calls (clip_id, stream_id, model, prompt_version, request_hash,
                                          input_tokens, cached_input_tokens, output_tokens,
                                          cost_usd, latency_s, answer, error, io_key,
-                                         provider_request_id)
+                                         provider_request_id, shadow)
                 VALUES (:clip_id, :stream_id, :model, :prompt_version, :request_hash,
                         :input_tokens, :cached_input_tokens, :output_tokens, :cost_usd,
-                        :latency_s, :answer, :error, :io_key, :provider_request_id)
+                        :latency_s, :answer, :error, :io_key, :provider_request_id, :shadow)
                 RETURNING id
                 """
             ).bindparams(bindparam("answer", type_=JSONB(none_as_null=True))),
@@ -302,6 +305,7 @@ async def insert_call(
                 "error": None if error is None else error[-4000:],
                 "io_key": io_key,
                 "provider_request_id": provider_request_id,
+                "shadow": shadow,
             },
         )
     ).scalar_one()

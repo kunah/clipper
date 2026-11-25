@@ -26,6 +26,12 @@ Per job (ref = candidate; the detector's `judge:{cand}` or the waiter's `judge:{
    the grown context, round + 1, `request_media(context, JUDGE_CONTEXT, clip_id)`, back to
    `waiting_for_media`, and the next round's job when that context is covered already (else the
    waiter enqueues it). Terminal states mark the clip's own media requests fulfilled.
+5. Shadow runs (`settings.shadow`, after a committed round): each judges the same inputs with
+   its own model/prompt, the resolver's one retry included; its call and plan rows have
+   `shadow = true` (the plan takes a version; `clips.plan_version` and the clip's status don't
+   change, nothing is rendered). Best effort: skipped while the usage guard holds
+   (`UsageGuard.shadow_block`), and when this round has a shadow plan of that model and prompt
+   already (a retried job); a failure is logged and never touches the clip or the job.
 Provider errors are retried by the job queue; the job's last attempt marks the clip `failed` (in
 the round the job handled; a job that failed before it loaded the clip leaves it to the waiter). A
 usage limit (refused call, extra usage that isn't allowed and the guard's overage latch after it,
@@ -37,7 +43,8 @@ attempt used, the clip stays `judging`) until the service is restarted with a fi
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -56,8 +63,10 @@ from clipper_core.jobs import ClaimedJob, PermanentJobError, RetryLater
 from clipper_core.logs import get_logger, log_context
 from clipper_core.timeline import utc_now
 from clipper_judge import reads, writes
+from clipper_judge.adapters import Shadow
 from clipper_judge.calls import NOT_COUNTED, Caller, CallOutcome
 from clipper_judge.guard import Defer, Reject, UsageGuard
+from clipper_judge.inputs import JudgeInputs
 from clipper_judge.model import (
     JudgeModel,
     ModelError,
@@ -94,9 +103,13 @@ class RoundStats:
     retries: int = 0  # the round's one retry (invalid answer / unrepairable)
     deferred: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)  # planned, rejected:<reason>, ...
+    shadow: dict[str, int] = field(default_factory=dict)  # planned, skipped, failed, ...
 
     def count(self, outcome: str) -> None:
         self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
+
+    def count_shadow(self, what: str) -> None:
+        self.shadow[what] = self.shadow.get(what, 0) + 1
 
 
 @dataclass
@@ -125,6 +138,7 @@ class JudgeHandler:
         clock: Clock = utc_now,
         params: JudgeParams | None = None,
         stats: RoundStats | None = None,
+        shadows: Sequence[Shadow] = (),
     ) -> None:
         self.sessions = sessions
         self.store = store
@@ -135,6 +149,10 @@ class JudgeHandler:
         self.clock = clock
         self.stats = stats or RoundStats()
         self.caller = Caller(sessions, store, model, settings, clock=clock)
+        self.shadows = [
+            (sh, Caller(sessions, store, sh.model, settings, clock=clock, shadow=True))
+            for sh in shadows
+        ]
 
     async def __call__(self, job: ClaimedJob) -> None:
         try:
@@ -296,7 +314,8 @@ class JudgeHandler:
             if isinstance(res, Unrepairable):
                 error, retry_final = res.error, request.final or res.final
                 continue
-            await self._commit(clip, cand, res, outcome.call_id, request)
+            if await self._commit(clip, cand, res, outcome.call_id, request):
+                await self._run_shadows(clip, inputs)
             return
         await self._finish_failed(clip, f"no usable answer after one retry: {error}")
 
@@ -382,8 +401,9 @@ class JudgeHandler:
         res: Resolution,
         call_id: int,
         request: JudgeRequest,
-    ) -> None:
-        """Step 4: one transaction, compare-and-set on the clip's (judging, round)."""
+    ) -> bool:
+        """Step 4: one transaction, compare-and-set on the clip's (judging, round). False: the
+        clip changed meanwhile and the result was dropped."""
         now = self.clock()
         async with self.sessions.begin() as s:
             cur = await reads.clip_for_update(s, clip_id=clip.id)
@@ -392,7 +412,7 @@ class JudgeHandler:
                     "clip changed while it was judged: result dropped",
                     status=None if cur is None else cur.status,
                 )
-                return
+                return False
             version = await writes.next_version(s, cur.id)
             common = {
                 "clip_id": cur.id,
@@ -474,6 +494,133 @@ class JudgeHandler:
                     after_s=res.after_s,
                     ready=ready,
                 )
+        return True
+
+    # ------------------------------------------------------------------ step 5: shadow runs
+
+    async def _run_shadows(self, clip: ClipRow, inputs: JudgeInputs) -> None:
+        for shadow, caller in self.shadows:
+            with log_context(shadow=shadow.label):
+                try:
+                    await self._shadow(shadow, caller, clip, inputs)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # best effort: never the clip's or the job's problem
+                    self.stats.count_shadow("failed")
+                    log.exception("shadow run failed")
+
+    async def _shadow(
+        self, shadow: Shadow, caller: Caller, clip: ClipRow, inputs: JudgeInputs
+    ) -> None:
+        name = shadow.model.name
+        request = build_request(inputs, self.params, prompt=shadow.prompt)
+        async with self.sessions() as s:
+            if await reads.shadow_plan_exists(
+                s, clip.id, inputs.round, name, request.prompt_version
+            ):
+                log.info("shadow plan exists for this round")
+                return
+        error: str | None = None
+        retry_final = request.final
+        for attempt in range(2):
+            blocked = self.guard.shadow_block(self.clock())
+            if blocked is not None:
+                self.stats.count_shadow("skipped")
+                log.info("shadow run skipped", reason=blocked)
+                return
+            if attempt:
+                request = retry_request(
+                    build_request(inputs, self.params, prompt=shadow.prompt, final=retry_final),
+                    error or "",
+                )
+            h = request_hash(name, request, shadow.model.options)
+            try:
+                outcome = await caller.call(
+                    request, request_hash=h, clip_id=clip.id, stream_id=clip.stream_id
+                )
+            except ModelError as exc:
+                self.guard.observe(exc.rate_limit)
+                self.stats.count_shadow("failed")
+                log.warning("shadow call failed", error=f"{type(exc).__name__}: {exc}"[:300])
+                return
+            self.guard.observe(outcome.rate_limit)
+            if outcome.answer is None:
+                error, retry_final = outcome.error or "invalid answer", request.final
+                continue
+            res = resolve(
+                outcome.answer,
+                inputs,
+                self.params,
+                model=name,
+                prompt_version=request.prompt_version,
+            )
+            if isinstance(res, Unrepairable):
+                error, retry_final = res.error, request.final or res.final
+                continue
+            verdict = await self._write_shadow(
+                clip, inputs.round, res, outcome.call_id, request, name
+            )
+            self.stats.count_shadow(verdict)
+            return
+        self.stats.count_shadow("failed")
+        log.info("shadow run without a usable answer", error=(error or "")[:300])
+
+    async def _write_shadow(
+        self,
+        clip: ClipRow,
+        round_: int,
+        res: Resolution,
+        call_id: int,
+        request: JudgeRequest,
+        model: str,
+    ) -> str:
+        async with self.sessions.begin() as s:
+            await reads.clip_for_update(s, clip_id=clip.id)  # plan versions one at a time
+            version = await writes.next_version(s, clip.id)
+            common = {
+                "clip_id": clip.id,
+                "version": version,
+                "round_": round_,
+                "model": model,
+                "prompt_version": request.prompt_version,
+                "judge_call_id": call_id,
+                "shadow": True,
+            }
+            if isinstance(res, Planned):
+                verdict = Verdict.CLIP
+                await writes.insert_plan(
+                    s,
+                    **common,
+                    verdict=verdict,
+                    plan=res.plan.model_dump(mode="json"),
+                    confidence=res.plan.confidence,
+                    reasons=res.plan.reasons,
+                    repairs=res.plan.repairs,
+                )
+            elif isinstance(res, Rejected):
+                verdict = Verdict.REJECT
+                await writes.insert_plan(
+                    s,
+                    **common,
+                    verdict=verdict,
+                    confidence=res.confidence,
+                    reasons=res.reasons,
+                    repairs=res.repairs,
+                )
+            else:
+                assert isinstance(res, NeedsContext)
+                verdict = Verdict.NEED_CONTEXT
+                await writes.insert_plan(
+                    s,
+                    **common,
+                    verdict=verdict,
+                    context_request=res.context_request(),
+                    confidence=res.confidence,
+                    reasons=res.reasons,
+                    repairs=res.repairs,
+                )
+        log.info("shadow plan", version=version, verdict=verdict.value)
+        return verdict.value
 
     # ------------------------------------------------------------------ endings
 

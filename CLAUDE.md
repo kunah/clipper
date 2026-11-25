@@ -58,7 +58,8 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   `backtest` (pure: truth = top 10 ∪ ≥ p75 viewer clips, chat coverage cut at the broadcast's
   end, hit@k vs a chance level, clip and moment recall@k, delay check, false suppressions,
   `--grid` combos, table/JSON) + `backtest_cli` (`clipper-detector backtest`: the live read
-  helpers -> `run_stream`; engine with `default_transaction_read_only`).
+  helpers -> `run_stream`; engine with `default_transaction_read_only`; `--export-drafts FILE`:
+  every draft of the base params as JSON, no scoring, for the judge's eval labelling).
   `services/judge/` (`clipper_judge`, DESIGN §19). Pure part (6b): `params` (`JudgeParams`),
   `inputs` (`JudgeInputs`, one round in memory), `transcript` (sentences `S1…`, snapping
   lookups), `answer` (`JudgeAnswer`, the model's schema), `prompt` (`build_request` -> versioned,
@@ -82,8 +83,15 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   deadlines), `rounds` (`JudgeHandler`: one judge job advances one clip), `revisions`
   (`ReviseHandler`: patches -> v+1 + render job; `RevisionSource`, `review_events` not built
   yet), `service` (`JudgeService`: N job runners on `judge` + `revise_plan`, waiter, heartbeat).
-  `evalset` (eval fixtures: one round's `JudgeInputs` as JSON, labels TOML/JSON) + `evaluate`
-  (`clipper-judge eval`: read-only DB or fixtures -> agreement, repairs, latency, usage).
+  `evalset` (eval fixtures: one round's `JudgeInputs` as JSON, labels TOML/JSON, detector drafts
+  as cases) + `evaluate` (`clipper-judge eval`: read-only DB or fixtures, `--drafts` -> agreement,
+  repairs, latency, usage), `label` + `label_page.html` (`clipper-judge label prepare|serve`: blind
+  labelling set, videos cut from the chunks, a 127.0.0.1 page writing `labels.json`; sets live in
+  the gitignored `data/labels/`). Shadow runs (`CLIPPER_JUDGE_SHADOW`, `adapters.make_shadows`,
+  `rounds`: same inputs, `shadow` rows, best effort); operator-instruction revisions
+  (`prompts/v1/revise.md`, `prompt.build_revision_request`, `resolver.resolve_instruction`); the
+  heartbeat queues `notify` jobs for `credential_expiring` (`CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES`:
+  a setup token reports no expiry) and `model_off`.
   Compose service `judge` (profile `judge`; the image pins the native Claude Code CLI 2.1.330 by
   sha256, runs as uid 10001, volume `judge-claude` = the CLI's own HOME). `render`/`notify` jobs
   queue until renderer/review exist. Integration tests: `tests/conftest.py` (`world` fixture;
@@ -135,6 +143,10 @@ docker compose up -d --build judge          # profile judge (CLIPPER_JUDGE_MODEL
                                             # claude-cli needs CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN in .env
 uv run clipper-judge eval --labels labels.toml [--report r.json --csv r.csv]   # read-only, fake model
 uv run clipper-judge eval --fixtures dir/ --labels labels.toml --model claude-cli --yes   # your plan
+uv run clipper-detector backtest --stream 2415 --params loose.toml --export-drafts drafts.json
+uv run clipper-judge label prepare --stream 2415 --drafts drafts.json --out data/labels/v1
+uv run clipper-judge label serve data/labels/v1 --open      # http://127.0.0.1:8765, blind labels
+uv run clipper-judge eval --labels data/labels/v1/labels.json --drafts data/labels/v1/drafts.json
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).

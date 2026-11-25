@@ -305,7 +305,7 @@ class World:
         kw.setdefault("concurrency", 1)
         return JudgeSettings(_env_file=None, **kw)
 
-    def service(self, model: JudgeModel, **kw: Any) -> JudgeService:
+    def service(self, model: JudgeModel, *, shadows: Sequence[Any] = (), **kw: Any) -> JudgeService:
         return JudgeService(
             self.sessions,
             self.store,
@@ -315,6 +315,7 @@ class World:
             dsn=self.db_settings.database_dsn,
             clock=self.clock,
             revisions=self.revisions,
+            shadows=shadows,
         )
 
     async def run_jobs(self, service: JudgeService, limit: int = 20) -> int:

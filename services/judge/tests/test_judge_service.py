@@ -627,7 +627,7 @@ async def test_refused_revisions_notify_and_write_no_plan(world, sessions):
     world.revisions.events.update(
         {
             602: Revision(clip_id=clip.id, patch={"title": "Stale base"}),
-            603: Revision(clip_id=clip.id, instruction="start 3 s earlier, punchier hook"),
+            603: Revision(clip_id=clip.id, instruction="   "),
             604: Revision(clip_id=clip.id, patch={"title": "x", "sparkle": True}),
             605: Revision(clip_id=clip.id, patch={"title": "both"}, instruction="and this"),
         }
@@ -646,7 +646,7 @@ async def test_refused_revisions_notify_and_write_no_plan(world, sessions):
         assert n.dedupe_key == dedupe_key(JobKind.NOTIFY, event, NoticeKind.REVISION_REFUSED.value)
         assert n.payload["kind"] == "revision_refused" and n.payload["clip_id"] == clip.id
     assert "not the clip's latest plan" in notices[602].payload["text"]
-    assert "free-text revisions are not supported yet" in notices[603].payload["text"]
+    assert "the instruction is empty" in notices[603].payload["text"]
     assert "the patch is not valid" in notices[604].payload["text"]
     assert "either a patch or an instruction" in notices[605].payload["text"]
     assert len(await world.jobs(JobKind.RENDER)) == 2  # v1 and v2 only

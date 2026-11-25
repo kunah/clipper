@@ -112,12 +112,14 @@ class Caller:
         settings: JudgeSettings,
         *,
         clock: Clock,
+        shadow: bool = False,
     ) -> None:
         self.sessions = sessions
         self.store = store
         self.model = model
         self.settings = settings
         self.clock = clock
+        self.shadow = shadow  # a shadow run's calls (`judge_calls.shadow`)
         self.calls = 0
         self.errors = 0
 
@@ -282,10 +284,12 @@ class Caller:
                 error=error,
                 io_key=io_key,
                 provider_request_id=request_id,
+                shadow=self.shadow,
             )
         log.info(
             "judge call",
             call_id=call_id,
+            shadow=self.shadow,
             request_hash=request_hash[:12],
             model=self.model.name,
             final=request.final,
@@ -316,6 +320,7 @@ class Caller:
             "options": dict(self.model.options),
             "clip_id": clip_id,
             "stream_id": stream_id,
+            "shadow": self.shadow,
             "at": self.clock().isoformat(),
             "request": request.as_dict(),
             "response": None

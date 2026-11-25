@@ -539,3 +539,51 @@ async def test_a_six_hour_stream_takes_well_under_a_minute(sessions, read_only, 
     (warning,) = st["warnings"]
     assert "past the last viewer clip" in warning
     assert elapsed < 60
+
+
+async def test_export_drafts_writes_every_draft_without_scoring(
+    sessions, read_only, tmp_path, capsys
+):
+    """`--export-drafts`: the base params' drafts (emitted and suppressed) of each stream, the
+    same the backtest drafts, also for a stream without viewer clips; nothing is written."""
+    cid, sid = await setup_stream(sessions)
+    # a later stream with chat but without viewer clips (the backtest can't score it)
+    bare = await add_stream(sessions, cid, at(2 * 3600), at(3 * 3600))
+    later = ChatSim(
+        random.Random(3), at(2 * 3600), channel_id=cid, stream_id=None, emote_names=EMOTES
+    )
+    later.chatter(0, 1800, 5, NORMAL)
+    burst(later, FUNNY, 900, factor=5)
+    await store_chat(sessions, later)
+    before = await snapshot(sessions)
+    path = tmp_path / "out" / "drafts.json"
+    args = backtest_cli.parse_args(["--stream", str(sid), "--export-drafts", str(path)])
+    cfg = backtest_cli.configure(args, DetectorSettings(_env_file=None))
+    out = io.StringIO()
+    assert await backtest_cli.export_drafts(args, read_only, cfg, out=out, now=NOW) == 0
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["format"] == "clipper-detector-drafts" and doc["version"] == 1
+    assert doc["streams"] == [sid] and doc["params"] == "code defaults"
+    (replayed,) = await backtest_cli.backtest_stream(read_only, sid, cfg, now=NOW)
+    expected = sorted(replayed.run.drafts, key=lambda d: d.peak_utc)
+    got = sorted(doc["drafts"], key=lambda d: d["peak_utc"])
+    assert [d["id"] for d in got] == [backtest_cli.draft_id(d) for d in expected]
+    assert [d["status"] for d in got] == [str(d.status) for d in expected]
+    first = got[0]
+    assert first["id"] == f"d{sid}-{int(expected[0].peak_utc.timestamp())}"
+    assert datetime.fromisoformat(first["window_from"]) == expected[0].window_from
+    assert set(first) >= {"trigger", "moment_from", "moment_to", "chat_delay_s", "features"}
+    assert f"stream {sid}: {len(expected)} drafts" in out.getvalue()
+    # a stream without viewer clips (the backtest only lists it) still gives its drafts
+    args = backtest_cli.parse_args(["--stream", str(bare), "--export-drafts", str(path)])
+    out = io.StringIO()
+    assert await backtest_cli.export_drafts(args, read_only, cfg, out=out, now=NOW) == 0
+    bare_doc = json.loads(path.read_text(encoding="utf-8"))
+    assert bare_doc["streams"] == [bare] and bare_doc["drafts"]
+    assert all(d["stream_id"] == bare for d in bare_doc["drafts"])
+    code, listed = await backtest(["--stream", str(bare)], read_only)
+    assert code == 0 and "not scored, no viewer clips" in listed
+    assert await snapshot(sessions) == before  # read-only
+    with pytest.raises(SystemExit):
+        backtest_cli.parse_args(["--stream", "1", "--export-drafts", "x", "--grid", "z_open=3,4"])
+    assert "--export-drafts runs the base params only" in capsys.readouterr().err

@@ -406,6 +406,21 @@ class PlanRow:
     shadow: bool
 
 
+async def shadow_plan_exists(
+    session: AsyncSession, clip_id: int, round_: int, model: str, prompt_version: str
+) -> bool:
+    """A shadow run already planned this round (a retried or requeued job)."""
+    return (
+        await session.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM clip_plans WHERE clip_id = :c AND round = :r"
+                " AND shadow AND model = :m AND prompt_version = :p)"
+            ),
+            {"c": clip_id, "r": round_, "m": model, "p": prompt_version},
+        )
+    ).scalar_one()
+
+
 async def plan_row(session: AsyncSession, plan_id: int) -> PlanRow | None:
     row = (
         await session.execute(

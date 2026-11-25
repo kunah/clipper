@@ -41,6 +41,12 @@ from the base params, so every combination is scored on the same clips. `restart
 Output: a table per stream + a total row (stdout; logs go to stderr), `--json` instead for
 machines (with every candidate and truth clip of a stream unless `--grid`). Exit 2: unknown
 stream/channel, nothing to backtest, an invalid `--params`/`--lexicon`/`--grid`.
+
+`--export-drafts FILE` (no scoring, so streams without viewer clips are fine; not with `--grid`):
+every draft of the base params, emitted and suppressed, of each stream to a JSON file
+(`clipper-detector-drafts` v1; each draft has the `candidates` columns and a stable id
+`d<stream>-<peak epoch s>`). The judge's eval labelling takes them as cases that aren't live
+candidates (`clipper-judge label prepare --drafts`), e.g. with looser `--params` for negatives.
 """
 
 from __future__ import annotations
@@ -90,7 +96,7 @@ from clipper_detector.backtest import (
     unhashed,
 )
 from clipper_detector.lexicon import Lexicon
-from clipper_detector.merge import resolve_delay
+from clipper_detector.merge import CandidateDraft, resolve_delay
 from clipper_detector.params import DetectorParams, detector_version, load_params
 from clipper_detector.pipeline import StreamRun, run_seconds, run_stream
 from clipper_detector.reads import ChannelInfo, StreamInfo
@@ -173,6 +179,13 @@ def add_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
         help="k = ceil(N x chat hours) for hit@k and the sort (4; 2/h and 8/h are shown too)",
     )
     b.add_argument("--json", action="store_true", help="JSON instead of the table")
+    b.add_argument(
+        "--export-drafts",
+        type=Path,
+        metavar="FILE",
+        help="no scoring: write every draft of the base params (emitted and suppressed) to FILE "
+        "(JSON), also for streams without viewer clips",
+    )
     return b
 
 
@@ -188,6 +201,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if (args.since or args.until) and not args.channel:
         parser.error("--since/--until go with --channel")
+    if getattr(args, "export_drafts", None) and args.grid:
+        parser.error("--export-drafts runs the base params only (no --grid)")
 
 
 @dataclass(frozen=True)
@@ -711,6 +726,111 @@ def truth_details(
 # --------------------------------------------------------------------------- the command
 
 
+# --------------------------------------------------------------------------- drafts export
+
+DRAFTS_FORMAT = "clipper-detector-drafts"
+DRAFTS_VERSION = 1
+
+
+def draft_id(d: CandidateDraft) -> str:
+    """Stable across exports of the same stream: the stream and the peak (whole seconds)."""
+    return f"d{d.stream_id}-{int(ensure_utc(d.peak_utc).timestamp())}"
+
+
+def draft_json(d: CandidateDraft) -> dict[str, Any]:
+    return {
+        "id": draft_id(d),
+        "stream_id": d.stream_id,
+        "channel_id": d.channel_id,
+        "source": str(d.source),
+        "status": str(d.status),
+        "suppress_reason": None if d.suppress_reason is None else str(d.suppress_reason),
+        "trigger": d.trigger,
+        "peak_utc": d.peak_utc,
+        "chat_peak_utc": d.chat_peak_utc,
+        "chat_delay_s": d.chat_delay_s,
+        "delay_source": str(d.delay_source),
+        "moment_from": d.moment_from,
+        "moment_to": d.moment_to,
+        "window_from": d.window_from,
+        "window_to": d.window_to,
+        "score": d.score,
+        "moment_type": str(d.moment_type),
+        "features": d.features,
+        "detector_version": d.detector_version,
+    }
+
+
+async def replay_base(
+    sessions: async_sessionmaker[AsyncSession], stream_id: int, cfg: Config, *, now: datetime
+) -> StreamRun:
+    """The base params over one stream, without scoring (viewer clips not needed)."""
+    p = cfg.base
+    async with sessions() as session:
+        data = await load_stream(session, stream_id, now=now, params=[p])
+        if data.chat_span is None:
+            log.info("drafts: no chat rows", stream_id=stream_id)
+            return StreamRun()
+        lexicon = cfg.lexicon.for_channel(data.channel.login)
+        prior = await prior_for(session, data, p)
+        episodes, _, _ = run_seconds(
+            data.seconds, p, started_at=data.stream.started_at, prior=prior
+        )
+        wins = [windows(ep, p) for ep in episodes]
+        messages, events = await stage2_rows(
+            session, data, [w.messages for w in wins], [w.events for w in wins]
+        )
+    return run_stream(
+        data.seconds,
+        messages,
+        events,
+        params=p,
+        lexicon=lexicon,
+        stream_id=data.stream.id,
+        channel_id=data.channel.id,
+        delay=resolve_delay(data.channel.chat_delay_s, data.learned, p),
+        detector_version=detector_version(p, cfg.lexicon),
+        started_at=data.stream.started_at,
+        prior=prior,
+    )
+
+
+async def export_drafts(
+    args: argparse.Namespace,
+    sessions: async_sessionmaker[AsyncSession],
+    cfg: Config,
+    *,
+    out: IO[str] | None = None,
+    now: datetime | None = None,
+) -> int:
+    out = out or sys.stdout
+    now = now or utc_now()
+    async with sessions() as session:
+        ids = await stream_ids(session, args)
+    drafts: list[dict[str, Any]] = []
+    for sid in ids:
+        run = await replay_base(sessions, sid, cfg, now=now)
+        emitted = len(run.emitted)
+        drafts += [draft_json(d) for d in run.drafts]
+        print(
+            f"stream {sid}: {len(run.drafts)} drafts ({emitted} emitted, "
+            f"{len(run.drafts) - emitted} suppressed), {len(run.episodes)} episodes",
+            file=out,
+        )
+    doc = {
+        "format": DRAFTS_FORMAT,
+        "version": DRAFTS_VERSION,
+        "params": cfg.params_source,
+        "detector_version": detector_version(cfg.base, cfg.lexicon),
+        "streams": ids,
+        "drafts": drafts,
+    }
+    args.export_drafts.parent.mkdir(parents=True, exist_ok=True)
+    args.export_drafts.write_text(dumps(doc) + "\n", encoding="utf-8")
+    print(f"{len(drafts)} drafts written to {args.export_drafts}", file=out)
+    return 0
+
+
 async def run_backtest(
     args: argparse.Namespace,
     sessions: async_sessionmaker[AsyncSession],
@@ -812,6 +932,8 @@ async def amain(args: argparse.Namespace) -> int:
         return 2
     engine = create_engine(settings, connect_args=READ_ONLY)
     try:
+        if getattr(args, "export_drafts", None):
+            return await export_drafts(args, session_factory(engine), cfg)
         return await run_backtest(args, session_factory(engine), cfg)
     except UsageError as exc:
         print(f"[error] {exc}", file=sys.stderr)

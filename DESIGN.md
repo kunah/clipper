@@ -4,7 +4,7 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-22):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
+> **Status (2026-11-25):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
 > unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill).
 > **Deployed for testing 2026-11-21** (user's OK; from branch `transcriber` @1778961, so compose runs
 > from that worktree until it is merged): live DB migrated to 0005; controller, chat-ingest and
@@ -25,11 +25,17 @@ judges, edits and publishes short vertical clips.
 > revisions by patch; compose profile `judge`, 2026-11-22) built; 6c is not deployed (no image
 > built, nothing enqueues judge jobs while the detector runs with `JUDGE_JOBS=0`). 6d's buildable
 > part (the Claude Code CLI adapter `ClaudeCliModel`, its startup auth check, the image's pinned
-> CLI 2.1.330, `clipper-judge eval`) built 2026-11-22, tested on a fake `claude` only: the first
-> real run (the setup token in `.env`, the "to verify" points, the eval with Opus) is next.
+> CLI 2.1.330, `clipper-judge eval`) built 2026-11-22; **first real run 2026-11-25** (the setup
+> token in `.env`, natively and in the built image: auth, canaries, hardening flags, the overage
+> reading's place; Opus on 3 real candidates, ~7–10 s and ~$0.07 list price each). 6e built
+> 2026-11-25 (§19 build item 5): notices (token expiry, model off), shadow runs, operator-
+> instruction revisions, the detector's drafts export and the blind labelling tool; the first
+> label set (75 cases: 50 candidates of streams 2415/1930/1412 + 25 loose-param drafts) waits
+> for the user's labels, then the Opus eval, then live judging (decided 2026-11-25). Recording is
+> off for now (user's answer, 2026-11-25); Postgres and object storage run. Migration 0006 is on
+> the live DB (seen 2026-11-25).
 > Migration 0006
-> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22, not on the live DB yet: it goes
-> on before the chat-ingest redeploy that ships it.
+> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -301,8 +307,10 @@ backtest CLI, `clipper-detector backtest`) built 2026-11-22, not run on real dat
 stream 803), tuning the defaults needs that; judge build item 6a (contracts, migration 0005, lifecycle helper)
 built 2026-11-20, 6b (input builder + resolver, pure) 2026-11-21, 6c (the judge service with a
 deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, 6d's buildable part
-(Claude Code CLI adapter, pinned CLI in the image, `clipper-judge eval`) 2026-11-22, see §19; next
-the first real CLI run and `clipper-judge eval` with Opus on ≥ 50 labelled candidates. Designs (all proposed 2026-11-19, not yet agreed):
+(Claude Code CLI adapter, pinned CLI in the image, `clipper-judge eval`) 2026-11-22, its first real
+run and 6e (notices, shadow runs, instruction revisions, drafts export, blind labelling)
+2026-11-25, see §19; next the user's labels on the first set (75 cases), `clipper-judge eval` with
+Opus on them, prompt fixes, then live judging. Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -2091,8 +2099,10 @@ No new notify channel: the jobs NOTIFY (`clipper_jobs`) wakes the judge.
 builder + resolver, pure) built 2026-11-21; build item 6c (the service with a deterministic fake
 model) built 2026-11-22, not deployed (image not built; compose service `judge` under profile
 `judge`); 6d's buildable part (`ClaudeCliModel`, the startup auth check, the pinned CLI in the
-image, `clipper-judge eval`) built 2026-11-22 against a fake `claude` (image not built, the real CLI
-never run); its first real run is next. **Decided by the user (2026-11-21):** the first real model
+image, `clipper-judge eval`) built 2026-11-22 against a fake `claude`; first real run and image
+build 2026-11-25; 6e (notices, shadow runs, instruction revisions, drafts export, blind
+labelling: build item 5) built 2026-11-25. Next: the user labels the first set, the Opus eval,
+then live judging (render jobs off until the renderer exists). **Decided by the user (2026-11-21):** the first real model
 runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
 **usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
 guard"). Also decided (2026-11-21): the model is **Opus** (pinned full id), **no usage
@@ -2794,6 +2804,70 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
      fake model and the CLI adapter incl. utilization deltas, retries and the stop at a usage
      limit, the database mode on a READ ONLY engine with context growth and unchanged tables,
      `not_ready`/`--partial`, `no_video`, `amain`'s engine).
+5. **6e The rest of the judge before review (built 2026-11-25; the user's answers that day)**.
+   The first real CLI run is recorded under "First real run (2026-11-25)" above (hardening
+   flags, the overage reading after the answer, the setup token's expiry from settings).
+   - **Notices**: see "Notices" in build item 4 (`credential_expiring`, `model_off`).
+   - **Shadow runs** (`CLIPPER_JUDGE_SHADOW`, JSON list of `{model?, effort?, prompt?}`; unset
+     fields are the main judge's; one identical to the judge or to another shadow, or an alias
+     model id, is refused at start): `adapters.make_shadows` builds one adapter each (the CLI:
+     another model id/effort, the same token and config dir). After a committed round
+     (`JudgeHandler._commit` returns True), each shadow judges **the same `JudgeInputs`** with
+     its prompt, the resolver's one retry included, inline in the same job (the CLI runs one call
+     at a time anyway): `judge_calls` and `clip_plans` rows with `shadow = true` (the plan takes a
+     version; `clips.plan_version`, the clip's status and the render jobs are untouched; the
+     usage guard's call counts leave shadows out). **Best effort**: skipped while a real call
+     would wait (`UsageGuard.shadow_block`: the overage latch; with caps set, no fresh reading or
+     one over a cap: shadows never refresh one), skipped when the round has a shadow plan of that
+     model and prompt already (a requeued job), and a failure is logged (heartbeat
+     `shadow.failed`), never the clip's or the job's problem. Heartbeat: `shadows` (labels
+     `model[@effort]/prompt`) and `shadow` (verdict counts, skipped, failed). Not in the eval:
+     `clipper-judge eval --claude-model/--effort/--prompt` compares models offline.
+   - **Instruction revisions** (`revisions.ReviseHandler`, the model and guard passed in by the
+     service): `prompt.build_revision_request` = `prompts/v{N}/revise.md` (the input document of
+     a final round, the base plan in the answer's form via `plan_as_answer`, emphasis as
+     sentence id + word of this transcript, and the instruction, angle brackets replaced, cut to
+     1000 chars; version `v{N}r-<sha8>` over system, revise.md, the line format and the final
+     schema, so `v1` stayed `v1-fb681fb1`), the final schema (`judge_revision`); through the call
+     cache; the resolver's one retry; `resolver.resolve_instruction` (the answer resolved with
+     the contract's 3-180 s and no core fallback; the base's word fixes kept, and its music gain
+     and ducking while the mood stays). Plan v+1: author `judge`, `instruction`, `parent_id`,
+     `review_event_id`, `judge_call_id`, the render job at `JUDGE_CONTEXT`. Refused with
+     `notify(REVISION_REFUSED)`: an empty instruction, no model, a `reject` answer (its first
+     reason quoted), no usable answer after the retry, a usage limit (with the reset time), the
+     overage latch (no call made), the model switched off or a permanent error, and the job's
+     last attempt after provider errors (`ModelError` otherwise retries through the queue). The
+     usage guard counts the call (a normal row) and never blocks it with its caps.
+   - **Detector drafts export** (`clipper-detector backtest --export-drafts FILE`, read-only,
+     no scoring, so streams without viewer clips work; not with `--grid`): every draft of the base
+     params, emitted and suppressed, with the `candidates` columns and a stable id
+     `d<stream>-<peak epoch s>` (`clipper-detector-drafts` v1). First run 2026-11-25 with
+     `z_open = 3, floor_viewer_fraction = 0` (`data/labels/loose_params.toml`) on streams 2415,
+     1930, 1412: 85 drafts (17 emitted, 68 suppressed: weak 45, subs 9, vote 6, raid 5,
+     copypasta 3). `evalset.load_drafts` makes each a `CandidateInfo` with id 0;
+     `clipper-judge eval --drafts FILE` judges them from the database like candidates (with a
+     selection: every draft of the file; with labels only: the labelled ones, an unknown
+     labelled draft id is an error).
+   - **Blind labelling** (`clipper-judge label prepare|serve`, decided 2026-11-25): `prepare`
+     (read-only DB, object storage, ffmpeg) takes the emitted candidates of `--stream`/
+     `--candidate` and up to `--max-drafts` (25) drafts at least `--min-gap-s` (90) from every
+     other case's peak in their stream, spread over time; cases without video near the moment
+     (the `no_video` rule) are left out. Each case's video = its round-0 context cut from the
+     chunks, one piece per chunk (a recording gap is a jump; the page maps video time to UTC
+     through the pieces), 540p30 H.264 (NVENC when ffmpeg has it, else libx264), AAC; a video
+     already cut for the same context is kept (`video/<key>.json`). Writes `cases.json` and
+     `drafts.json` (the set's drafts, for `eval --drafts`). `serve`: a page on 127.0.0.1 only
+     (`label_page.html`, package data; byte ranges for the player): video with the moment band
+     and T marked, mark in/out, clip/reject/unlabel, a note, keyboard keys; blind: no case id,
+     kind, stream id, trigger, score or model answer reaches the page, and cases are ordered by
+     an opaque key (`k` + sha1 of the case id), which mixes candidates and drafts. Every change
+     rewrites `labels.json` atomically (evalset's JSON form, the cut in seconds from T, plus
+     `at`). The set lives in the gitignored `data/labels/`; its videos are clips of a real
+     stream and are never published.
+   - **Tests**: `test_judge_shadow.py` (5), `test_judge_revision.py` (5), `test_judge_label.py`
+     (6, the prepare/eval one with tiny ffmpeg test videos as chunks), a drafts-export test in
+     the detector's `test_detector_backtest_cli.py`; the CLI tests follow the recorded event
+     order.
 
 ### Proposed decision-log rows
 

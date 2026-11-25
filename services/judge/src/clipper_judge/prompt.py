@@ -12,6 +12,10 @@ fences, on one line per item, with angle brackets replaced (`transcript.clean_te
 Prompt versions: `clipper_judge/prompts/v{N}/` holds `system.md` and `user.md` (a
 `string.Template`); `prompt_version` = `v{N}-{sha8}` over both texts, the code's line format
 (`INPUT_FORMAT`) and both answer schemas, so editing any of them shows in every plan and hash.
+An optional `revise.md` is the operator-instruction revision (§19 "Revisions",
+`build_revision_request`): the same document, the current plan in the answer's form and the
+instruction; its own version `v{N}r-{sha8}` (system, revise.md, the line format, the final
+schema), so adding it leaves `v{N}` as it was.
 `request_hash(model, request, options)` = sha256 over the model name, the provider options
 (temperature, reasoning effort, ...: everything that changes the answer) and the canonical
 request (prompt version, schema version, system, user, schema, max tokens):
@@ -34,7 +38,15 @@ from string import Template
 from typing import Any
 
 from clipper_core.chat import is_command, is_mention, normalised_text, strip_links, user_key
-from clipper_core.contracts import CaptionStyle, LayoutKind, MusicMood, SoundGroup
+from clipper_core.contracts import (
+    CLIP_MAX,
+    CLIP_MIN,
+    CaptionStyle,
+    EditPlan,
+    LayoutKind,
+    MusicMood,
+    SoundGroup,
+)
 from clipper_core.timeline import Interval, ensure_utc, merge, uncovered
 from clipper_judge.answer import ANSWER_SCHEMA_VERSION, answer_schema
 from clipper_judge.inputs import ChatMessageLike, JudgeInputs, bridge_jitter
@@ -53,6 +65,8 @@ class PromptTemplate:
     version: str  # "v1-<sha8>"
     system: str
     user: Template
+    revise: Template | None = None  # revise.md, when the directory has one
+    revise_version: str | None = None  # "v1r-<sha8>"
 
 
 @cache
@@ -72,7 +86,29 @@ def load_prompt(name: str = PROMPT) -> PromptTemplate:
     ):
         digest.update(part.encode("utf-8"))
         digest.update(b"\0")
-    return PromptTemplate(name, f"{name}-{digest.hexdigest()[:8]}", system, Template(user))
+    revise = revise_version = None
+    revise_file = base.joinpath("revise.md")
+    if revise_file.is_file():
+        text = revise_file.read_text(encoding="utf-8").replace("\r\n", "\n")
+        rd = hashlib.sha256()
+        for part in (
+            system,
+            text,
+            str(INPUT_FORMAT),
+            str(ANSWER_SCHEMA_VERSION),
+            _canonical(answer_schema(True)),
+        ):
+            rd.update(part.encode("utf-8"))
+            rd.update(b"\0")
+        revise, revise_version = Template(text), f"{name}r-{rd.hexdigest()[:8]}"
+    return PromptTemplate(
+        name,
+        f"{name}-{digest.hexdigest()[:8]}",
+        system,
+        Template(user),
+        revise,
+        revise_version,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,27 +204,133 @@ def render_user(
     """The user content: the input document."""
     template = template or load_prompt()
     final = inputs.round >= params.max_rounds if final is None else final
-    transcript = Transcript(
-        inputs.words,
-        inputs.context,
-        pause_s=params.sentence_pause_s,
-        max_s=params.sentence_max_s,
-    )
     doc = _Doc(inputs, params, final=final)
-    return template.user.substitute(
-        meta=doc.meta(),
-        options=doc.options(),
-        media=doc.media(),
-        transcript=doc.transcript(transcript.sentences),
-        bucket=_num(params.chat_bucket_s),
-        chat=doc.chat(),
-        sound_min=_num(params.sound_min),
-        loud_db=_num(params.loud_db),
-        music_risk=_num(params.music_risk),
-        audio=doc.audio(),
-        rounds=doc.rounds(),
-        task=doc.task(),
+    return template.user.substitute(**_sections(doc), rounds=doc.rounds(), task=doc.task())
+
+
+def _sections(doc: _Doc) -> dict[str, str]:
+    """The input document's sections, shared by the rounds' and the revision's templates."""
+    p, i = doc.p, doc.i
+    transcript = Transcript(i.words, i.context, pause_s=p.sentence_pause_s, max_s=p.sentence_max_s)
+    return {
+        "meta": doc.meta(),
+        "options": doc.options(),
+        "media": doc.media(),
+        "transcript": doc.transcript(transcript.sentences),
+        "bucket": _num(p.chat_bucket_s),
+        "chat": doc.chat(),
+        "sound_min": _num(p.sound_min),
+        "loud_db": _num(p.loud_db),
+        "music_risk": _num(p.music_risk),
+        "audio": doc.audio(),
+    }
+
+
+INSTRUCTION_CHARS = 1000  # an operator's instruction is cut to this length
+
+
+def build_revision_request(
+    inputs: JudgeInputs,
+    base: EditPlan,
+    instruction: str,
+    params: JudgeParams = DEFAULT_PARAMS,
+    *,
+    version: int,
+    prompt: str = PROMPT,
+) -> JudgeRequest:
+    """The operator-instruction revision of `base` (version `version` of its clip): the clip's
+    inputs as a final round's, the plan in the answer's form, the instruction; the final schema
+    (clip or reject). `ValueError` when the prompt directory has no `revise.md`."""
+    template = load_prompt(prompt)
+    if template.revise is None or template.revise_version is None:
+        raise ValueError(f"prompt {prompt!r} has no revise.md: free-text revisions not supported")
+    doc = _Doc(inputs, params, final=True)
+    plan = json.dumps(plan_as_answer(base, inputs, params), ensure_ascii=False, indent=1)
+    user = template.revise.substitute(
+        **_sections(doc),
+        version=str(version),
+        plan=_fence_safe(plan),
+        instruction=_fence_safe(instruction.strip()[:INSTRUCTION_CHARS]) or "(empty)",
+        min_s=_num(CLIP_MIN.total_seconds()),
+        max_s=_num(CLIP_MAX.total_seconds()),
     )
+    return JudgeRequest(
+        prompt_version=template.revise_version,
+        schema_version=ANSWER_SCHEMA_VERSION,
+        final=True,
+        system=template.system,
+        user=user,
+        schema_name="judge_revision",
+        schema=answer_schema(True),
+        max_tokens=params.max_output_tokens,
+    )
+
+
+def _fence_safe(text: str) -> str:
+    """Angle brackets replaced (as `transcript.clean_text` does), so no `</data>` can close a
+    fence early; control characters other than newlines and tabs removed."""
+    out = text.replace("<", "\u2039").replace(">", "\u203a")
+    return "".join(ch for ch in out if ch in "\n\t" or ch.isprintable())
+
+
+def plan_as_answer(
+    plan: EditPlan, inputs: JudgeInputs, params: JudgeParams = DEFAULT_PARAMS
+) -> dict[str, Any]:
+    """`plan` in the answer's form (`answer.FinalJudgeAnswer`, seconds relative to T), so the
+    model can change what the operator asks and keep the rest. Emphasised words become
+    (sentence id, word) of this input's transcript; a word no sentence holds is left out."""
+    t = inputs.anchor
+
+    def rel(ts: datetime) -> float:
+        return round((ensure_utc(ts) - t).total_seconds(), 1)
+
+    transcript = Transcript(
+        inputs.words, inputs.context, pause_s=params.sentence_pause_s, max_s=params.sentence_max_s
+    )
+    by_start = {
+        ensure_utc(w.start_utc): (s.id, w.text) for s in transcript.sentences for w in s.words
+    }
+    emphasis = []
+    for e in plan.emphasis:
+        hit = by_start.get(ensure_utc(e.start_utc))
+        if hit is not None:
+            emphasis.append({"sentence": hit[0], "word": clean_text(hit[1]), "kind": e.kind})
+    hook: dict[str, Any] = {"mode": plan.hook.mode.value}
+    if plan.hook.text:
+        hook["text"] = plan.hook.text
+    if plan.hook.start_utc is not None and plan.hook.end_utc is not None:
+        hook["from_s"], hook["to_s"] = rel(plan.hook.start_utc), rel(plan.hook.end_utc)
+    layout: dict[str, Any] = {"kind": plan.layout.kind.value}
+    if plan.layout.focus_x is not None:
+        layout["focus_x"] = plan.layout.focus_x
+    return {
+        "reasons": list(plan.reasons),
+        "verdict": "clip",
+        "confidence": plan.confidence,
+        "plan": {
+            "in_s": rel(plan.in_utc),
+            "out_s": rel(plan.out_utc),
+            "title": plan.title,
+            "hook": hook,
+            "hashtags": list(plan.hashtags),
+            "caption_style": plan.caption_style.value,
+            "emphasis": emphasis,
+            "zooms": [
+                {
+                    "from_s": rel(z.start_utc),
+                    "to_s": rel(z.end_utc),
+                    "scale": z.scale,
+                    "target": z.target,
+                }
+                for z in plan.zooms
+            ],
+            "sfx": [{"at_s": rel(c.at_utc), "tag": c.tag} for c in plan.sfx],
+            "music_mood": None if plan.music is None else plan.music.mood.value,
+            "layout": layout,
+            "thumbnail_s": None if plan.thumbnail_utc is None else rel(plan.thumbnail_utc),
+            "moment_type": plan.moment_type.value,
+        },
+    }
 
 
 # --------------------------------------------------------------------------- formatting

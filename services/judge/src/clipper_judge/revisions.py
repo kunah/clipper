@@ -11,11 +11,18 @@ holds a `patch` (`contracts.PlanPatch`) or an `instruction` (free text), and rev
   fields it doesn't know) or can't be cut (`resolve_patch` -> `PatchRefused`: also when the
   video is gone, since the cut is clamped to the chunks that still have video);
 - a patch -> `resolve_patch` (author `operator`, the contract's 3-180 s, only the moved edges
-  snapped) -> one transaction: `clip_plans` v+1 (`parent_id` = the base, `review_event_id`),
-  `clips.plan_version`, the `render` job at `JUDGE_CONTEXT` (a human waits).
-- an instruction (one model call on the plan + the same input, author `judge`) is **not built
-  yet** (6c): it is refused with a notice. It needs a prompt version with a revision section
-  (6d or later).
+  snapped);
+- an instruction (built 2026-11-25) -> one model call (`prompt.build_revision_request`: the
+  clip's inputs, the base plan in the answer's form, the instruction; prompt version
+  `v{N}r-<sha8>`) through the call cache, the resolver's one retry included, then
+  `resolve_instruction` (author `judge`, the contract's 3-180 s, the base's word fixes kept).
+  Refused (with the notice) when the model rejects or gives no usable revision, the plan's usage
+  limit is reached, extra usage is latched (the guard's overage latch), or the model is switched
+  off. The call is counted by the usage guard (a normal `judge_calls` row), never blocked by its
+  caps: a human waits. Other provider errors retry through the job queue; the job's last attempt
+  refuses with the notice;
+- then one transaction: `clip_plans` v+1 (`parent_id` = the base, `review_event_id`,
+  `instruction`), `clips.plan_version`, the `render` job at `JUDGE_CONTEXT` (a human waits).
 
 Where revisions come from is a `RevisionSource`: `ReviewEventsSource` reads `review_events`
 (refusing to run while that table doesn't exist), tests pass their own.
@@ -46,9 +53,27 @@ from clipper_core.jobs import ClaimedJob, PermanentJobError
 from clipper_core.logs import get_logger, log_context
 from clipper_core.timeline import utc_now
 from clipper_judge import reads, writes
+from clipper_judge.calls import Caller, CallOutcome
+from clipper_judge.guard import UsageGuard
+from clipper_judge.inputs import JudgeInputs
+from clipper_judge.model import (
+    JudgeModel,
+    ModelError,
+    ModelUnavailableError,
+    PermanentModelError,
+    UsageLimitError,
+)
 from clipper_judge.params import JudgeParams
+from clipper_judge.prompt import build_revision_request, request_hash, retry_request
 from clipper_judge.reads import ClipRow, ObjectStore, PlanRow
-from clipper_judge.resolver import PatchRefused, resolve_patch
+from clipper_judge.resolver import (
+    PatchRefused,
+    Planned,
+    Rejected,
+    Unrepairable,
+    resolve_instruction,
+    resolve_patch,
+)
 from clipper_judge.settings import JudgeSettings
 
 log = get_logger(__name__)
@@ -99,6 +124,14 @@ class Refused(Exception):
     """The revision is refused: the operator gets a notice."""
 
 
+@dataclass(frozen=True, slots=True)
+class _Revised:
+    plan: EditPlan
+    author: PlanAuthor
+    call_id: int | None = None
+    instruction: str | None = None
+
+
 class ReviseHandler:
     def __init__(
         self,
@@ -109,6 +142,8 @@ class ReviseHandler:
         source: RevisionSource | None = None,
         clock: Clock = utc_now,
         params: JudgeParams | None = None,
+        model: JudgeModel | None = None,
+        guard: UsageGuard | None = None,
     ) -> None:
         self.sessions = sessions
         self.store = store
@@ -116,6 +151,11 @@ class ReviseHandler:
         self.source = source or ReviewEventsSource()
         self.clock = clock
         self.params = params or settings.params()
+        self.model = model  # None: free-text instructions are refused
+        self.guard = guard or UsageGuard(settings)
+        self.caller = (
+            None if model is None else Caller(sessions, store, model, settings, clock=clock)
+        )
         self.revised = 0
         self.refused = 0
 
@@ -129,6 +169,12 @@ class ReviseHandler:
                 await self.revise(payload)
             except Refused as exc:
                 await self._refuse(payload, str(exc))
+            except PermanentJobError:
+                raise
+            except Exception as exc:
+                if job.attempts >= job.max_attempts:  # the operator hears of it
+                    await self._refuse(payload, f"the judge kept failing: {exc}"[:500])
+                raise
 
     async def revise(self, p: RevisePlanPayload) -> int | None:
         """The new plan's id (None: already applied earlier). Raises `Refused`."""
@@ -150,15 +196,12 @@ class ReviseHandler:
             base = await reads.plan_row(s, p.base_plan_id)
             self._check(p, revision, clip, base)
             assert base is not None and base.plan is not None
-            if revision.instruction is not None:
-                raise Refused(
-                    "free-text revisions are not supported yet (judge build item 6c); "
-                    "edit the fields instead"
-                )
-            try:
-                patch = PlanPatch.model_validate(revision.patch)
-            except ValidationError as exc:
-                raise Refused(f"the patch is not valid: {_short(exc)}") from exc
+            patch = None
+            if revision.patch is not None:
+                try:
+                    patch = PlanPatch.model_validate(revision.patch)
+                except ValidationError as exc:
+                    raise Refused(f"the patch is not valid: {_short(exc)}") from exc
             cand = await reads.candidate(s, clip.candidate_id)
             if cand is None:
                 raise PermanentJobError(f"candidate {clip.candidate_id} does not exist")
@@ -175,10 +218,113 @@ class ReviseHandler:
                 audio_only=self.settings.judge_audio_only,
             )
         base_plan = EditPlan.model_validate(base.plan)
-        res = resolve_patch(base_plan, patch, inputs, self.params)
-        if isinstance(res, PatchRefused):
-            raise Refused(res.error)
-        plan = res.plan
+        if patch is not None:
+            res = resolve_patch(base_plan, patch, inputs, self.params)
+            if isinstance(res, PatchRefused):
+                raise Refused(res.error)
+            revised = _Revised(res.plan, PlanAuthor.OPERATOR)
+        else:
+            assert revision.instruction is not None
+            revised = await self._instruction(clip, base, base_plan, inputs, revision.instruction)
+        return await self._write(p, revision, clip, base, revised)
+
+    # ------------------------------------------------------------------ an instruction
+
+    async def _instruction(
+        self,
+        clip: ClipRow,
+        base: PlanRow,
+        base_plan: EditPlan,
+        inputs: JudgeInputs,
+        instruction: str,
+    ) -> _Revised:
+        if self.model is None or self.caller is None:
+            raise Refused("free-text revisions need the judge's model; edit the fields instead")
+        if not instruction.strip():
+            raise Refused("the instruction is empty")
+        try:
+            first = build_revision_request(
+                inputs,
+                base_plan,
+                instruction,
+                self.params,
+                version=base.version,
+                prompt=self.settings.prompt,
+            )
+        except ValueError as exc:
+            raise Refused(str(exc)) from exc
+        request, error = first, None
+        for attempt in range(2):
+            if attempt:
+                request = retry_request(first, error or "")
+            outcome = await self._ask(request, clip)
+            if outcome.answer is None:
+                error = outcome.error or "invalid answer"
+                continue
+            res = resolve_instruction(
+                outcome.answer,
+                base_plan,
+                inputs,
+                self.params,
+                model=self.model.name,
+                prompt_version=request.prompt_version,
+            )
+            if isinstance(res, Rejected):
+                why = res.reasons[0] if res.reasons else "no reason given"
+                raise Refused(f"the judge didn't revise the plan: {why}")
+            if isinstance(res, Unrepairable):
+                error = res.error
+                continue
+            assert isinstance(res, Planned)
+            return _Revised(res.plan, PlanAuthor.JUDGE, outcome.call_id, instruction.strip())
+        raise Refused(f"no usable revision after one retry: {error}")
+
+    async def _ask(self, request: Any, clip: ClipRow) -> CallOutcome:
+        assert self.model is not None and self.caller is not None
+        h = request_hash(self.model.name, request, self.model.options)
+        cached = await self.caller.cached(h, request)
+        if cached is not None:
+            log.info("revision answer reused from an earlier call", call_id=cached.call_id)
+            return cached
+        now = self.clock()
+        latched = self.guard.overage_until
+        if latched is not None and now < latched:  # money, not our caps
+            raise Refused(
+                f"the plan reported extra usage (billed): the judge holds every call until "
+                f"{latched:%Y-%m-%d %H:%M} UTC; send the instruction again then"
+            )
+        try:
+            outcome = await self.caller.call(
+                request, request_hash=h, clip_id=clip.id, stream_id=clip.stream_id
+            )
+        except UsageLimitError as exc:
+            self.guard.observe(exc.rate_limit)
+            when = "" if exc.resets_at is None else f" until {exc.resets_at:%Y-%m-%d %H:%M} UTC"
+            raise Refused(
+                f"the Claude plan's usage limit is reached{when}; send the instruction again then"
+            ) from exc
+        except ModelUnavailableError as exc:
+            raise Refused(f"the judge's model is switched off: {exc}") from exc
+        except PermanentModelError as exc:
+            self.guard.observe(exc.rate_limit)
+            raise Refused(f"the model failed: {exc}") from exc
+        except ModelError as exc:
+            self.guard.observe(exc.rate_limit)
+            raise  # the job queue retries; its last attempt refuses
+        self.guard.observe(outcome.rate_limit)
+        return outcome
+
+    # ------------------------------------------------------------------ the write
+
+    async def _write(
+        self,
+        p: RevisePlanPayload,
+        revision: Revision,
+        clip: ClipRow,
+        base: PlanRow,
+        revised: _Revised,
+    ) -> int | None:
+        plan = revised.plan
         async with self.sessions.begin() as s:
             cur = await reads.clip_for_update(s, clip_id=clip.id)
             assert cur is not None
@@ -200,9 +346,11 @@ class ReviseHandler:
                 confidence=plan.confidence,
                 reasons=plan.reasons,
                 repairs=plan.repairs,
-                author=PlanAuthor.OPERATOR,
+                author=revised.author,
                 parent_id=base.id,
                 review_event_id=p.review_event_id,
+                instruction=revised.instruction,
+                judge_call_id=revised.call_id,
             )
             await s.execute(
                 text(
@@ -222,6 +370,7 @@ class ReviseHandler:
             plan_id=plan_id,
             version=version,
             parent_id=base.id,
+            author=revised.author.value,
             repairs=len(plan.repairs),
             render_job=render_job,
         )

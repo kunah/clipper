@@ -275,6 +275,28 @@ session pings first. Tests run with `CLIPPER_DATABASE_URL` pointed at a nonexist
 - 2026-11-21: the five-hour usage limit stopped the agents mid-task (the `channel` fix round);
   continued after the reset at 21:50Z.
 
+## Session 2026-11-25 (judge, single session in this worktree)
+
+Your answers (DESIGN §15, 2026-11-25): blind labelling page; build instruction revisions, shadow
+runs and the token-expiry notice now; live judging only after the eval; recording stays off
+(stream 2415 is enough), Postgres + object storage started (`docker start`, nothing else).
+- Done: first real CLI run (2338ef6; natively 2.1.331 and in the judge image 2.1.330, built from
+  `../clips-deploy` @29a04ad, not deployed): DESIGN §19 "First real run (2026-11-25)". Real eval
+  of 3 candidates with Opus: 2 clip, 1 reject, ~7–10 s, ~$0.07 list price each.
+- Done: 6e (DESIGN §19 build item 5): notices, shadow runs, instruction revisions, detector
+  `--export-drafts`, `clipper-judge label prepare|serve`, `eval --drafts`. 762 tests (judge,
+  detector, core, db) pass.
+- Label set `data/labels/v1` (gitignored, 1.6 GB): 75 cases (50 candidates of 2415/1930/1412,
+  25 drafts from `data/labels/drafts_loose.json`). **Waiting for your labels**:
+  `uv run clipper-judge label serve data/labels/v1 --open`.
+- Next after the labels: `uv run clipper-judge eval --labels data/labels/v1/labels.json --drafts
+  data/labels/v1/drafts.json --model claude-cli --yes --report data/labels/v1/eval-opus.json`,
+  prompt work (likely `prompts/v2/`), maybe `--effort` comparison; then live judging
+  (`CLIPPER_DETECTOR_JUDGE_JOBS=1`, `CLIPPER_JUDGE_MODEL=claude-cli`, `CLIPPER_JUDGE_RENDER_JOBS=0`).
+- `.env` here: `CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN` (yours) and `CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES=
+  2027-11-25` (added by me: a setup token lasts a year; the CLI reports no expiry).
+  `../clips-deploy/.env` doesn't have the token yet (needed when the judge is deployed).
+
 ## Next
 
 - Done 2026-11-21 after the resume: `channel` list-only (b556ed4); `calibrate` reads fMP4 VODs

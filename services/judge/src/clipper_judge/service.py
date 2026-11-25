@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -34,6 +34,7 @@ from clipper_core.jobs import JobRunner
 from clipper_core.logs import get_logger
 from clipper_core.timeline import ensure_utc, utc_now
 from clipper_judge import writes
+from clipper_judge.adapters import Shadow
 from clipper_judge.guard import UsageGuard
 from clipper_judge.model import JudgeModel, ReportsStatus
 from clipper_judge.prompt import load_prompt
@@ -79,6 +80,7 @@ class JudgeService:
         dsn: str,
         clock: Clock = utc_now,
         revisions: RevisionSource | None = None,
+        shadows: Sequence[Shadow] = (),
     ) -> None:
         self.sessions = sessions
         self.model = model
@@ -99,9 +101,18 @@ class JudgeService:
             clock=clock,
             params=self.params,
             stats=self.stats,
+            shadows=shadows,
         )
+        self.shadow_labels = [s.label for s in shadows]
         self.revise = ReviseHandler(
-            sessions, store, settings, source=revisions, clock=clock, params=self.params
+            sessions,
+            store,
+            settings,
+            source=revisions,
+            clock=clock,
+            params=self.params,
+            model=model,
+            guard=self.guard,
         )
         self.waiter = Waiter(sessions, settings, dsn=dsn, clock=clock, params=self.params)
         self.noticed: set[tuple[NoticeKind, int]] = set()  # notices queued by this process
@@ -131,6 +142,7 @@ class JudgeService:
             render_jobs=s.render_jobs,
             judge_audio_only=s.judge_audio_only,
             usage_guard=self.guard.enabled,
+            shadows=self.shadow_labels,
         )
         workers = {
             asyncio.create_task(r.run(stop), name=f"runner-{i}"): f"runner-{i}"
@@ -183,6 +195,8 @@ class JudgeService:
             "retries": self.stats.retries,
             "deferred": self.stats.deferred,
             "outcomes": dict(self.stats.outcomes),
+            "shadows": self.shadow_labels,
+            "shadow": dict(self.stats.shadow),
             "revisions": {"revised": self.revise.revised, "refused": self.revise.refused},
             "waiting_clips": waiting,
             "waiter": {"listening": self.waiter.listening, "enqueued": self.waiter.enqueued},

@@ -337,6 +337,52 @@ def resolve_patch(
     return PatchRefused(res.error) if isinstance(res, Unrepairable) else res
 
 
+def resolve_instruction(
+    answer: JudgeAnswer,
+    base: EditPlan,
+    inputs: JudgeInputs,
+    params: JudgeParams = DEFAULT_PARAMS,
+    *,
+    model: str,
+    prompt_version: str,
+) -> Planned | Rejected | Unrepairable:
+    """The model's revision of `base` after an operator's free-text instruction (§19
+    "Revisions", author `judge`): the answer resolved like a round's, but with the contract's
+    length bounds (3-180 s: the operator may ask for a long or short clip) and no core fallback;
+    what only an operator sets is kept from `base`: the caption word fixes, and the music's gain
+    and ducking while the mood stays. `Rejected`: the model didn't answer `clip` (the revision is
+    refused, the clip keeps its plan)."""
+    r = _Repairs()
+    reasons = _reasons(answer.reasons, params, r)
+    confidence = _clamp01(answer.confidence, r)
+    if answer.verdict is not Verdict.CLIP:
+        return Rejected(ClipRejectReason.MODEL, reasons, confidence, r.codes())
+    if answer.plan is None:
+        return Unrepairable("a revision answers verdict clip with the whole revised plan")
+    ctx = _Ctx(inputs, params)
+    draft = _draft_from_answer(answer.plan, ctx, r)
+    draft.word_fixes = list(base.word_fixes)
+    if base.music is not None and draft.music is not None and draft.music.mood == base.music.mood:
+        draft.music = base.music
+    lengths = (CLIP_MIN.total_seconds(), CLIP_MAX.total_seconds())
+    segments = _cut(draft.in_utc, draft.out_utc, True, True, ctx, r, lengths)
+    if segments is None:
+        return Unrepairable(
+            f"no cut of at least {CLIP_MIN.total_seconds():g} s fits the video and the speech "
+            "there: choose in_s and out_s inside one of the video ranges listed under Media"
+        )
+    return _finish(
+        draft,
+        segments,
+        ctx,
+        r,
+        model=model,
+        prompt_version=prompt_version,
+        reasons=reasons,
+        confidence=confidence,
+    )
+
+
 def extend_context(
     ask: ContextAsk | None,
     inputs: JudgeInputs,

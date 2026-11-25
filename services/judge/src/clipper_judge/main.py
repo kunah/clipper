@@ -2,6 +2,7 @@
 
     clipper-judge                 # the service (CLIPPER_JUDGE_MODEL = fake | claude-cli)
     clipper-judge eval ...        # read-only: the judge over labelled candidates (evaluate)
+    clipper-judge label prepare|serve ...   # a blind labelling set for the eval (label)
 
 CLIPPER_JUDGE_MODEL = fake (deterministic rules) or claude-cli (the Claude Code CLI on the user's
 subscription, `clipper_judge.claude_cli`). With claude-cli the service first runs `claude auth
@@ -23,8 +24,8 @@ from clipper_core.db import create_engine, session_factory
 from clipper_core.logs import get_logger, setup_logging
 from clipper_core.runtime import run, stop_event_on_signals
 from clipper_core.storage import ObjectStore
-from clipper_judge import evaluate
-from clipper_judge.adapters import check_model, make_model, settings_for_model
+from clipper_judge import evaluate, label
+from clipper_judge.adapters import check_model, make_model, make_shadows, settings_for_model
 from clipper_judge.prompt import load_prompt
 from clipper_judge.service import SERVICE, JudgeService
 from clipper_judge.settings import JudgeSettings
@@ -41,6 +42,7 @@ async def amain() -> int:
         js = settings_for_model(JudgeSettings())
         model = make_model(js)
         load_prompt(js.prompt)
+        shadows = make_shadows(js)
     except (ValueError, OSError) as exc:  # ValidationError, unknown model, missing prompt dir
         log.error("invalid judge configuration (CLIPPER_JUDGE_*)", error=str(exc))
         return 1
@@ -56,6 +58,7 @@ async def amain() -> int:
             js,
             worker_id=settings.worker_id,
             dsn=settings.database_dsn,
+            shadows=shadows,
         )
         return await service.run(stop)  # 1: a runner or the waiter died (compose restarts it)
     finally:
@@ -69,14 +72,21 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     sub = p.add_subparsers(dest="cmd", metavar="command")
     ev = evaluate.add_parser(sub)
+    lab = label.add_parser(sub)
     args = p.parse_args(list(argv))
     if args.cmd == "eval":
         evaluate.check_args(ev, args)
+    if args.cmd == "label":
+        label.check_args(lab, args)
     return args
 
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
+    if args.cmd == "label":
+        with contextlib.suppress(KeyboardInterrupt):
+            sys.exit(label.main(args))
+        return
     if args.cmd == "eval":
         # titles and chat: a cp1252 console or pipe must not crash the report
         for stream in (sys.stdout, sys.stderr):

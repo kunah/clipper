@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import date
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from clipper_judge.params import JudgeParams
 
@@ -20,6 +21,30 @@ MODELS = (FAKE, CLAUDE_CLI)
 CLAUDE_MODEL = "claude-opus-5-5"
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 DEFAULT_CLAUDE_CONFIG_DIR = Path("~/.clipper/judge-claude")
+
+
+class ShadowSpec(BaseModel):
+    """One shadow run (DESIGN §19 "Shadow runs"): another model, effort and/or prompt judging the
+    same inputs as the real round; stored (`shadow = true`), never rendered. Unset fields are the
+    main judge's."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model: str | None = None  # a full model id (claude-cli), e.g. "claude-sonnet-5-5"
+    effort: Effort | None = None
+    prompt: str | None = None  # a prompt directory, e.g. "v2"
+
+    def resolved(self, settings: JudgeSettings) -> tuple[str, str | None, str]:
+        main_model = settings.claude_model if settings.model == CLAUDE_CLI else settings.model
+        return (
+            self.model or main_model,
+            self.effort if self.effort is not None else settings.claude_effort,
+            self.prompt or settings.prompt,
+        )
+
+    def label(self, settings: JudgeSettings) -> str:
+        model, effort, prompt = self.resolved(settings)
+        return f"{model}" + (f"@{effort}" if effort else "") + f"/{prompt}"
 
 
 def check_config_dir(path: Path | str | None, *, home: Path | None = None) -> Path:
@@ -99,6 +124,11 @@ class JudgeSettings(BaseSettings):
     # kills the call (UsageLimitError until the window resets) and the usage guard holds every
     # call until then, caps or not, with a heartbeat warning.
     claude_allow_overage: bool = False
+    # Shadow runs (env CLIPPER_JUDGE_SHADOW, JSON, e.g. '[{"model": "claude-sonnet-5-5"},
+    # {"prompt": "v2"}]'): each judges every round's inputs after the round is committed, best
+    # effort (skipped while the usage guard holds; a failure is only logged). Calls and plans get
+    # `shadow = true`; nothing renders them. Empty: none.
+    shadow: Annotated[list[ShadowSpec], NoDecode] = Field(default_factory=list)
     # Enqueue the `render` job with every `clip` plan. Nothing runs them until the renderer
     # exists (§20): they just queue.
     render_jobs: bool = True
@@ -158,6 +188,19 @@ class JudgeSettings(BaseSettings):
             return None
         return value
 
+    @field_validator("shadow", mode="before")
+    @classmethod
+    def _shadow_json(cls, value: Any) -> Any:
+        # the environment's text is decoded here (NoDecode), so compose's empty ${VAR:-} is none
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return []
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError as exc:
+                raise ValueError(f"CLIPPER_JUDGE_SHADOW is not JSON: {exc}") from exc
+        return value
+
     @field_validator("claude_config_dir", mode="before")
     @classmethod
     def _blank_dir_is_default(cls, value: Any) -> Any:
@@ -183,6 +226,19 @@ class JudgeSettings(BaseSettings):
         self.params()  # JudgeParams validates its own ranges
         if self.model == CLAUDE_CLI:
             check_config_dir(self.claude_config_dir)
+        main = (
+            self.claude_model if self.model == CLAUDE_CLI else self.model,
+            self.claude_effort,
+            self.prompt,
+        )
+        seen = {main}
+        for spec in self.shadow:
+            got = spec.resolved(self)
+            if self.model == CLAUDE_CLI and not got[0].startswith("claude-"):
+                raise ValueError(f"shadow model must be a full model id, not {got[0]!r}")
+            if got in seen:
+                raise ValueError(f"shadow {spec.label(self)} repeats the judge or another shadow")
+            seen.add(got)
         return self
 
     @property

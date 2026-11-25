@@ -110,6 +110,27 @@ class UsageGuard:
             Defer(min(until, hard_deadline), "extra usage (overage) reported: held until reset")
         )
 
+    def shadow_block(self, now: datetime) -> str | None:
+        """Why a shadow run's call must not go now (None: it may). Shadows are best effort: they
+        never wait and never refresh a reading; they go only when a real call would go now
+        without waiting: no overage latch, and with usage caps set a fresh reading under them."""
+        if self.overage_until is not None and now < self.overage_until:
+            return "extra usage (overage) reported"
+        s = self.settings
+        if s.usage_five_hour_max is None and s.usage_seven_day_max is None:
+            return None
+        r = self.reading
+        if r is None or (now - r.observed_at).total_seconds() > s.usage_stale_s:
+            return "no fresh usage reading"
+        over = _over("five_hour", r.five_hour, s.usage_five_hour_max) or _over(
+            "seven_day", r.seven_day, s.usage_seven_day_max
+        )
+        if over is not None:
+            return f"usage {over[0]} over the cap"
+        if r.status != ALLOWED:
+            return f"usage status {r.status}"
+        return None
+
     def call_done(self) -> None:
         """The call this guard let through finished without a reading."""
         self._refreshing = False

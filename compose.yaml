@@ -203,6 +203,7 @@ services:
       CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES: ${CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES:-}
       CLIPPER_JUDGE_CLAUDE_MODEL: ${CLIPPER_JUDGE_CLAUDE_MODEL:-claude-opus-5-5}
       CLIPPER_JUDGE_CLAUDE_EFFORT: ${CLIPPER_JUDGE_CLAUDE_EFFORT:-}   # empty: the CLI's default
+      CLIPPER_JUDGE_SHADOW: ${CLIPPER_JUDGE_SHADOW:-}   # JSON list of {model, effort, prompt}
       CLIPPER_JUDGE_CLAUDE_CONFIG_DIR: /var/lib/clipper-judge
     volumes:
       - judge-claude:/var/lib/clipper-judge   # the CLI's own HOME/config (not the user's ~/.claude)
