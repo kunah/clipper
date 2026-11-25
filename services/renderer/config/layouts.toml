@@ -1,0 +1,26 @@
+# Renderer layouts (DESIGN §20 "Layouts"). Mounted read-only into the renderer at /config; it is
+# read for every render (edits need no restart) and its sha256 goes into each render.
+#
+# Rects are normalised source rects (0..1 of the source frame's width/height), so 720p and 1080p
+# sources share one config. Fit a channel's facecam with
+#   uv run clipper-renderer layout-preview <login> --at <utc>
+# which draws the rects on a frame of a recorded chunk.
+#
+# Choice per render: the plan's layout hint where the config allows it; `auto` -> the category's
+# layout, else the channel's `default`, else facecam_gameplay when a facecam rect exists, else
+# the `default` below.
+
+version = 1
+default = "blurred_fit"   # PROPOSED: the whole frame, full width, over a blurred copy
+
+# Example (not fitted yet: ohnepixel's rect is build item 7c, with the user):
+#
+# [channels.ohnepixel]
+# facecam = { x = 0.0, y = 0.0, w = 0.25, h = 0.30 }   # where the cam sits in the source
+# default = "facecam_gameplay"
+# split = 0.396              # top panel (facecam) share of the 1920 px height (760 px)
+# gameplay_focus_x = 0.5     # the gameplay crop's centre (0 = left, 1 = right)
+#
+# [channels.ohnepixel.categories."Just Chatting"]
+# layout = "full_crop"       # a 9:16 crop of the whole frame
+# focus_x = 0.5

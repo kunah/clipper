@@ -297,6 +297,18 @@ runs and the token-expiry notice now; live judging only after the eval; recordin
   2027-11-25` (added by me: a setup token lasts a year; the CLI reports no expiry).
   `../clips-deploy/.env` doesn't have the token yet (needed when the judge is deployed).
 
+## Session 2026-11-25, later (renderer 7a + 7b, this worktree)
+
+Your task: DESIGN §20 build items 7a and 7b; taste defaults proposed, 7c/7d wait for you.
+- Done: 7a (DESIGN §20 build item 1): contracts, migration 0007 (not on the live DB), core
+  assets, the renderer's pure parts with goldens. Found: ffmpeg's TS seek lands one GOP late
+  (fixed with a 5 s pre-roll + timestamp trims); the chunk origin is its first audio sample.
+- Proposed taste defaults (for your sign-off with real renders): captions bold_pop = Montserrat
+  Black 92 px, white, black outline 7, the spoken word yellow #FFD21F popping to 118 % in 80 ms,
+  emphasis green #3DF06B, uppercase, 1-3 words / <= 16 characters per page at y 1300; title band
+  Montserrat ExtraBold 62/54/46 px (by length) in a 70 %-opaque black box; text hook white on red
+  for 2.6 s; layouts: blurred_fit unless `layouts.toml` says otherwise (facecam panel 760 px).
+
 ## Next
 
 - Done 2026-11-21 after the resume: `channel` list-only (b556ed4); `calibrate` reads fMP4 VODs

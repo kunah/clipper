@@ -1,0 +1,21 @@
+[project]
+name = "clipper-renderer"
+version = "0.1.0"
+description = "Renders edit plans into 9:16 clips with ffmpeg: exact UTC time map, layouts, ASS captions, loudness (DESIGN §20)."
+requires-python = ">=3.12"
+dependencies = [
+    "clipper-core",
+]
+
+[project.scripts]
+clipper-renderer = "clipper_renderer.main:main"
+
+[tool.uv.sources]
+clipper-core = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clipper_renderer"]

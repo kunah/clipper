@@ -51,6 +51,21 @@ class keys:
         name = request_hash if suffix is None else f"{request_hash}.{suffix}"
         return f"{prefix}/{name}.json"
 
+    @staticmethod
+    def clip_pinned_video(clip_id: int, seq: int) -> str:
+        """The renderer's copy of a chunk's video that a clip uses (`renders.pinned_keys`, §20):
+        the chunk's own video goes with the blind ~48 h retention, the pinned copy with the
+        clip's (re-renders after review still work)."""
+        return f"clips/{clip_id}/pinned/{seq:06d}.ts"
+
+    @staticmethod
+    def render_file(clip_id: int, render_id: int, name: str) -> str:
+        """One output of a render (§20): `clip.mp4`, `preview.mp4`, `thumb.jpg`,
+        `captions.ass`, `render.json`. `name` is a plain file name."""
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name) or ".." in name:
+            raise ValueError(f"not a plain file name: {name!r}")
+        return f"clips/{clip_id}/renders/{render_id}/{name}"
+
 
 class ObjectStore:
     def __init__(self, settings: Settings) -> None:
@@ -113,6 +128,14 @@ class ObjectStore:
 
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self.bucket, Key=key)
+
+    def copy(self, src_key: str, dst_key: str) -> None:
+        """Server-side copy inside the bucket (S3 CopyObject: nothing passes through this
+        process; objects up to 5 GB, a ~60 s chunk is ~60 MB). Raises botocore's ClientError
+        (code `NoSuchKey`/`404`) when `src_key` doesn't exist."""
+        self._client.copy_object(
+            Bucket=self.bucket, Key=dst_key, CopySource={"Bucket": self.bucket, "Key": src_key}
+        )
 
     def presigned_url(self, key: str, expires_s: int = 3600) -> str:
         return self._client.generate_presigned_url(

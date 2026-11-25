@@ -71,6 +71,8 @@ def test_check_constraints_match_models(db_url, fresh_database):
         assert ("clips", f"ck_clips_{name}") in declared
     for name in ("verdict", "plan", "context_request", "author"):
         assert ("clip_plans", f"ck_clip_plans_{name}") in declared
+    for name in ("status", "unrenderable_reason", "done_outputs"):
+        assert ("renders", f"ck_renders_{name}") in declared
     assert migrated == declared
 
 

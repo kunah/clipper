@@ -16,7 +16,8 @@ Render, review and publication statuses this module doesn't know (added after it
 so an older reader falls back to the earlier stages' facts. An unknown `clips.status` (a newer
 judge) is an error in `lifecycle_state()`; `lifecycle_states()` logs a warning and leaves that
 clip out. The status sets below are §20-§22's values as text: their enums come with those units
-(7a, 21a, 22a), which may switch these sets over to them.
+(7a, 21a, 22a), which may switch these sets over to them (the render set uses `RenderStatus`
+since 7a).
 
 `lifecycle_states()` costs two round trips: a catalog lookup (which later-stage tables exist yet:
 a database not migrated that far simply has no such facts), then one query.
@@ -29,7 +30,7 @@ from collections.abc import Iterable
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from clipper_core.contracts import ClipStatus, LifecycleState
+from clipper_core.contracts import ClipStatus, LifecycleState, RenderStatus
 from clipper_core.logs import get_logger
 
 log = get_logger(__name__)
@@ -45,10 +46,10 @@ REVIEW_STATES = {
     "revising": LifecycleState.IN_REVIEW,
 }
 RENDER_STATES = {
-    "rendering": LifecycleState.RENDERING,
-    "done": LifecycleState.IN_REVIEW,
-    "failed": LifecycleState.FAILED,
-    "unrenderable": LifecycleState.UNRENDERABLE,
+    RenderStatus.RENDERING.value: LifecycleState.RENDERING,
+    RenderStatus.DONE.value: LifecycleState.IN_REVIEW,
+    RenderStatus.FAILED.value: LifecycleState.FAILED,
+    RenderStatus.UNRENDERABLE.value: LifecycleState.UNRENDERABLE,
 }
 
 # Tables of later stages (migrations 0007, 0008, 0009).

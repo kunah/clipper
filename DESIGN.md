@@ -35,7 +35,10 @@ judges, edits and publishes short vertical clips.
 > off for now (user's answer, 2026-11-25); Postgres and object storage run. Migration 0006 is on
 > the live DB (seen 2026-11-25).
 > Migration 0006
-> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22.
+> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22. Renderer (§20): build item 7a
+> (contracts + migration 0007 `renders` + `clipper_core.assets`, the pure parts of
+> `services/renderer`: time map, layouts, ASS captions, filter graph) built 2026-11-25; 0007 is not
+> on the live DB.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -3117,10 +3120,12 @@ detector's filter helpers (bots, commands, dup normalisation), moved there so bo
 
 ## 20. Renderer (phase 2) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal, nothing built. Time mapping, layouts, captions, the filter graph and the render
-loop can be built and tested now with libx264 on synthetic chunks. NVENC inside Docker Desktop/WSL2
-is **UNVERIFIED** (smoke test 7c; x264 keeps everything working without it). Per-channel layouts,
-caption taste and the SFX/music library need the user.
+**Status:** proposal (not yet agreed). **7a built 2026-11-25** (see build plan item 1: the contract,
+migration 0007, `clipper_core.assets`, and the renderer's pure parts with golden tests). NVENC inside
+Docker Desktop/WSL2 is **UNVERIFIED** (smoke test 7c; x264 keeps everything working without it).
+Per-channel layouts, caption taste and the SFX/music library need the user: the taste values built
+are **PROPOSED defaults** (`styles.py`, `layout.py`, `graph.py` mark them), to be signed off with
+real renders (7c/7d).
 
 **Role.** `services/renderer`, one process per GPU, one `render` job at a time (ref = `clip_plans.id`,
 from the judge or review's re-render). Writer of `renders` (new) and `clips/{id}/pinned/`, `/renders/`;
@@ -3220,7 +3225,37 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
 **Build plan.**
 1. **7a Contracts + 0007 + pure parts** (timemap, layout geometry, ASS builder, graph builder, asset
    manifest + picker). *Done:* golden tests; generated ASS renders through ffmpeg's `ass` filter
-   without warnings; `test_migrations` passes.
+   without warnings; `test_migrations` passes. **Built 2026-11-25:**
+   - Core: `RenderStatus`, `UnrenderableReason`, `RenderSource`/`RenderAsset`/`RenderManifest`,
+     `models.Render` + hand-written `0007_renderer` (apply alone, as 0006 says); `keys.clip_pinned_video`,
+     `keys.render_file` (plain file names only), `ObjectStore.copy` (CopyObject, tested on
+     SeaweedFS); `clipper_core.assets` (manifest models, unknown keys rejected, licence required,
+     `licence_problems`, `file_sha256`, `pick`); lifecycle's render set uses `RenderStatus`; the
+     controller requeues `render` jobs after 20 min. Beyond the contract below: `renders.true_peak_db`,
+     CHECK `done_outputs` (a `done` row has `video_key`, `video_sha256`, `finished_at`),
+     `RenderSource.teaser`, nullable `RenderManifest.loudness_lufs`/`true_peak_db` (silent audio is
+     not normalised).
+   - `services/renderer` (pure): `profiles` (`short_1080x1920`, `test_270x480`; preview bitrate
+     lowered for long clips so it stays <= 19 MB), `timemap` (pieces per range and chunk, jitter
+     fill, gap cuts, overlaps cut from the later chunk, teaser first; *runs* = stretches linear in
+     UTC that map captions, zooms, SFX, the thumbnail), `layout` (+ `config/layouts.toml`, empty:
+     `blurred_fit` everywhere until 7c), `styles` (PROPOSED looks: bundled Montserrat
+     Black/ExtraBold/SemiBold v7.222, OFL, in `fonts/` with their sha256), `captions` (pages, one
+     event per word slice, title band, text hook; emoji and other symbols the fonts lack are left
+     out), `graph` (both ffmpeg commands; paths relative to the job's work dir), `media`
+     (ffmpeg/ffprobe runner, loudnorm parsing), `synthetic` (lavfi chunks: luma = frame index, a
+     1 kHz beep each whole UTC second).
+   - Found while building: **ffmpeg's MPEG-TS seek lands on the keyframe *after* the target**
+     (ffmpeg 9.0.2, synthetic chunks with a 2 s GOP): a plain input `-ss` loses up to a GOP. Each
+     piece now opens 5 s early (`SEEK_PREROLL_S`) and the graph trims by timestamp (they stay
+     anchored to the `-ss` value). The chunk's origin is its **first audio sample** (the
+     transcriber's words count from it): the renderer adds the audio stream's start inside the
+     `.ts` to every offset. libass falls back to system fonts silently (`fontselect: ... ->
+     ArialMT`); the test asserts every selection resolves to a bundled font and that `-v warning`
+     prints nothing; non-font files in `fontsdir` produce errors, so only TTF/OTF files are copied.
+   - Tests: 44 in `services/renderer/tests` (goldens: three ASS files, both passes' commands, the
+     NVENC variant; time map, layouts, paging, counts) + `libs/core/tests/test_renderer_contract.py`,
+     `db/tests/test_migration_renderer.py`.
 2. **7b Render loop, libx264, synthetic chunks.** *Done:* frames at a chunk boundary and at segment
    cuts match the time map ±1 frame (luma index); the beep lands within ±1 frame; −14 ± 1 LUFS,
    TP ≤ −1 dB; the same plan twice → the same `graph_hash` and identical bytes; audio_only →

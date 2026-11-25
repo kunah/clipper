@@ -654,6 +654,78 @@ class PlanPatch(BaseModel):
 _PATCH_NESTED: dict[str, type[BaseModel]] = {"hook": Hook, "layout": LayoutHint, "music": MusicPlan}
 
 
+# --------------------------------------------------------------------------- renderer (§20)
+
+
+class RenderStatus(StrEnum):
+    """`renders.status` (writer: renderer; CHECK). One row per `render` job (`renders.job_id`):
+    a retry resumes it."""
+
+    RENDERING = "rendering"  # the job holds it (also between failed attempts; `renders.error`)
+    DONE = "done"  # outputs uploaded; the `review` job was enqueued in the same transaction
+    FAILED = "failed"  # the job's last attempt failed; `notify(RENDER_FAILED)` went with it
+    UNRENDERABLE = "unrenderable"  # see `renders.unrenderable_reason`; job done, no retry
+
+
+class UnrenderableReason(StrEnum):
+    """`renders.unrenderable_reason` (set iff `unrenderable`; plain text, no CHECK on values)."""
+
+    NO_VIDEO = "no_video"  # no chunk with video under a segment (audio_only, or no chunk at all)
+    VIDEO_EXPIRED = "video_expired"  # retention deleted the video before it was pinned
+
+
+RENDER_MANIFEST_VERSION = 1
+
+
+class RenderSource(StoredModel):
+    """One piece of the output: a trim of one chunk's video (pinned copy) and audio."""
+
+    chunk_id: int
+    seq: int
+    key: str  # the pinned copy that was read (`storage.keys.clip_pinned_video`)
+    start_utc: UtcDatetime  # the chunk's start: offsets inside the chunk count from it (§5)
+    trim_from_s: float  # offsets inside the chunk, [from, to)
+    trim_to_s: float
+    out_at_s: float  # where the piece starts in the output
+    pad_after_s: float = 0.0  # jitter fill after it (last frame held + silence)
+    teaser: bool = False  # part of a teaser hook (plays before the clip)
+
+
+class RenderAsset(StoredModel):
+    id: str
+    kind: Literal["sfx", "music", "font"]
+    sha256: str
+    licence: str | None = None  # the licence's name (sfx/music); fonts: the font licence
+    at_s: float | None = None  # output time (sfx)
+
+
+class RenderManifest(StoredModel):
+    """`render.json` next to each render (`storage.keys.render_file`): everything needed to run it
+    again and to audit it (inputs, layout, assets with their licences, versions)."""
+
+    version: Literal[1] = RENDER_MANIFEST_VERSION
+    render_id: int
+    clip_id: int
+    plan_id: int
+    profile: str
+    renderer_version: str
+    ffmpeg_version: str
+    encoder: str  # h264_nvenc | libx264
+    graph_hash: str
+    layout: dict[str, Any]  # resolved kind + pixel rects
+    layout_config_sha256: str | None
+    sources: list[RenderSource]
+    assets: list[RenderAsset] = Field(default_factory=list)
+    width: int
+    height: int
+    fps: float
+    duration_s: float
+    loudness_lufs: float | None  # None: silent audio, not normalised
+    true_peak_db: float | None
+    video_sha256: str
+    warnings: list[str] = Field(default_factory=list)
+
+
 def recording_lease(channel_id: int) -> str:
     """Lease a recorder holds while it records a channel (only one recorder per channel)."""
     return f"record:channel:{channel_id}"

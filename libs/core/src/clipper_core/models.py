@@ -731,6 +731,75 @@ class ClipPlan(Base):
     created_at: Mapped[datetime] = _created_at()
 
 
+# --------------------------------------------------------------------------- renderer
+
+
+class Render(Base):
+    """One render of a `clip` plan (DESIGN §20), one row per `render` job. Writer: renderer.
+
+    `job_id` is the render job's id (UNIQUE, no FK: a retry of the job resumes the row).
+    `status` (`contracts.RenderStatus`): `rendering` while the job holds it (between failed
+    attempts too, with the last `error`), `done` (outputs uploaded; the `review` job is enqueued
+    in the same transaction), `failed` (the last attempt failed; a `notify(render_failed)` job
+    went with it), `unrenderable` (`unrenderable_reason`, `contracts.UnrenderableReason`:
+    `no_video`, `video_expired`; no retry). Keys: `pinned_keys` = the chunk copies under
+    `clips/{clip_id}/pinned/` (`storage.keys.clip_pinned_video`), the outputs under
+    `clips/{clip_id}/renders/{id}/` (`storage.keys.render_file`). `graph_hash` = sha256 of
+    everything that decides the output (plan, filter graph, captions, inputs, layout config,
+    assets, fonts, versions); `warnings`: e.g. a gap inside a segment (hard cut), a layout
+    fallback. Read by review (§21) and `clipper_core.lifecycle` (the clip's latest render).
+    """
+
+    __tablename__ = "renders"
+    __table_args__ = (
+        Index(None, "clip_id", "created_at"),
+        Index(None, "plan_id"),
+        CheckConstraint("status IN ('rendering', 'done', 'failed', 'unrenderable')", name="status"),
+        CheckConstraint(
+            "(status = 'unrenderable') = (unrenderable_reason IS NOT NULL)",
+            name="unrenderable_reason",
+        ),
+        CheckConstraint(
+            "status <> 'done' OR (video_key IS NOT NULL AND video_sha256 IS NOT NULL"
+            " AND finished_at IS NOT NULL)",
+            name="done_outputs",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    job_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    clip_id: Mapped[int] = mapped_column(ForeignKey("clips.id"))
+    plan_id: Mapped[int] = mapped_column(ForeignKey("clip_plans.id"))
+    profile: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default="rendering")
+    unrenderable_reason: Mapped[str | None] = mapped_column(Text)
+    layout: Mapped[str | None] = mapped_column(Text)  # the resolved contracts.LayoutKind
+    encoder: Mapped[str | None] = mapped_column(Text)  # h264_nvenc | libx264
+    renderer_version: Mapped[str | None] = mapped_column(Text)
+    ffmpeg_version: Mapped[str | None] = mapped_column(Text)
+    graph_hash: Mapped[str | None] = mapped_column(Text)
+    pinned_keys: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    video_key: Mapped[str | None] = mapped_column(Text)
+    preview_key: Mapped[str | None] = mapped_column(Text)
+    thumb_key: Mapped[str | None] = mapped_column(Text)
+    captions_key: Mapped[str | None] = mapped_column(Text)
+    manifest_key: Mapped[str | None] = mapped_column(Text)
+    video_sha256: Mapped[str | None] = mapped_column(Text)
+    duration_s: Mapped[float | None] = mapped_column(Float)
+    fps: Mapped[float | None] = mapped_column(Float)
+    loudness_lufs: Mapped[float | None] = mapped_column(Float)
+    true_peak_db: Mapped[float | None] = mapped_column(Float)
+    render_s: Mapped[float | None] = mapped_column(Float)  # wall clock of the last attempt
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    bytes: Mapped[int | None] = mapped_column(BigInteger)
+    preview_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    warnings: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None]
+
+
 # --------------------------------------------------------------------------- coordination
 
 

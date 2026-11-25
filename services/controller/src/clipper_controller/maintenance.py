@@ -20,6 +20,8 @@ STALE_AFTER = {
     JobKind.JUDGE: timedelta(minutes=10),  # LLM calls; the judge commits each call right after it
     JobKind.DETECT_OFFLINE: timedelta(minutes=30),  # a whole stream's offline pass
     JobKind.REVISE_PLAN: timedelta(minutes=10),  # one judge call at most (an instruction)
+    # pin + two-pass loudnorm + encode; a 3 min clip with x264 on the CPU stays well below it
+    JobKind.RENDER: timedelta(minutes=20),
 }
 
 

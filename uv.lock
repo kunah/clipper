@@ -18,6 +18,7 @@ members = [
     "clipper-detector",
     "clipper-judge",
     "clipper-recorder",
+    "clipper-renderer",
     "clipper-transcriber",
     "clipper-twitch",
 ]
@@ -442,6 +443,17 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "streamlink", specifier = ">=7.0" },
 ]
+
+[[package]]
+name = "clipper-renderer"
+version = "0.1.0"
+source = { editable = "services/renderer" }
+dependencies = [
+    { name = "clipper-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "clipper-core", editable = "libs/core" }]
 
 [[package]]
 name = "clipper-transcriber"

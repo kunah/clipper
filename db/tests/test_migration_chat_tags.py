@@ -114,7 +114,7 @@ def test_a_held_lock_makes_the_upgrade_give_up_and_stay_at_0005(engine, monkeypa
     with engine.connect() as conn:
         assert version(conn) == "0005" and tag_columns(conn, "chat_messages") == {}
     monkeypatch.undo()
-    cli.upgrade(_url(engine))  # once the lock is gone it goes through
+    command.upgrade(cfg, "0006")  # once the lock is gone it goes through
     with engine.connect() as conn:
         assert version(conn) == "0006"
 
