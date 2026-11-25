@@ -9,6 +9,12 @@ shared by the process. The heartbeat (`worker_heartbeats`, service `judge`) carr
 prompt version, the usage guard's last reading and warnings, the round outcomes since start,
 the number of waiting clips and, for an adapter that reports one (`model.ReportsStatus`), the
 model's status (the CLI adapter: version, auth method, credential expiry, warnings).
+
+Notices (`notify` jobs for review, §21; they queue until review exists), from the adapter's
+warnings, in the heartbeat's transaction: `credential_expiring` (the credential ends within 14
+days; one per expiry value) and `model_off` (the adapter switched itself off, judge jobs are held;
+one per UTC day). Deduped by `(ref, kind)` in the queue, and per process so a notice isn't
+re-sent every heartbeat.
 """
 
 from __future__ import annotations
@@ -16,16 +22,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from clipper_core import heartbeat
-from clipper_core.contracts import JobKind
+from clipper_core.contracts import JobKind, NoticeKind
 from clipper_core.jobs import JobRunner
 from clipper_core.logs import get_logger
-from clipper_core.timeline import utc_now
+from clipper_core.timeline import ensure_utc, utc_now
+from clipper_judge import writes
 from clipper_judge.guard import UsageGuard
 from clipper_judge.model import JudgeModel, ReportsStatus
 from clipper_judge.prompt import load_prompt
@@ -40,6 +48,23 @@ log = get_logger(__name__)
 SERVICE = "judge"
 STOP_TIMEOUT_S = 20.0  # on shutdown, jobs in progress get this long to finish (then cancelled)
 Clock = Callable[[], datetime]
+
+
+@dataclass(frozen=True, slots=True)
+class Notice:
+    kind: NoticeKind
+    ref_id: int
+    text: str
+    severity: Literal["info", "warning", "error"]
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return ensure_utc(datetime.fromisoformat(value))
+    except ValueError:
+        return None
 
 
 class JudgeService:
@@ -79,6 +104,7 @@ class JudgeService:
             sessions, store, settings, source=revisions, clock=clock, params=self.params
         )
         self.waiter = Waiter(sessions, settings, dsn=dsn, clock=clock, params=self.params)
+        self.noticed: set[tuple[NoticeKind, int]] = set()  # notices queued by this process
         handlers = {JobKind.JUDGE: self.judge, JobKind.REVISE_PLAN: self.revise}
         n = settings.concurrency
         self.runners = [
@@ -166,6 +192,7 @@ class JudgeService:
         }
 
     async def beat(self) -> None:
+        sent: list[tuple[NoticeKind, int]] = []
         async with self.sessions.begin() as session:
             waiting = await waiting_count(session)
             await heartbeat.beat(
@@ -175,6 +202,55 @@ class JudgeService:
                 started_at=self.started_at,
                 info=self.info(waiting),
             )
+            for notice in self.notices():
+                key = (notice.kind, notice.ref_id)
+                if key in self.noticed:
+                    continue
+                await writes.notify(
+                    session,
+                    notice.kind,
+                    ref_id=notice.ref_id,
+                    text_=notice.text,
+                    severity=notice.severity,
+                )
+                sent.append(key)
+                log.warning("notice queued", kind=notice.kind, ref_id=notice.ref_id)
+        self.noticed.update(sent)  # only once the transaction committed
+
+    def notices(self) -> list[Notice]:
+        """The notices the adapter's warnings call for now (see the module docstring)."""
+        if not isinstance(self.model, ReportsStatus):
+            return []
+        status = self.model.status()
+        warnings = status.get("warnings") or {}
+        out: list[Notice] = []
+        expiring = _parse_iso(warnings.get("credential_expiring"))
+        if expiring is not None:
+            days = max((expiring - self.clock()).total_seconds() / 86400, 0.0)
+            out.append(
+                Notice(
+                    NoticeKind.CREDENTIAL_EXPIRING,
+                    int(expiring.timestamp()),
+                    f"The judge's Claude credential expires {expiring:%Y-%m-%d %H:%M} UTC (in "
+                    f"{days:.0f} days). Run `claude setup-token`, put the new token in .env as "
+                    "CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN (and its date as "
+                    "CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES), then restart the judge.",
+                    "warning",
+                )
+            )
+        off = warnings.get("model_off")
+        if off:
+            since = _parse_iso(status.get("off_since")) or self.clock()
+            out.append(
+                Notice(
+                    NoticeKind.MODEL_OFF,
+                    int(since.timestamp() // 86400),
+                    f"The judge's model is switched off: {off}. Judge jobs are held (clips keep "
+                    "their state) until the judge is restarted with a fix.",
+                    "error",
+                )
+            )
+        return out
 
     @staticmethod
     async def _every(

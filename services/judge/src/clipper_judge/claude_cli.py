@@ -4,13 +4,17 @@
 One headless `claude -p` process per call, no shell:
 
     claude -p --output-format stream-json --verbose --model <id> --tools "" --strict-mcp-config
-           --no-session-persistence --max-turns 3 --system-prompt-file <file> --json-schema <json>
+           --no-session-persistence --max-turns 3 --safe-mode --disable-slash-commands
+           --restricted --system-prompt-file <file> --json-schema <json>
            [--effort <level>] [--max-budget-usd <x>]
 
 with the user content on stdin (closed after writing) and an empty temp dir as the working dir.
 `--json-schema` works through the CLI's built-in StructuredOutput tool (2 turns, hence
-`--max-turns 3`). Never `--bare` (it can't read `CLAUDE_CODE_OAUTH_TOKEN`) and never
-`--fallback-model` (a silent model switch would change verdicts). The CLI has no max-tokens
+`--max-turns 3`; seen 2026-11-25: one model request, the second "turn" is the CLI accepting the
+tool call). `--safe-mode --disable-slash-commands --restricted` (`HARDENING`) leave out
+CLAUDE.md, skills, installed plugins, hooks, MCP servers and settings files. Never `--bare` (it
+can't read `CLAUDE_CODE_OAUTH_TOKEN`) and never `--fallback-model` (a silent model switch would
+change verdicts). The CLI has no max-tokens
 flag: `JudgeRequest.max_tokens` is unused here.
 
 **Environment, built from scratch** (`child_env`): PATH, locale, temp and proxy/CA variables
@@ -30,10 +34,13 @@ pass that session's variables on), never CLAUDE_CODE_RETRY_WATCHDOG.
   held, a heartbeat warning `model_off`). The init event comes before the model request, but the
   CLI may already have sent it: the check bounds the spend to at most one request, it can't
   guarantee none. `model` and `claude_code_version` are recorded.
-- `rate_limit_event` -> the usage reading (`RateLimitReading`). Extra usage beyond the plan
-  (`isUsingOverage`, or the plan refusing while `overageStatus` allows) kills the call with
-  `UsageLimitError` (the window's reset) unless `allow_overage`; the guard then holds every call
-  until that reset (`guard.UsageGuard.hold`).
+- `rate_limit_event` -> the usage reading (`RateLimitReading`); seen 2026-11-25 it comes after
+  the model's response (init > thinking > tool_use > tool result > reading > result). Extra usage
+  beyond the plan (`isUsingOverage`, or the plan refusing while `overageStatus` allows), unless
+  `allow_overage`: before an accepted StructuredOutput call it kills the call with
+  `UsageLimitError` (the window's reset: no further turn is sent); after one the answer is paid
+  already and is kept. Either way the guard then holds every call until that reset
+  (`guard.UsageGuard.hold`).
 - `system/api_retry` -> logged.
 - the final `result`: a `structured_output` is the answer whatever the subtype (a non-success
   subtype is logged). Without one: `error_max_turns` / `error_max_structured_output_retries` and
@@ -80,6 +87,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +129,13 @@ OFF_RETRY_S = 600.0  # a held job (the adapter switched off) comes back after th
 STDERR_TAIL_CHARS = 4000
 STDERR_LINE_CHARS = 500  # each stderr line is cut to this
 NON_JSON_KEPT = 5  # non-JSON stdout lines kept for the record
+ORDER_KEPT = 40  # runs of the event order kept for the record
+STRUCTURED_TOOL = "StructuredOutput"  # the CLI's built-in tool behind --json-schema
+# Fixed hardening flags (checked with 2.1.330/2.1.331 on 2026-11-25: auth and the answer are
+# unchanged): no CLAUDE.md, skills, installed plugins, hooks or MCP servers (`--safe-mode`), no
+# skills or slash commands (`--disable-slash-commands`), no user/project/local settings files
+# (`--restricted`). Not hashed: they don't change what the model is asked.
+HARDENING = ("--safe-mode", "--disable-slash-commands", "--restricted")
 TMP_PREFIX = "clipper-judge-"  # the per-call temp dir (system temp: never inside a checkout)
 ANSWER_SUBTYPES = frozenset({"error_max_turns", "error_max_structured_output_retries"})
 BUDGET_SUBTYPE = "error_max_budget_usd"
@@ -547,9 +562,18 @@ class _Run:
     retries: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     events: Counter[str] = field(default_factory=Counter)
+    order: list[list[Any]] = field(default_factory=list)  # [name, count] runs, in arrival order
     non_json: list[str] = field(default_factory=list)
     exit_code: int | None = None
     stderr: str = ""
+    structured_ids: set[str] = field(default_factory=set)  # StructuredOutput tool_use ids
+    answered: bool = False  # the CLI accepted a StructuredOutput call (its tool result, no error)
+
+    def note(self, name: str) -> None:
+        if self.order and self.order[-1][0] == name:
+            self.order[-1][1] += 1
+        elif len(self.order) < ORDER_KEPT:
+            self.order.append([name, 1])
 
     @property
     def version(self) -> str | None:
@@ -592,6 +616,7 @@ class ClaudeCliModel:
         max_budget_usd: float | None = 0.50,
         system_prompt_file: bool = True,
         allow_overage: bool = False,
+        token_expires_at: datetime | None = None,
         clock: Clock = utc_now,
     ) -> None:
         self.command = list(command)
@@ -608,6 +633,8 @@ class ClaudeCliModel:
         self.auth: AuthStatus | None = None
         self.cli_version: str | None = None
         self.credential_expires_at: datetime | None = None
+        # the configured expiry of the token (the CLI reports none for a setup token)
+        self.token_expires_at = token_expires_at if oauth_token else None
         self.calls = 0
         self.off: str | None = None
         self.off_since: datetime | None = None
@@ -628,6 +655,9 @@ class ClaudeCliModel:
             max_budget_usd=settings.claude_max_budget_usd,
             system_prompt_file=settings.claude_system_prompt_file,
             allow_overage=settings.claude_allow_overage,
+            token_expires_at=None
+            if settings.claude_token_expires is None
+            else datetime.combine(settings.claude_token_expires, dt_time(0), tzinfo=UTC),
         )
 
     # ------------------------------------------------------------------ JudgeModel
@@ -657,6 +687,7 @@ class ClaudeCliModel:
             "--no-session-persistence",
             "--max-turns",
             str(MAX_TURNS),
+            *HARDENING,
         ]
         if system_file is not None:
             args += ["--system-prompt-file", str(system_file)]
@@ -776,6 +807,7 @@ class ClaudeCliModel:
         subtype = event.get("subtype")
         name = f"{kind}/{subtype}" if isinstance(subtype, str) else kind
         run.events[name] += 1
+        run.note(name)
         if run.first_event is None:
             run.first_event = name
             if name != "system/init":
@@ -803,6 +835,18 @@ class ClaudeCliModel:
             }
             run.retries.append(retry)
             log.warning("claude api retry", **retry)
+        elif kind == "assistant":
+            for part in _content(event):
+                if part.get("type") == "tool_use" and part.get("name") == STRUCTURED_TOOL:
+                    run.structured_ids.add(str(part.get("id")))
+        elif kind == "user":
+            for part in _content(event):
+                if (
+                    part.get("type") == "tool_result"
+                    and str(part.get("tool_use_id")) in run.structured_ids
+                    and part.get("is_error") is not True
+                ):
+                    run.answered = True
         elif kind == "rate_limit_event":
             info = event.get("rate_limit_info")
             if isinstance(info, Mapping):
@@ -810,6 +854,17 @@ class ClaudeCliModel:
                 run.reading = parse_reading(info, self.clock())
                 if run.reading.overage and not self.allow_overage:
                     resets = run.reading.refusal_resets_at() or run.reading.resets_at
+                    if run.answered:
+                        # seen 2026-11-25: the reading follows the model's (only) response, so
+                        # the answer is paid already and nothing more will be sent: keep it; the
+                        # reading latches the usage guard (`guard.UsageGuard.observe`)
+                        log.error(
+                            "claude reports extra usage (overage) after the answer: answer kept, "
+                            "later calls are held",
+                            overage_status=run.reading.overage_status,
+                            resets_at=_iso(resets),
+                        )
+                        return
                     log.error(
                         "claude reports extra usage (overage): call killed",
                         overage_status=run.reading.overage_status,
@@ -994,6 +1049,7 @@ class ClaudeCliModel:
                     "api_retries": run.retries,
                     "result": run.result,
                     "events": dict(run.events),
+                    "order": run.order,
                     "non_json_stdout": run.non_json,
                     "exit_code": run.exit_code,
                     "wall_s": None if wall_s is None else round(wall_s, 3),
@@ -1087,10 +1143,13 @@ class ClaudeCliModel:
             self._warn_expiry()
 
     def expires_at(self) -> datetime | None:
-        """The credential's end: the token's (`credential_expires_at` of the last result), else
-        the stored login's (`loginExpiresAt`)."""
+        """The credential's end: what the CLI reported (`credential_expires_at` of the last
+        result), else the token's configured expiry (`claude_token_expires`; the CLI reports
+        none for a setup token), else the stored login's (`loginExpiresAt`)."""
         if self.credential_expires_at is not None:
             return self.credential_expires_at
+        if self.token_expires_at is not None:
+            return self.token_expires_at
         return None if self.auth is None else self.auth.login_expires_at
 
     def warnings(self) -> dict[str, str]:
@@ -1127,6 +1186,7 @@ class ClaudeCliModel:
             "auth_method": None if self.auth is None else self.auth.auth_method,
             "login_expires_at": None if self.auth is None else _iso(self.auth.login_expires_at),
             "credential_expires_at": _iso(self.credential_expires_at),
+            "token_expires_at": _iso(self.token_expires_at),
             "calls": self.calls,
             "off": self.off,
             "off_since": _iso(self.off_since),
@@ -1136,6 +1196,13 @@ class ClaudeCliModel:
 
 def _iso(dt: datetime | None) -> str | None:
     return None if dt is None else dt.isoformat()
+
+
+def _content(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The content parts of an `assistant`/`user` event's message (only the mappings)."""
+    message = event.get("message")
+    parts = message.get("content") if isinstance(message, Mapping) else None
+    return [p for p in parts if isinstance(p, Mapping)] if isinstance(parts, list) else []
 
 
 def _same_path(a: str, b: Path) -> bool:

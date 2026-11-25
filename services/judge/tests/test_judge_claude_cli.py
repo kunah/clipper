@@ -83,13 +83,22 @@ async def test_success_maps_structured_output_usage_and_reading(fake_claude):
     assert cli["version"] == "2.1.330" and cli["exit_code"] == 0
     assert cli["init"]["apiKeySource"] == "none" and cli["result"]["num_turns"] == 2
     assert cli["rate_limit_info"]["unifiedWindows"]["five_hour"]["utilization"] == 0.12
-    assert cli["events"] == {  # both turns of the StructuredOutput tool
+    assert cli["events"] == {  # the order seen on 2026-11-25 (one model response)
         "system/init": 1,
-        "rate_limit_event": 1,
+        "system/thinking_tokens": 1,
         "assistant": 2,
         "user": 1,
+        "rate_limit_event": 1,
         "result/success": 1,
     }
+    assert cli["order"] == [
+        ["system/init", 1],
+        ["system/thinking_tokens", 1],
+        ["assistant", 2],
+        ["user", 1],
+        ["rate_limit_event", 1],
+        ["result/success", 1],
+    ]
     assert cli["first_event"] == "system/init" and r.overage is False
     assert "<request schema>" in cli["argv"]  # the schema isn't stored twice
     json.dumps(response.extras)  # JSON values only (the S3 record)
@@ -108,7 +117,7 @@ async def test_argv_stdin_cwd_and_system_prompt_file(fake_claude):
     await model.judge(req)
     (call,) = fake_claude.calls()
     argv = call["argv"]
-    assert argv[:12] == [
+    assert argv[:15] == [
         "-p",
         "--output-format",
         "stream-json",
@@ -121,6 +130,9 @@ async def test_argv_stdin_cwd_and_system_prompt_file(fake_claude):
         "--no-session-persistence",
         "--max-turns",
         "3",
+        "--safe-mode",  # no CLAUDE.md, skills, installed plugins, hooks, MCP servers
+        "--disable-slash-commands",
+        "--restricted",  # no user/project/local settings files
     ]
     assert argv[argv.index("--effort") + 1] == "high"
     assert argv[argv.index("--max-budget-usd") + 1] == "0.5"
@@ -366,9 +378,10 @@ async def test_rate_limit_retries_or_a_limit_message_are_usage_limits(fake_claud
 
 async def test_timeout_kills_the_whole_process_tree(fake_claude):
     fake_claude.runs({"steps": [{"line": fake_claude.init()}, {"sleep": 60}], "heartbeat": True})
-    model = fake_claude.model(timeout_s=3.0)
+    # 6 s: the fake prints init only once it and its child run (a cold start can take ~3 s)
+    model = fake_claude.model(timeout_s=6.0)
     started = time.monotonic()
-    with pytest.raises(CallTimeoutError, match="timed out after 3 s") as info:
+    with pytest.raises(CallTimeoutError, match="timed out after 6 s") as info:
         await model.judge(request())
     assert time.monotonic() - started < 20
     assert info.value.extras["claude_cli"]["init"]["apiKeySource"] == "none"
@@ -534,6 +547,35 @@ async def test_credential_expiry_from_results_warns(fake_claude):
     assert model.status()["warnings"] == {"credential_expiring": expires.isoformat()}
 
 
+async def test_a_setup_token_expiry_comes_from_the_settings(fake_claude, monkeypatch, tmp_path):
+    # seen 2026-11-25: with a setup token the CLI reports no expiry (null in the result and in
+    # `claude auth status`), so the configured date is used; a value the CLI reports wins
+    now = datetime(2027, 11, 15, 12, tzinfo=UTC)
+    steps = fake_claude.success()
+    steps[-1]["line"]["credential_expires_at"] = None
+    fake_claude.runs(steps)
+    model = fake_claude.model(
+        clock=lambda: now, token_expires_at=datetime(2027, 11, 25, tzinfo=UTC)
+    )
+    await model.judge(request())
+    assert model.expires_at() == datetime(2027, 11, 25, tzinfo=UTC)
+    assert model.status()["warnings"] == {"credential_expiring": "2027-11-25T00:00:00+00:00"}
+    assert model.status()["token_expires_at"] == "2027-11-25T00:00:00+00:00"
+    far = fake_claude.model(clock=lambda: now, token_expires_at=datetime(2028, 1, 1, tzinfo=UTC))
+    assert far.status()["warnings"] == {}
+    # without a token the date means nothing (a stored login has its own expiry)
+    assert fake_claude.model(oauth_token=None, token_expires_at=now).expires_at() is None
+    # settings: a UTC date; blank (compose's ${VAR:-}) is unset
+    monkeypatch.setenv("CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN", "sk-ant-oat01-abc")
+    monkeypatch.setenv("CLIPPER_JUDGE_CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES", "2027-11-25")
+    s = JudgeSettings(_env_file=None, model="claude-cli")
+    built = ClaudeCliModel.from_settings(s)
+    assert built.token_expires_at == datetime(2027, 11, 25, tzinfo=UTC)
+    monkeypatch.setenv("CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES", "")
+    assert JudgeSettings(_env_file=None).claude_token_expires is None
+
+
 # --------------------------------------------------------------------------- pure helpers
 
 
@@ -674,6 +716,37 @@ async def test_overage_kills_the_call_until_the_window_resets(fake_claude):
     )
     with pytest.raises(UsageLimitError, match="overage"):
         await fake_claude.model().judge(request())
+
+
+async def test_overage_after_the_answer_keeps_the_paid_answer(fake_claude):
+    # the real order (2026-11-25): the reading follows the model's only response, so the answer
+    # is paid already; it is kept and the reading (overage) latches the guard in the service
+    fake_claude.runs(
+        fake_claude.success(five_hour=1.0, using_overage=True, overage_status="allowed")
+    )
+    response = await fake_claude.model().judge(request())
+    assert json.loads(response.text) == CLIP
+    assert response.rate_limit.overage is True
+
+
+async def test_overage_after_a_refused_tool_call_kills_the_call(fake_claude):
+    # the CLI refused the StructuredOutput call (schema): another turn would be sent and paid
+    steps = fake_claude.success()
+    fake_claude.runs(
+        {
+            "steps": [
+                *steps[:4],
+                {"line": fake_claude.tool_result(is_error=True)},
+                {"line": fake_claude.rate(1.0, using_overage=True, overage_status="allowed")},
+                {"sleep": 30},  # the next turn must not run
+                *steps[3:],
+            ],
+            "heartbeat": True,
+        }
+    )
+    with pytest.raises(UsageLimitError, match="overage"):
+        await fake_claude.model().judge(request())
+    await assert_tree_dead(fake_claude, 0)
 
 
 async def test_overage_allowed_passes_and_the_users_reading_is_no_overage(fake_claude):
@@ -862,6 +935,34 @@ async def test_a_switched_off_adapter_holds_the_job_and_keeps_the_clip(world, fa
     await svc.beat()
     row = await world.one("SELECT info FROM worker_heartbeats WHERE worker_id = 'judge-test'")
     assert "model_off" in row.info["model_status"]["warnings"]
+
+
+@pytest.mark.integration
+async def test_notices_for_an_expiring_token_and_a_switched_off_model(world, fake_claude):
+    expires = world.at(10 * 86400)
+    model = fake_claude.model(clock=world.clock, token_expires_at=expires)
+    svc = world.service(model)
+    await svc.beat()
+    await svc.beat()  # every heartbeat: still one notice
+    (job,) = await world.jobs(JobKind.NOTIFY)
+    assert job.dedupe_key == f"notify:{int(expires.timestamp())}:credential_expiring"
+    assert job.payload["kind"] == "credential_expiring" and job.payload["severity"] == "warning"
+    assert "claude setup-token" in job.payload["text"] and "in 10 days" in job.payload["text"]
+    await world.service(model).beat()  # a restarted service: the queue dedupes it
+    assert len(await world.jobs(JobKind.NOTIFY)) == 1
+    # the adapter switches itself off on a call: a model_off notice, one per UTC day
+    await world.transcribe_range(-480, 180)
+    await world.candidate()
+    fake_claude.runs([{"line": fake_claude.init(api_key_source="ANTHROPIC_API_KEY")}])
+    assert await world.run_jobs(svc) == 1
+    await svc.beat()
+    await svc.beat()
+    jobs = await world.jobs(JobKind.NOTIFY)
+    assert [j.payload["kind"] for j in jobs] == ["credential_expiring", "model_off"]
+    off = jobs[1]
+    assert off.payload["severity"] == "error" and "apiKeySource" in off.payload["text"]
+    day = int(model.off_since.timestamp() // 86400)
+    assert off.dedupe_key == f"notify:{day}:model_off"
 
 
 @pytest.mark.integration

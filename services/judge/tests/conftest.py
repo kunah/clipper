@@ -492,13 +492,24 @@ class FakeClaude:
         }
 
     @staticmethod
+    def thinking_tokens(estimated: int = 150) -> dict[str, Any]:
+        """Streamed while the model thinks (seen 2026-11-25, before the assistant events)."""
+        return {
+            "type": "system",
+            "subtype": "thinking_tokens",
+            "estimated_tokens": estimated,
+            "estimated_tokens_delta": estimated,
+            "session_id": SESSION,
+        }
+
+    @staticmethod
     def assistant(answer: Any = None) -> dict[str, Any]:
-        """Turn 1: the StructuredOutput tool call (with the answer); turn 2 (`answer` None): the
-        closing text."""
+        """The StructuredOutput tool call (with the answer); `answer` None: the thinking block
+        the CLI prints first (seen 2026-11-25: one model response, two assistant events)."""
         content: list[dict[str, Any]] = (
             [{"type": "tool_use", "id": "toolu_1", "name": "StructuredOutput", "input": answer}]
             if answer is not None
-            else [{"type": "text", "text": "Done."}]
+            else [{"type": "thinking", "thinking": ""}]
         )
         return {
             "type": "assistant",
@@ -508,20 +519,18 @@ class FakeClaude:
         }
 
     @staticmethod
-    def tool_result() -> dict[str, Any]:
-        """Between the turns: the CLI's answer to the StructuredOutput tool call."""
+    def tool_result(*, is_error: bool = False) -> dict[str, Any]:
+        """The CLI accepting (or, `is_error`, refusing) the StructuredOutput tool call."""
+        part: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": "Structured output provided successfully",
+        }
+        if is_error:
+            part |= {"is_error": True, "content": "Output does not match the schema"}
         return {
             "type": "user",
-            "message": {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "toolu_1",
-                        "content": "Structured output provided successfully",
-                    }
-                ],
-            },
+            "message": {"role": "user", "content": [part]},
             "parent_tool_use_id": None,
             "session_id": SESSION,
         }
@@ -566,13 +575,16 @@ class FakeClaude:
 
     @classmethod
     def success(cls, answer: Any = None, **rate: Any) -> list[dict[str, Any]]:
+        """The order seen with 2.1.330/2.1.331 on 2026-11-25: init, thinking, the tool call,
+        the tool result, the usage reading (after the response), the result."""
         answer = answer if answer is not None else CLIP_ANSWER
         return [
             {"line": cls.init()},
-            {"line": cls.rate(**rate)},
-            {"line": cls.assistant(answer)},  # turn 1: the StructuredOutput tool call
+            {"line": cls.thinking_tokens()},
+            {"line": cls.assistant()},  # the thinking block
+            {"line": cls.assistant(answer)},  # the StructuredOutput tool call
             {"line": cls.tool_result()},
-            {"line": cls.assistant()},  # turn 2
+            {"line": cls.rate(**rate)},
             {"line": cls.result(answer, text="")},
         ]
 

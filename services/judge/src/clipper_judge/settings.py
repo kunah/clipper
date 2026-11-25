@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal
 
@@ -80,6 +81,11 @@ class JudgeSettings(BaseSettings):
     # CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN. None: a login stored in `claude_config_dir` (natively,
     # `CLAUDE_CONFIG_DIR=<dir>/.claude claude` once and /login).
     claude_oauth_token: SecretStr | None = None
+    # The token's expiry (UTC date; env CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES=2027-11-25): one year
+    # after `claude setup-token`. The CLI reports none for such a token (seen 2026-11-25:
+    # `credential_expires_at` and `loginExpiresAt` null), so this drives the heartbeat warning
+    # and the notice 14 days before. A value the CLI reports wins.
+    claude_token_expires: date | None = None
     # A writable directory of the judge's own (the CLI's HOME; its config in `.claude/`), never
     # the user's ~/.claude, home or a git checkout (`check_config_dir`; blank: the default).
     claude_config_dir: Path = DEFAULT_CLAUDE_CONFIG_DIR
@@ -136,7 +142,13 @@ class JudgeSettings(BaseSettings):
     price_cached_input_per_mtok: float = Field(default=0.0, ge=0)
     price_output_per_mtok: float = Field(default=0.0, ge=0)
 
-    @field_validator("claude_effort", "claude_oauth_token", "claude_max_budget_usd", mode="before")
+    @field_validator(
+        "claude_effort",
+        "claude_oauth_token",
+        "claude_max_budget_usd",
+        "claude_token_expires",
+        mode="before",
+    )
     @classmethod
     def _blank_is_none(cls, value: Any) -> Any:
         # compose passes `${VAR:-}`: an empty value means "not set"

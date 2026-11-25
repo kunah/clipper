@@ -92,7 +92,12 @@ def test_state_enums():
         "unrenderable",
     ]
     assert {s.value for s in ClipStatus} <= {s.value for s in LifecycleState}
-    assert {k.value for k in NoticeKind} == {"revision_refused", "render_failed"}
+    assert {k.value for k in NoticeKind} == {
+        "revision_refused",
+        "render_failed",
+        "credential_expiring",
+        "model_off",
+    }
     assert {m.value for m in HookMode} == {"none", "text", "teaser"}
     assert LayoutKind.AUTO == "auto" and CaptionStyle.BOLD_POP == "bold_pop"
     assert len(MusicMood) == 7

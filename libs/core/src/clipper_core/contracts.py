@@ -306,6 +306,12 @@ class NoticeKind(StrEnum):
 
     REVISION_REFUSED = "revision_refused"  # judge; ref = review event
     RENDER_FAILED = "render_failed"  # renderer; ref = render
+    # judge: its Claude credential expires within 14 days; ref = the expiry (epoch seconds), so
+    # each token gets one notice
+    CREDENTIAL_EXPIRING = "credential_expiring"
+    # judge: its model adapter switched itself off (an API key would be billed, rejected or
+    # expired credentials): judge jobs are held; ref = the UTC day (epoch days), one per day
+    MODEL_OFF = "model_off"
 
 
 class Payload(BaseModel):

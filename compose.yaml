@@ -199,6 +199,8 @@ services:
       CLIPPER_WORKER_ID: judge-1   # stable id: one heartbeat row across restarts
       CLIPPER_JUDGE_MODEL: ${CLIPPER_JUDGE_MODEL:-fake}
       CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN: ${CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN:-}
+      # the token's expiry (one year after `claude setup-token`; the CLI reports none for it)
+      CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES: ${CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES:-}
       CLIPPER_JUDGE_CLAUDE_MODEL: ${CLIPPER_JUDGE_CLAUDE_MODEL:-claude-opus-5-5}
       CLIPPER_JUDGE_CLAUDE_EFFORT: ${CLIPPER_JUDGE_CLAUDE_EFFORT:-}   # empty: the CLI's default
       CLIPPER_JUDGE_CLAUDE_CONFIG_DIR: /var/lib/clipper-judge

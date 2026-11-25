@@ -374,6 +374,10 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-21 | `calibrate` and the first backtest data use **yesterday's ohnepixel VOD** (if Twitch still has it): the main session runs `calibrate` and `clips` on it once the stack is up; detector build item 4 uses it later (user's answer; §17, §18) | a broadcast we also recorded live, the only way to measure T0 against our own clock |
 | 2026-11-21 | §17–§22 stay **proposed** as a whole: the user reviews them personally; only the answers recorded above are decided (user's answer) | the designs are long; the user reads them before they count as agreed |
 | 2026-11-21 | Backfill may **fill the `not_recorded` gaps of a live-recorded stream from its VOD**, while the VOD exists: on request only (`clipper-backfill vod <id> --fill-gaps`), it fills only the gaps and never touches what was recorded live; a gone VOD leaves the gap. First targets: stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in stream 1412 (user's answer; design in §17, proposed) | recorder or Docker outages lose hours of a broadcast whose VOD still has them |
+| 2026-11-25 | Judge eval labels come from a **blind labelling page**: `clipper-judge label` cuts each candidate's context from our recordings into local video files and serves a local page (127.0.0.1) where the user marks clip/reject and optionally the ideal in/out, without seeing any model answer; loosened-detector drafts are added so the set has negatives (user's answer; §19) | an unbiased agreement number; nearly all live candidates come from viewer clips, i.e. are likely positives |
+| 2026-11-25 | Build now, besides the real CLI run, the image and the eval: **instruction revisions**, **shadow runs** and the **token-expiry notice** (user's answer; §19) | the rest of §19's judge before review exists |
+| 2026-11-25 | **Live judging starts after the eval** (real-CLI checks, then the eval on the user's labels and prompt fixes, then `CLIPPER_DETECTOR_JUDGE_JOBS=1`), render jobs off until the renderer exists (user's answer; §19) | the prompt is tuned before it spends plan usage on live candidates |
+| 2026-11-25 | Recording stays **off** for now (no controller, chat-ingest, recorder): stream 2415 (2026-11-23, 5.2 h with video) is enough material; Postgres and object storage run for the eval (user's answer) | the judge work needs stored data, not new recordings |
 
 ## 16. Transcriber design (step 4)
 
@@ -2246,7 +2250,8 @@ code.claude.com: headless, cli-reference, authentication, legal-and-compliance):
     sessions or config. ~~Falls back to the user's login only when no token is set~~ (built
     differently, build item 4: without a token the CLI uses a login stored in the judge's own
     config dir, never the user's `~/.claude`; `loginExpiresAt` is ~2 weeks, renewed by
-    interactive use). The notice 14 days before expiry is not built yet (heartbeat + log only).
+    interactive use). The notice 14 days before expiry is built (2026-11-25, see build item 4
+    "Notices").
 - **Terms (docs, for the user):** the legal page says subscription OAuth is "designed to support
   ordinary use of Claude Code", and that products serving other people should use API keys
   ("route requests through Free, Pro, Max, or Ultra plan credentials on behalf of their users" is
@@ -2274,6 +2279,38 @@ code.claude.com: headless, cli-reference, authentication, legal-and-compliance):
   `isUsingOverage`/`overageStatus` (the user's account showed `overageStatus` `rejected`,
   `overageDisabledReason` `org_level_disabled`, `isUsingOverage` false on 2026-11-22) and that
   the `rate_limit_event` arrives before the second turn.
+- **First real run (2026-11-25)**, natively (CLI 2.1.331) and in the image (2.1.330: built, 867 MB,
+  `claude --version` 2.1.330 inside, uid 10001), on the sample candidate with Opus:
+  - `claude auth status` with the token: `authMethod` `oauth_token`, `apiProvider` `firstParty`,
+    `loginExpiresAt` null; the result's `credential_expires_at` is null too. **A setup token
+    reports no expiry**, so a setting gives it: `claude_token_expires` (UTC date, one year after
+    `claude setup-token`; `.env` 2027-11-25), which drives the heartbeat warning and the notice.
+  - init: `apiKeySource` `none` (also with this session's `ANTHROPIC_*`/`CLAUDE_CODE_*` variables in
+    the parent environment), `model` the pinned id, `tools` `[StructuredOutput]`, no MCP servers;
+    `modelUsage` lists only `claude-opus-5-5` (`costBasis` list).
+  - **Event order**: init, `system/thinking_tokens` (repeated), assistant (thinking), assistant
+    (StructuredOutput tool use), user (tool result), `rate_limit_event`, result. One model request:
+    the CLI's second "turn" only accepts the tool call. The reading comes *after* the response, so
+    killing at an overage reading can't save that call: an overage reading after an accepted
+    StructuredOutput call now keeps the paid answer; before one (a refused tool call would cost a
+    second request) the call is still killed; the guard latches either way.
+  - Canaries (CLAUDE.md and AGENTS.md in the judge's config dir and in the system temp dir, the
+    call dir's parent): not in the answer. The CLI loads built-in plugins (`cc-plugin-agents-md`,
+    telemetry, privacy, plugin authoring) and lists ~19 skills: fixed flags `--safe-mode
+    --disable-slash-commands --restricted` (`claude_cli.HARDENING`) remove skills and slash
+    commands, installed plugins, hooks, MCP servers and settings files; tokens and answer
+    unchanged.
+  - A fresh config dir brings no prompt; the CLI writes only into it (`.claude.json` + backups, a
+    plugin store file, policy limits, remote settings, an empty `sessions/`).
+  - Usage on the sample (a 5.7k-token prompt): default effort ~1k output tokens (~180 thinking),
+    10–13 s, list estimate $0.065 uncached and $0.024 with the prompt cache (1-hour cache writes; a
+    repeat read 5.2k of 5.7k from the cache, also across the native and the container run);
+    `--effort max`: 13k output, 126 s, $0.27 (inside the 0.50 cap, close to the 180 s timeout).
+  - Reading: `status` allowed, five-hour and seven-day windows (a window that has just reset is
+    missing from the next reading), `overageStatus` rejected (`org_level_disabled`),
+    `isUsingOverage` false.
+  - Still open: the `-p` output at a usage limit (not reached), the inline `--system-prompt`
+    fallback (not run), real candidates (the eval).
 
 **Provider options** (user's pick; per clip at ~4k uncached + 3k cached input, 1–3k output incl.
 reasoning; list prices 2026-11-19, verify; a context round adds ~50 %):
@@ -2676,8 +2713,14 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
      run without a token needs a login stored there once (`CLAUDE_CONFIG_DIR=<dir>/.claude
      claude`, then /login). Expiry: `credential_expires_at` of the last result (else
      `loginExpiresAt`) less than 14 days ahead -> a heartbeat warning
-     (`model_status.warnings.credential_expiring`) and one log line per value; **no notice yet**
-     (`NoticeKind` has no such kind: add `credential_expiring` with §21's notify consumer).
+     (`model_status.warnings.credential_expiring`) and one log line per value. **Notices**
+     (built 2026-11-25; core `NoticeKind.CREDENTIAL_EXPIRING`, `MODEL_OFF`): the service's
+     heartbeat turns the adapter's warnings into `notify` jobs in its own transaction:
+     `credential_expiring` (ref = the expiry, epoch s: one per token), `model_off` (the adapter
+     switched itself off, judge jobs held; ref = the UTC day: at most one a day). Deduped by the
+     queue (`dedupe_key(NOTIFY, ref, kind)`, one job ever) and per process (no upsert every 15 s).
+     They queue until review (§21) delivers them. A setup token's expiry comes from
+     `claude_token_expires` (the CLI reports none); a value the CLI reports wins.
    - **Concurrency** 1 with the CLI (`settings_for_model`; a warning only when
      `CLIPPER_JUDGE_CONCURRENCY` asked for more).
    - **Settings** (`CLIPPER_JUDGE_*`): `model` `fake` | `claude-cli`; `claude_path` (`claude`),
