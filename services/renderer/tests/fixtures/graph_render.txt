@@ -162,4 +162,4 @@ preview.mp4
 [8:a:0]aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,atrim=duration=23.800000,volume=-20.00dB,afade=t=out:st=22.800:d=1[mus];
 [mus][key]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[duck];
 [sp][x0][x1][duck]amix=inputs=4:duration=first:dropout_transition=0:normalize=0[mix];
-[mix]loudnorm=I=-14:TP=-1.5:LRA=11:measured_I=-23.41:measured_TP=-6.20:measured_LRA=5.10:measured_thresh=-33.60:offset=0.12:linear=true:print_format=json,aresample=48000,asplit=2[aclip][aprev]
+[mix]loudnorm=I=-14:TP=-1.5:LRA=11:measured_I=-23.4:measured_TP=-6.2:measured_LRA=5.1:measured_thresh=-33.6:linear=true:print_format=json,aresample=48000,asplit=2[aclip][aprev]

@@ -22,12 +22,20 @@ Then the layout (crop/scale per panel; a blurred cover copy behind `blurred_fit`
 panel's source crop shrunk by the zoom scale, switched in by `overlay=enable='between(t,a,b)'`),
 the ASS file (`ass`, bundled fonts only via `fontsdir`), the audio mix (stream audio, SFX by
 `adelay` at their output sample, a music bed ducked by `sidechaincompress` keyed on the stream
-audio, 1 s fade-out; `amix` without normalisation), two-pass `loudnorm` (pass 2 `linear=true`
-with pass 1's values) and two encodes of the same frames: the clip and the preview.
+audio, 1 s fade-out; `amix` without normalisation), two-pass loudness and two encodes of the
+same frames: the clip and the preview.
+
+Loudness: pass 1 measures the mix with `ebur128` (integrated loudness, its gate threshold, LRA,
+true peak); pass 2 applies `loudnorm` with those values and `linear=true` (one gain; loudnorm
+itself falls back to its dynamic mode when the gain would push the true peak over the target).
+Not loudnorm's own measuring pass: on mixes with short loud events (SFX hits) its `input_i` was
+1-1.6 LU above `ebur128` and above a plain BS.1770 computation, which agreed to 0.01 LU
+(2026-11-25, ffmpeg 9.0.2); steady test tones read the same in both.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -89,17 +97,19 @@ class ZoomOut:
 
 @dataclass(frozen=True, slots=True)
 class Loudness:
-    """loudnorm's pass-1 measurement, as printed (strings pass through unchanged)."""
+    """`ebur128`'s pass-1 measurement, as printed (strings pass through unchanged)."""
 
-    input_i: str
-    input_tp: str
-    input_lra: str
-    input_thresh: str
-    target_offset: str
+    i: str  # integrated loudness, LUFS
+    thresh: str  # the integrated measurement's relative gate threshold, LUFS
+    lra: str  # loudness range, LU
+    tp: str  # true peak, dBFS
 
     @property
     def silent(self) -> bool:
-        return self.input_i in ("-inf", "inf", "nan") or float(self.input_i) < -70
+        try:
+            return float(self.i) <= -69.9 or float(self.tp) == float("-inf")
+        except ValueError:
+            return True
 
 
 @dataclass(frozen=True)
@@ -215,7 +225,7 @@ def _crop(r: Rect) -> str:
     return f"crop={r.w}:{r.h}:{r.x}:{r.y}"
 
 
-def _layout_filters(spec: GraphSpec) -> list[str]:
+def layout_filters(spec: GraphSpec) -> list[str]:
     lay = spec.layout
     W, H = lay.canvas
     zooms_by_panel: dict[str, list[ZoomOut]] = {}
@@ -300,14 +310,19 @@ def _audio_mix(spec: GraphSpec, first_input: int) -> list[str]:
     return chains
 
 
-def _loudnorm(measured: Loudness | None) -> str:
-    base = f"loudnorm=I={TARGET_LUFS:g}:TP={TARGET_TP:g}:LRA={TARGET_LRA:g}"
-    if measured is None:
-        return f"{base}:print_format=json"
+MEASURE = "ebur128=peak=true:framelog=quiet"
+
+
+def _loudnorm(measured: Loudness) -> str:
+    """Pass 2: one linear gain to the target. loudnorm keeps linear mode only while the measured
+    LRA is within its LRA target and above 0, so the target follows the measurement (capped at
+    50) and a 0.0 LU measurement (a steady tone) is passed as 0.1."""
+    lra = max(float(measured.lra), 0.1)
+    target_lra = min(max(TARGET_LRA, math.ceil(lra) + 1.0), 50.0)
     return (
-        f"{base}:measured_I={measured.input_i}:measured_TP={measured.input_tp}:"
-        f"measured_LRA={measured.input_lra}:measured_thresh={measured.input_thresh}:"
-        f"offset={measured.target_offset}:linear=true:print_format=json"
+        f"loudnorm=I={TARGET_LUFS:g}:TP={TARGET_TP:g}:LRA={target_lra:g}:"
+        f"measured_I={measured.i}:measured_TP={measured.tp}:measured_LRA={lra:g}:"
+        f"measured_thresh={measured.thresh}:linear=true:print_format=json"
     )
 
 
@@ -319,11 +334,11 @@ BITEXACT = [
 
 
 def measure_command(spec: GraphSpec) -> Command:
-    """Pass 1: the audio mix through loudnorm (measuring), to the null muxer."""
+    """Pass 1: the audio mix through `ebur128` (measuring), to the null muxer."""
     chains, _, alabels = _piece_filters(spec, video=False)
     chains.append(_concat(alabels, "[speech]", video=False))
     chains += _audio_mix(spec, len(spec.pieces))
-    chains.append(f"[mix]{_loudnorm(None)}[aout]")
+    chains.append(f"[mix]{MEASURE}[aout]")
     graph = ";\n".join(chains)
     args = [*GLOBAL, *_input_args(spec), "-filter_complex", graph]
     args += ["-map", "[aout]", "-f", "null", "-"]
@@ -364,7 +379,7 @@ def render_command(
     chains, vlabels, alabels = _piece_filters(spec, video=True)
     chains.append(_concat(vlabels, "[vcat]", video=True))
     chains.append(_concat(alabels, "[speech]", video=False))
-    chains += _layout_filters(spec)
+    chains += layout_filters(spec)
     if spec.subtitles:
         chains.append(f"[canvas]ass=filename={spec.subtitles}:fontsdir={spec.fonts_dir}[cap]")
     else:

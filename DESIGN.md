@@ -35,10 +35,13 @@ judges, edits and publishes short vertical clips.
 > off for now (user's answer, 2026-11-25); Postgres and object storage run. Migration 0006 is on
 > the live DB (seen 2026-11-25).
 > Migration 0006
-> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22. Renderer (§20): build item 7a
+> (IRC tags as `chat_messages` columns, §18.3) built 2026-11-22. Renderer (§20): build items 7a
 > (contracts + migration 0007 `renders` + `clipper_core.assets`, the pure parts of
-> `services/renderer`: time map, layouts, ASS captions, filter graph) built 2026-11-25; 0007 is not
-> on the live DB.
+> `services/renderer`) and 7b (the render loop on libx264 and synthetic chunks, the
+> `clipper-renderer` service, image with a pinned jellyfin-ffmpeg 8.1.3-2, compose profile
+> `renderer`) built 2026-11-25; not deployed, 0007 is not on the live DB. Taste values (caption
+> look, title band, layouts) are PROPOSED defaults; 7c (NVENC in the container, a real stream,
+> ohnepixel's layout) and 7d (the licensed SFX/music library) wait for the user.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -191,7 +194,7 @@ Services talk only through Postgres and object storage.
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
 | detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
 | judge | LLM verdict + edit plan, context requests, revisions (§19; contract + 0005 built; the service with a deterministic fake model built 2026-11-22, not deployed; the Claude Code CLI adapter built 2026-11-22 (6d), not run for real yet). Enqueues `judge` rounds, `render`, `notify` | clips, clip_plans, judge_calls, own media_requests | slim (profile `judge`) |
-| renderer | ffmpeg + NVENC, 9:16, captions | renders (later) | CUDA |
+| renderer | ffmpeg + NVENC (libx264 fallback), 9:16, captions, two-pass loudness (§20; 7a+7b built 2026-11-25, not deployed). Pins chunk video, enqueues `review`, `notify` | renders; `clips/{id}/pinned/`, `clips/{id}/renders/` | slim + static ffmpeg, GPU (profile `renderer`) |
 | review | FastAPI UI + Discord bot (§21) | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
 | tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c), chat_messages, chat_metrics_1s (5d); viewer_clips (5d, all streams); in an ended live stream (`--fill-gaps`, §17): vods, `source='backfill'` chunks, chat rows of seconds without live chat | slim + ffmpeg (profile `tools`) |
@@ -209,7 +212,8 @@ Rules:
   `streams/{id}/audio/{seq}.aac`, `streams/{id}/transcripts/{seq}.json`.
 - `.ts` not `.mp4`: a crashed recorder still leaves a playable file.
 - Separate audio so the GPU worker downloads ~1 MB/min instead of ~45 MB/min.
-- Retention: video ~48 h unless a clip uses it; audio + transcripts forever.
+- Retention: video ~48 h; a clip pins the chunks it uses (`clips/{id}/pinned/`, the renderer's
+  S3 copy, §20); audio + transcripts forever.
 - Postgres: `chat_messages` partitioned by UTC day (no DEFAULT partition; writers call
   `ensure_chat_partitions` for the days they write). Transcript sentences have full-text
   search (`text_tsv`); pgvector is available for semantic search later.
@@ -313,7 +317,10 @@ deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, 6d'
 (Claude Code CLI adapter, pinned CLI in the image, `clipper-judge eval`) 2026-11-22, its first real
 run and 6e (notices, shadow runs, instruction revisions, drafts export, blind labelling)
 2026-11-25, see §19; next the user's labels on the first set (75 cases), `clipper-judge eval` with
-Opus on them, prompt fixes, then live judging. Designs (all proposed 2026-11-19, not yet agreed):
+Opus on them, prompt fixes, then live judging. Renderer build items 7a (contract, migration 0007,
+pure parts) and 7b (render loop, service, image, compose) built 2026-11-25, see §20; next 7c (NVENC
+in the container, a real stream, ohnepixel's layout) and 7d (licensed assets) with the user.
+Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
 [§20](#20-renderer-phase-2--proposed-2026-11-19-not-yet-agreed), review
@@ -3120,8 +3127,9 @@ detector's filter helpers (bots, commands, dup normalisation), moved there so bo
 
 ## 20. Renderer (phase 2) — proposed 2026-11-19, not yet agreed
 
-**Status:** proposal (not yet agreed). **7a built 2026-11-25** (see build plan item 1: the contract,
-migration 0007, `clipper_core.assets`, and the renderer's pure parts with golden tests). NVENC inside
+**Status:** proposal (not yet agreed). **7a and 7b built 2026-11-25** (see build plan items 1 and
+2: the contract, migration 0007, `clipper_core.assets`, the renderer's pure parts with golden tests,
+the render loop, the service, its image and compose service; not deployed). NVENC inside
 Docker Desktop/WSL2 is **UNVERIFIED** (smoke test 7c; x264 keeps everything working without it).
 Per-channel layouts, caption taste and the SFX/music library need the user: the taste values built
 are **PROPOSED defaults** (`styles.py`, `layout.py`, `graph.py` mark them), to be signed off with
@@ -3152,7 +3160,8 @@ or jellyfin-ffmpeg; URL + sha256) + bundled OFL fonts; compose reserves the GPU 
    (`fontsdir` = bundled fonts only, no system fallback), **zooms**, hook (teaser range first, or
    overlay text) and a title band (`plan.title`; post texts are separate, §22).
 5. **Audio**: the stream audio from the chunk `.ts` (sample-aligned with its video), SFX + music,
-   two-pass `loudnorm` to **−14 LUFS, −1 dBTP** (measure, then `linear=true` with the measured values).
+   two-pass loudness to **−14 LUFS, −1 dBTP** (measure, then `loudnorm` `linear=true` with the
+   measured values; built 2026-11-25 with `ebur128` as the measurement, see build item 2).
 6. **Encode**, one ffmpeg run, two outputs: `clip.mp4` 1080×1920 at source fps (≤ 60), H.264 High,
    `h264_nvenc` (p5, VBR ~8 Mbps / max 12, 2 s GOP) or `libx264` (`medium`, CRF 20) by
    `CLIPPER_RENDERER_ENCODER=auto|nvenc|x264` (`auto` falls back when NVENC init fails);
@@ -3260,7 +3269,56 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
    cuts match the time map ±1 frame (luma index); the beep lands within ±1 frame; −14 ± 1 LUFS,
    TP ≤ −1 dB; the same plan twice → the same `graph_hash` and identical bytes; audio_only →
    `unrenderable` without running ffmpeg; a crash + retry reuses the row; done → `review` job in the
-   same transaction; S3 CopyObject works on SeaweedFS.
+   same transaction; S3 CopyObject works on SeaweedFS. **Built 2026-11-25** (all of these hold):
+   - `render.render_files` (files on disk, no DB/S3): probe each chunk, layout, captions, effects
+     (zooms through the time map's runs; SFX and music picked by `clipper_core.assets.pick` from
+     the usable library entries, normalised per asset: SFX to a −6 dBFS true peak, music to
+     −14 LUFS, then the plan's gain; no music when the plan flags `copyright_music_risk`; a cue
+     without an asset or cut out of the clip is skipped with a warning), pass 1, pass 2 (an NVENC
+     failure under `auto` renders again with libx264, warning `nvenc_fallback`), thumbnail (the
+     plan's `thumbnail_utc`, else a teaser's start, else **the moment T** in the clip: the first
+     frame of a clip without a teaser is rarely its best), the delivered file measured again,
+     `graph_hash` (plan, profile, encoder, the sources with trims and origins, both commands,
+     the thumbnail command, the ASS hash, layout + config sha256, assets, fonts, renderer and
+     ffmpeg versions), `render.json`.
+   - **Loudness measured with `ebur128`, not loudnorm's own pass:** on the synthetic mix with two
+     SFX hits loudnorm's measuring pass read −14.0 LUFS where `ebur128` and a plain numpy
+     BS.1770-4 computation both read −15.1 (and −15.0/−16.3 vs −16.28 on a 10 s window); steady
+     tones agree. Pass 1 = `ebur128=peak=true`; pass 2 = `loudnorm ... linear=true` with its I,
+     threshold, LRA and true peak (LRA target = max(11, measured + 1) so linear mode holds; a
+     0.0 LU reading passed as 0.1); loudnorm falls back to its dynamic mode only when the gain
+     would pass the true-peak target (warning `loudness_dynamic`). The row's `loudness_lufs` and
+     `true_peak_db` are `ebur128` readings of the delivered `clip.mp4`. True-peak target −1.5 dBTP
+     inside the graph (the AAC encode adds a little), delivery ≤ −1 dBTP.
+   - `handler.RenderHandler` (the job), `service.RendererService` (one runner, heartbeat:
+     encoder, ffmpeg, renders done/unrenderable/failed/retried, p50 render time, queued render
+     jobs), `settings` (`CLIPPER_RENDERER_*`: `encoder` auto|nvenc|x264, `layouts_path`,
+     `assets_dir`, `asset_platforms`, `fonts_dir`, `temp_dir`, `keep_work`, `pin_margin_s` 30,
+     `ffmpeg`/`ffprobe`, `timeout_s`), `library.AssetLibrary` (manifest + sha256 + licence checks
+     per render, hashes and measurements cached), CLI `clipper-renderer layout-preview <login>
+     --at <utc>` (read-only DB: `frame.png` with the rects drawn, `layout.png` composed 1080x1920)
+     and `clipper-renderer assets check` (exit 1 if an entry is unusable).
+   - A failed attempt keeps the row `rendering` with `error`; the job's last attempt (or an error
+     retrying can't fix: not a clip plan, an unknown profile) → `failed` + `notify(render_failed)`
+     (`notify:{render}:render_failed`) in one transaction; requeueing the job by hand reopens the
+     row. A chunk the plan needs whose video is gone and unpinned → `video_expired`; one only in
+     the ±30 s margin → warning `pin_skipped`. A re-render (another job, same plan) reads the
+     pinned copies after the chunk video is gone and gives identical bytes.
+   - Image `clipper/renderer:dev` (616 MB, built 2026-11-25, not run as a service): python slim,
+     the venv, `ffmpeg`/`ffprobe` from **jellyfin-ffmpeg 8.1.3-2 portable GPL** (static; amd64 +
+     arm64 by sha256; the build checks `ass`, `h264_nvenc`, `libx264`), uid 10002, `/work` volume,
+     a fontconfig config without font directories (no system fonts, no fontconfig errors),
+     `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`. A throwaway `docker run --rm` (no GPU)
+     rendered a synthetic clip at −14.0 LUFS with libass on the bundled fonts only, the same
+     graph hash and bytes on two runs; NVENC not tried (7c). Compose service `renderer` (profile
+     `renderer`, GPU reserved, `services/renderer/config` at `/config` read-only, assets from
+     `${CLIPPER_RENDERER_ASSETS:-./data/assets}` read-only).
+   - Tests: `test_renderer_render.py` (3, real ffmpeg on synthetic chunks: frames, beeps, SFX
+     onsets, loudness, determinism, the facecam layout with punch-ins), `test_renderer_service.py`
+     (10, Postgres + an in-memory store, one on SeaweedFS), `test_renderer_cli.py` (4).
+   - Not built: the retention sweep (pinned copies and outputs of discarded clips), the judge
+     reading the SFX tags/moods from the manifest (`CLIPPER_JUDGE_SFX_TAGS` stays the way in),
+     smooth zooms, an audio-only format.
 3. **7c GPU + real stream** (smoke on this PC). *Done:* NVENC works in the container (else x264-only
    is documented); a 30 s 1080p60 clip renders in ≤ 30 s p50 while the transcriber runs and its
    realtime factor drops < 10 % (numbers in §20); ohnepixel's layout fitted with `layout-preview`
@@ -3281,7 +3339,7 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
 | 2026-11-19 | Captions = ASS generated by pure code from `words()` + the plan's `word_fixes`, one event per word slice, bundled OFL fonts via `fontsdir` | deterministic, golden-testable, full control over highlight, emphasis and fixes |
 | 2026-11-19 | v1 punch-ins are hard static zooms; smooth zooms later | simple and deterministic; it's the common short-form look |
 | 2026-11-19 | SFX/music only from a user-supplied local library with a manifest (sha256 + licence + platforms), checked by `assets check`; deterministic choice by hash | §2: licensed audio only, provable per render |
-| 2026-11-19 | Loudness: two-pass `loudnorm`, −14 LUFS, −1 dBTP | platform normalisation targets for shorts; two-pass is deterministic |
+| 2026-11-19 | Loudness: two-pass `loudnorm`, −14 LUFS, −1 dBTP (built 2026-11-25: pass 1 measures with `ebur128`, loudnorm's own measuring pass misread SFX-heavy mixes by 1–1.6 LU) | platform normalisation targets for shorts; two-pass is deterministic |
 | 2026-11-19 | Reproducibility = `graph_hash` over plan, inputs, layout config, assets, fonts and versions; byte-identical only with x264 | NVENC output may differ across drivers; the graph is what we control |
 | 2026-11-19 | Each render writes final 1080×1920 (+ sha256), a 540×960 preview ≤ 19 MB (Discord's 20 MiB upload; was 20 MB for Telegram), thumbnail, ASS and a manifest | the phone review needs a small file; the publisher checks the upload; the manifest makes renders auditable |
 | 2026-11-19 | audio_only channels are not rendered in v1 | no video; an audio-only format is a later product decision |

@@ -69,4 +69,4 @@ null
 [8:a:0]aresample=48000,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,atrim=duration=23.800000,volume=-20.00dB,afade=t=out:st=22.800:d=1[mus];
 [mus][key]sidechaincompress=threshold=0.05:ratio=8:attack=20:release=400[duck];
 [sp][x0][x1][duck]amix=inputs=4:duration=first:dropout_transition=0:normalize=0[mix];
-[mix]loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json[aout]
+[mix]ebur128=peak=true:framelog=quiet[aout]

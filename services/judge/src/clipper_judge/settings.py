@@ -129,8 +129,8 @@ class JudgeSettings(BaseSettings):
     # effort (skipped while the usage guard holds; a failure is only logged). Calls and plans get
     # `shadow = true`; nothing renders them. Empty: none.
     shadow: Annotated[list[ShadowSpec], NoDecode] = Field(default_factory=list)
-    # Enqueue the `render` job with every `clip` plan. Nothing runs them until the renderer
-    # exists (§20): they just queue.
+    # Enqueue the `render` job with every `clip` plan; the renderer (§20) runs them (they queue
+    # while it isn't running).
     render_jobs: bool = True
     # Judge audio_only clips too (cut on audio ranges). Off: they are rejected as `no_video`
     # without a call, since the renderer can't render them (decided 2026-11-21).
@@ -151,7 +151,8 @@ class JudgeSettings(BaseSettings):
     min_clip_s: float = 10.0
     max_clip_s: float = 60.0
     max_output_tokens: int = Field(default=4000, gt=0)
-    # SFX tags the model may use; empty until the renderer's asset manifest exists (§20).
+    # SFX tags the model may use (the renderer's asset manifest has them: `clipper-renderer assets
+    # check`, §20; not read from it automatically yet). Empty: none.
     sfx_tags: list[str] = Field(default_factory=list)
     title_blocklist: list[str] = Field(default_factory=list)  # whole words -> flag `sensitive`
 

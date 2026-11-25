@@ -244,7 +244,8 @@ def _first(*values: float | None) -> float:
     return next(v for v in values if v is not None)
 
 
-def _px(n: NormRect, source: tuple[int, int]) -> Rect:
+def to_pixels(n: NormRect, source: tuple[int, int]) -> Rect:
+    """A normalised rect in source pixels."""
     sw, sh = source
     x, y = round(n.x * sw), round(n.y * sh)
     w = min(round(n.w * sw), sw - x)
@@ -315,7 +316,7 @@ def _geometry(
     if kind == LayoutKind.FACECAM_GAMEPLAY:
         assert facecam is not None
         top_h = _even(H * split)
-        face = crop_to_aspect(_px(facecam, source), W / top_h)
+        face = crop_to_aspect(to_pixels(facecam, source), W / top_h)
         game = crop_to_aspect(frame, W / (H - top_h), gameplay_focus_x)
         panels = (
             Panel("face", face, Rect(0, 0, W, top_h)),

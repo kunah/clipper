@@ -689,6 +689,9 @@ class RenderSource(StoredModel):
     out_at_s: float  # where the piece starts in the output
     pad_after_s: float = 0.0  # jitter fill after it (last frame held + silence)
     teaser: bool = False  # part of a teaser hook (plays before the clip)
+    # the audio stream's start inside the file (offsets count from the chunk's first audio
+    # sample, as the transcriber's words do): the input seek is trim_from_s + origin_s
+    origin_s: float = 0.0
 
 
 class RenderAsset(StoredModel):

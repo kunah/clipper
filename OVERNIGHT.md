@@ -303,6 +303,17 @@ Your task: DESIGN §20 build items 7a and 7b; taste defaults proposed, 7c/7d wai
 - Done: 7a (DESIGN §20 build item 1): contracts, migration 0007 (not on the live DB), core
   assets, the renderer's pure parts with goldens. Found: ffmpeg's TS seek lands one GOP late
   (fixed with a 5 s pre-roll + timestamp trims); the chunk origin is its first audio sample.
+- Done: 7b (DESIGN §20 build item 2): `render_files`, the job handler, the service, CLI
+  `layout-preview` + `assets check`, the image (jellyfin-ffmpeg 8.1.3-2 static, 616 MB, built,
+  not run as a service) and the compose service `renderer` (profile `renderer`). Found: loudnorm's
+  measuring pass misreads mixes with SFX hits by 1-1.6 LU (ebur128 and a plain BS.1770 agree):
+  pass 1 measures with ebur128 now. Not deployed; migration 0007 not on the live DB.
+- For 7c (with you): `docker compose up -d renderer` needs 0007 first (`docker compose up --build
+  migrate`, alone); then NVENC in the container (`auto` logs the encoder it chose), a real clip of
+  stream 2415 (enqueue a render job for a judged plan, or run the judge with render jobs), and
+  ohnepixel's facecam rect: `uv run clipper-renderer layout-preview ohnepixel --at <utc>` writes
+  `data/layout-preview/frame.png` + `layout.png`; the rect goes into
+  `services/renderer/config/layouts.toml`.
 - Proposed taste defaults (for your sign-off with real renders): captions bold_pop = Montserrat
   Black 92 px, white, black outline 7, the spoken word yellow #FFD21F popping to 118 % in 80 ms,
   emphasis green #3DF06B, uppercase, 1-3 words / <= 16 characters per page at y 1300; title band

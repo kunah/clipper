@@ -8,8 +8,8 @@ CLIPPER_JUDGE_MODEL = fake (deterministic rules) or claude-cli (the Claude Code 
 subscription, `clipper_judge.claude_cli`). With claude-cli the service first runs `claude auth
 status` with the CLI's own environment and exits (1, no judging) unless it shows a subscription
 login (`oauth_token`, or `claude.ai` natively); it runs one job at a time. Nothing enqueues judge
-jobs until the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=1; `render` jobs queue until the
-renderer exists (§20).
+jobs until the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=1; `render` jobs wait for the
+renderer (`clipper-renderer`, §20).
 """
 
 from __future__ import annotations

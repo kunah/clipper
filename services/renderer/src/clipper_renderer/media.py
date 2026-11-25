@@ -4,7 +4,7 @@ psycopg needs has no asyncio subprocesses). Parsing what they print.
     tools = Tools("ffmpeg", "ffprobe")
     info = tools.probe(path)                  # size, fps, stream starts
     result = tools.run(args, cwd=work)        # FfmpegError on failure
-    loud = parse_loudnorm(result.stderr)      # loudnorm's print_format=json block
+    loud = parse_ebur128(result.stderr)       # ebur128's summary (I, threshold, LRA, true peak)
 """
 
 from __future__ import annotations
@@ -190,11 +190,28 @@ def parse_loudnorm(stderr: str) -> dict[str, str]:
     return {k: str(v) for k, v in json.loads(blocks[-1]).items()}
 
 
-def loudness_of(stats: dict[str, str]) -> Loudness:
-    return Loudness(
-        input_i=stats["input_i"],
-        input_tp=stats["input_tp"],
-        input_lra=stats["input_lra"],
-        input_thresh=stats["input_thresh"],
-        target_offset=stats["target_offset"],
-    )
+_SUMMARY = re.compile(
+    r"Integrated loudness:\s+I:\s+(?P<i>\S+) LUFS\s+Threshold:\s+(?P<thresh>\S+) LUFS\s+"
+    r"Loudness range:\s+LRA:\s+(?P<lra>\S+) LU.*?True peak:\s+Peak:\s+(?P<tp>\S+) dBFS",
+    re.S,
+)
+
+
+def parse_ebur128(stderr: str) -> Loudness:
+    """The last `ebur128=peak=true` summary in ffmpeg's log."""
+    found = list(_SUMMARY.finditer(stderr))
+    if not found:
+        raise FfmpegError("no ebur128 summary in the ffmpeg log", stderr)
+    m = found[-1]
+    return Loudness(i=m["i"], thresh=m["thresh"], lra=m["lra"], tp=m["tp"])
+
+
+def number(value: str) -> float | None:
+    """A measured value as a float; None for -inf/inf/nan and -70 LUFS (silence)."""
+    try:
+        v = float(value)
+    except ValueError:
+        return None
+    if v != v or v in (float("inf"), float("-inf")):
+        return None
+    return v

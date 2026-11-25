@@ -93,10 +93,25 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   heartbeat queues `notify` jobs for `credential_expiring` (`CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES`:
   a setup token reports no expiry) and `model_off`.
   Compose service `judge` (profile `judge`; the image pins the native Claude Code CLI 2.1.330 by
-  sha256, runs as uid 10001, volume `judge-claude` = the CLI's own HOME). `render`/`notify` jobs
-  queue until renderer/review exist. Integration tests: `tests/conftest.py` (`world` fixture;
+  sha256, runs as uid 10001, volume `judge-claude` = the CLI's own HOME). `render` jobs run on the
+  renderer (profile `renderer`), `notify` jobs queue until review exists. Integration tests: `tests/conftest.py` (`world` fixture;
   `fake_claude` = `tests/fake_claude.py`, a fake executable: tests never run the real CLI).
   Depends on core only.
+  `services/renderer/` (`clipper_renderer`, DESIGN §20). Pure: `profiles` (`short_1080x1920`,
+  `test_270x480`), `timemap` (plan ranges -> per-chunk trims, jitter fill, gap cuts, teaser first;
+  runs map plan times to output), `layout` (+ `config/layouts.toml`, read per render), `styles`
+  (PROPOSED looks; bundled OFL Montserrat in `fonts/`, `fontset`), `captions` (ASS builder),
+  `graph` (both ffmpeg commands; pieces seek 5 s early and trim by pts: ffmpeg's TS seek lands a
+  GOP late; loudness measured with `ebur128`, applied by `loudnorm linear=true`), `samples`,
+  `synthetic` (lavfi chunks: luma = frame index, 1 kHz beeps). `media` (ffmpeg/ffprobe runner),
+  `library` (asset manifest + sha256 + licences, per-asset normalisation), `render`
+  (`render_files`: one render from files on disk), `handler` (the `render` job: pin by S3 copy,
+  download, words, render, upload, row `done` + `review` job; `unrenderable` no_video /
+  video_expired; last attempt -> `failed` + `notify(render_failed)`), `service`, `settings`
+  (`CLIPPER_RENDERER_*`), `main` (`clipper-renderer`, `layout-preview`, `assets check`). Goldens
+  in `tests/fixtures/` (`CLIPPER_RENDERER_UPDATE_GOLDEN=1` rewrites them); tests need ffmpeg and
+  ffprobe on PATH. Compose service `renderer` (profile `renderer`, GPU; image with jellyfin-ffmpeg
+  8.1.3-2 static by sha256). Needs migration 0007 (`renders`). Depends on core only.
 - `tools/backfill/` (`clipper_backfill`, `clipper-backfill` CLI): past VODs in the live format
   (DESIGN §17). A `vod` run: media + time (T0 estimator, chunk planner, `audio_only` by default,
   muted parts -> `muted` gaps, priority-0 transcribe jobs, resume from `vods.media_done_s`), then
@@ -147,6 +162,9 @@ uv run clipper-detector backtest --stream 2415 --params loose.toml --export-draf
 uv run clipper-judge label prepare --stream 2415 --drafts drafts.json --out data/labels/v1
 uv run clipper-judge label serve data/labels/v1 --open      # http://127.0.0.1:8765, blind labels
 uv run clipper-judge eval --labels data/labels/v1/labels.json --drafts data/labels/v1/drafts.json
+docker compose up -d --build renderer       # profile renderer (GPU; needs migration 0007)
+uv run clipper-renderer layout-preview ohnepixel --at 2026-11-23T20:15:00Z   # data/layout-preview/
+uv run clipper-renderer assets check --dir data/assets   # the licensed SFX/music library
 ```
 
 uv was installed with winget; in an old shell it may not be on PATH yet (restart the shell).

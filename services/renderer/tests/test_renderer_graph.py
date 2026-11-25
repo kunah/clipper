@@ -29,7 +29,7 @@ from clipper_renderer.timemap import build, plan_ranges
 FIXTURES = Path(__file__).parent / "fixtures"
 UPDATE = os.environ.get("CLIPPER_RENDERER_UPDATE_GOLDEN") == "1"
 SHORT = get_profile("short_1080x1920")
-LOUD = Loudness("-23.41", "-6.20", "5.10", "-33.60", "0.12")
+LOUD = Loudness(i="-23.4", thresh="-33.6", lra="5.1", tp="-6.2")
 
 FACECAM = """
 [channels.xqc]
@@ -90,9 +90,17 @@ def test_measure_pass_reads_the_same_inputs_without_video(tmp_path):
     m, r = measure_command(spec), render_command(spec, LOUD)
     inputs = lambda c: [a for i, a in enumerate(c.args) if c.args[i - 1] == "-i"]  # noqa: E731
     assert inputs(m) == inputs(r)
-    assert ":v:0]" not in m.graph and "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json" in m.graph
+    assert ":v:0]" not in m.graph and "[mix]ebur128=peak=true:framelog=quiet[aout]" in m.graph
     assert m.args[-5:] == ["-map", "[aout]", "-f", "null", "-"]
-    assert "measured_I=-23.41" in r.graph and "linear=true" in r.graph
+    assert (
+        "loudnorm=I=-14:TP=-1.5:LRA=11:measured_I=-23.4:measured_TP=-6.2:measured_LRA=5.1:"
+        in r.graph
+    )
+    assert "measured_thresh=-33.6:linear=true" in r.graph
+    wide = render_command(spec, Loudness(i="-20", thresh="-30", lra="17.4", tp="-9")).graph
+    assert ":LRA=19:" in wide and ":measured_LRA=17.4:" in wide  # linear needs LRA <= target
+    steady = render_command(spec, Loudness(i="-20", thresh="-30", lra="0.0", tp="-9")).graph
+    assert ":measured_LRA=0.1:" in steady
     assert r.outputs == ["clip.mp4", "preview.mp4"]
 
 
@@ -137,7 +145,7 @@ def test_a_chunk_without_audio_gets_silence_and_silent_audio_isnt_normalised(tmp
     assert "anullsrc=r=48000:cl=stereo,atrim=end_sample=" in cmd.graph
     assert "[1:a:0]" not in cmd.graph and "[0:a:0]" in cmd.graph
     assert "[speech]anull[mix]" in cmd.graph and "[mix]anull,aresample" in cmd.graph
-    silent = Loudness("-inf", "-inf", "0.00", "-70.00", "0.00")
+    silent = Loudness(i="-70.0", thresh="0.0", lra="0.0", tp="-inf")
     assert silent.silent and "loudnorm" not in render_command(spec, silent).graph
 
 
