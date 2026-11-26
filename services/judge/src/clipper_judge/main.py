@@ -3,6 +3,8 @@
     clipper-judge                 # the service (CLIPPER_JUDGE_MODEL = fake | claude-cli)
     clipper-judge eval ...        # read-only: the judge over labelled candidates (evaluate)
     clipper-judge label prepare|serve ...   # a blind labelling set for the eval (label)
+    clipper-judge ideas --stream ID ...     # read-only trial: post-stream clip ideas (ideas)
+    clipper-judge rate-ideas [--open]       # a local page to rate them (ideas_rate)
 
 CLIPPER_JUDGE_MODEL = fake (deterministic rules) or claude-cli (the Claude Code CLI on the user's
 subscription, `clipper_judge.claude_cli`). With claude-cli the service first runs `claude auth
@@ -24,7 +26,7 @@ from clipper_core.db import create_engine, session_factory
 from clipper_core.logs import get_logger, setup_logging
 from clipper_core.runtime import run, stop_event_on_signals
 from clipper_core.storage import ObjectStore
-from clipper_judge import evaluate, label
+from clipper_judge import evaluate, ideas, ideas_rate, label
 from clipper_judge.adapters import check_model, make_model, make_shadows, settings_for_model
 from clipper_judge.prompt import load_prompt
 from clipper_judge.service import SERVICE, JudgeService
@@ -73,11 +75,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sub = p.add_subparsers(dest="cmd", metavar="command")
     ev = evaluate.add_parser(sub)
     lab = label.add_parser(sub)
+    ide = ideas.add_parser(sub)
+    ideas_rate.add_parser(sub)
     args = p.parse_args(list(argv))
     if args.cmd == "eval":
         evaluate.check_args(ev, args)
     if args.cmd == "label":
         label.check_args(lab, args)
+    if args.cmd == "ideas":
+        ideas.check_args(ide, args)
     return args
 
 
@@ -87,13 +93,19 @@ def main() -> None:
         with contextlib.suppress(KeyboardInterrupt):
             sys.exit(label.main(args))
         return
-    if args.cmd == "eval":
+    if args.cmd == "rate-ideas":
+        setup_logging(service="judge-rate-ideas", stream=sys.stderr)  # no DB settings needed
+        with contextlib.suppress(KeyboardInterrupt):
+            sys.exit(ideas_rate.main(args))
+        return
+    if args.cmd in ("eval", "ideas"):
         # titles and chat: a cp1252 console or pipe must not crash the report
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(AttributeError, ValueError):
                 stream.reconfigure(errors="backslashreplace")
+        command = evaluate.amain if args.cmd == "eval" else ideas.amain
         with contextlib.suppress(KeyboardInterrupt):
-            sys.exit(run(lambda: evaluate.amain(args)))
+            sys.exit(run(lambda: command(args)))
         return
     with contextlib.suppress(KeyboardInterrupt):  # Windows Ctrl+C (no signal handlers)
         sys.exit(run(amain))

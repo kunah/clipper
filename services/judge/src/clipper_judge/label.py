@@ -315,29 +315,43 @@ def pick_encoder(ffmpeg: str, choice: str) -> str:
     return "h264_nvenc" if " h264_nvenc " in out else "libx264"
 
 
-def encode_args(encoder: str) -> list[str]:
+SAMPLE_RATE = 48000
+# as the renderer (§20): open each piece this far before it and trim by timestamp, since ffmpeg's
+# MPEG-TS seek lands up to a GOP late (a plain `-ss X` lost the video of a piece near a chunk's end)
+SEEK_PREROLL_S = 5.0
+
+
+def codec_args(encoder: str) -> list[str]:
     video = (
         ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "30"]
         if encoder == "h264_nvenc"
         else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28"]
     )
+    return [*video, "-g", str(FPS), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-ac", "2"]
+
+
+def piece_command(ffmpeg: str, source: str, piece: Piece, encoder: str, out: str) -> list[str]:
+    """One piece as its own file of exactly its length on both tracks (frames on the FPS grid,
+    samples at 48 kHz; a short track is padded), so the pieces concatenate without drift."""
+    ss = max(piece.offset_s - SEEK_PREROLL_S, 0.0)
+    pre = piece.offset_s - ss
+    frames = max(round(piece.duration_s * FPS), 1)
+    samples = max(round(piece.duration_s * SAMPLE_RATE), 1)
+    graph = (
+        f"[0:v:0]trim=start={pre:.3f},setpts=PTS-{pre:.3f}/TB,scale=-2:{HEIGHT},"
+        f"fps=fps={FPS}:start_time=0:round=near,"
+        f"tpad=stop_mode=clone:stop_duration={piece.duration_s:.3f},trim=end_frame={frames},"
+        f"setpts=N/{FPS}/TB[v];"
+        f"[0:a:0]atrim=start={pre:.3f},asetpts=PTS-{pre:.3f}/TB,"
+        f"aresample={SAMPLE_RATE}:async=1:first_pts=0,apad,atrim=end_sample={samples},"
+        f"asetpts=N/{SAMPLE_RATE}/TB[a]"
+    )
     return [
-        "-vf",
-        f"scale=-2:{HEIGHT},fps={FPS}",
-        *video,
-        "-g",
-        str(FPS),
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "96k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-    ]
+        ffmpeg, "-v", "error", "-y",
+        "-ss", f"{ss:.3f}", "-t", f"{pre + piece.duration_s + 1.0:.3f}", "-i", source,
+        "-filter_complex", graph, "-map", "[v]", "-map", "[a]",
+        *codec_args(encoder), out,
+    ]  # fmt: skip
 
 
 def _run(cmd: list[str]) -> None:
@@ -374,16 +388,8 @@ class Cutter:
             parts = []
             for i, p in enumerate(pieces):
                 part = tmp / f"p{i:03d}.mp4"
-                _run(
-                    [
-                        self.ffmpeg, "-v", "error", "-y",
-                        "-ss", f"{p.offset_s:.3f}",
-                        "-i", str(self.chunk_file(p.chunk_key)),
-                        "-t", f"{p.duration_s:.3f}",
-                        *encode_args(self.encoder),
-                        str(part),
-                    ]
-                )  # fmt: skip
+                source = str(self.chunk_file(p.chunk_key))
+                _run(piece_command(self.ffmpeg, source, p, self.encoder, str(part)))
                 parts.append(part)
             listing = tmp / "list.txt"
             listing.write_text("".join(f"file '{p.name}'\n" for p in parts), encoding="utf-8")
@@ -574,6 +580,61 @@ def page_html() -> bytes:
     return resources.files("clipper_judge").joinpath("label_page.html").read_bytes()
 
 
+def send_video(h: BaseHTTPRequestHandler, path: Path) -> None:
+    """An mp4 file with byte ranges (the player seeks), 404 when it is missing; shared by the
+    label page and the ideas rating page (`ideas_rate`)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        body = json.dumps({"error": "video missing"}).encode("utf-8")
+        h.send_response(HTTPStatus.NOT_FOUND)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        if h.command != "HEAD":
+            h.wfile.write(body)
+        return
+    start, end = 0, size - 1
+    status = HTTPStatus.OK
+    rng = h.headers.get("Range")
+    m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip()) if rng else None
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else size - 1
+        else:  # the last N bytes
+            start = max(size - int(m.group(2)), 0)
+        end = min(end, size - 1)
+        if start > end:
+            h.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            h.send_header("Content-Range", f"bytes */{size}")
+            h.end_headers()
+            return
+        status = HTTPStatus.PARTIAL_CONTENT
+    length = end - start + 1
+    h.send_response(status)
+    h.send_header("Content-Type", "video/mp4")
+    h.send_header("Accept-Ranges", "bytes")
+    h.send_header("Content-Length", str(length))
+    if status == HTTPStatus.PARTIAL_CONTENT:
+        h.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+    h.end_headers()
+    if h.command == "HEAD":
+        return
+    with path.open("rb") as f:
+        f.seek(start)
+        left = length
+        while left > 0:
+            buf = f.read(min(1 << 20, left))
+            if not buf:
+                break
+            try:
+                h.wfile.write(buf)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return  # the player moved on
+            left -= len(buf)
+
+
 def make_handler(store: LabelStore) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "clipper-label"
@@ -612,50 +673,7 @@ def make_handler(store: LabelStore) -> type[BaseHTTPRequestHandler]:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def _video(self, path: Path) -> None:
-            try:
-                size = path.stat().st_size
-            except OSError:
-                self._json(HTTPStatus.NOT_FOUND, {"error": "video missing"})
-                return
-            start, end = 0, size - 1
-            status = HTTPStatus.OK
-            rng = self.headers.get("Range")
-            m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip()) if rng else None
-            if m and (m.group(1) or m.group(2)):
-                if m.group(1):
-                    start = int(m.group(1))
-                    end = int(m.group(2)) if m.group(2) else size - 1
-                else:  # the last N bytes
-                    start = max(size - int(m.group(2)), 0)
-                end = min(end, size - 1)
-                if start > end:
-                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.end_headers()
-                    return
-                status = HTTPStatus.PARTIAL_CONTENT
-            length = end - start + 1
-            self.send_response(status)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(length))
-            if status == HTTPStatus.PARTIAL_CONTENT:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.end_headers()
-            if self.command == "HEAD":
-                return
-            with path.open("rb") as f:
-                f.seek(start)
-                left = length
-                while left > 0:
-                    buf = f.read(min(1 << 20, left))
-                    if not buf:
-                        break
-                    try:
-                        self.wfile.write(buf)
-                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                        return  # the player moved on
-                    left -= len(buf)
+            send_video(self, path)
 
         def do_POST(self) -> None:
             if self.path != "/api/label":
