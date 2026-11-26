@@ -33,6 +33,16 @@ def _libpq(url: str) -> str:
     return url.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+def pytest_collection_modifyitems(config, items):
+    # Tests against the real Twitch run only on request: they are slow and depend on Twitch.
+    if os.environ.get("CLIPPER_TWITCH_LIVE_TESTS") == "1":
+        return
+    skip = pytest.mark.skip(reason="real Twitch requests: set CLIPPER_TWITCH_LIVE_TESTS=1")
+    for item in items:
+        if "twitch_live" in item.keywords:
+            item.add_marker(skip)
+
+
 def pytest_asyncio_loop_factories(config, item):
     # psycopg async can't use Windows' default Proactor loop (same as clipper_core.runtime.run).
     if sys.platform == "win32":

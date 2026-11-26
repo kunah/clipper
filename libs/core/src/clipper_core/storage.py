@@ -5,6 +5,7 @@ boto3 is blocking; from async code call these methods via asyncio.to_thread.
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
@@ -32,6 +33,38 @@ class keys:
     @staticmethod
     def chunk_words(stream_id: int, seq: int) -> str:
         return f"streams/{stream_id}/transcripts/{seq:06d}.json"
+
+    @staticmethod
+    def judge_io(request_hash: str, clip_id: int | None = None, suffix: str | None = None) -> str:
+        """Request + raw response of a judge call (`judge_calls.io_key`; evals, prompt work).
+
+        Keyed on the call's `request_hash` (hex sha256), so the judge uploads it before the
+        `judge_calls` row exists; calls outside a clip (evals) go under `judge/`. `suffix`
+        (lowercase letters, digits, `-`) keeps several records of one request apart: the judge
+        gives each failed call (provider error, usage limit) its own, so the request's next call
+        doesn't overwrite it (`{request_hash}.{suffix}.json`)."""
+        if not re.fullmatch(r"[0-9a-f]+", request_hash):
+            raise ValueError(f"request hash must be lowercase hex: {request_hash!r}")
+        if suffix is not None and not re.fullmatch(r"[0-9a-z][0-9a-z-]*", suffix):
+            raise ValueError(f"suffix must be lowercase letters, digits and '-': {suffix!r}")
+        prefix = "judge" if clip_id is None else f"clips/{clip_id}/judge"
+        name = request_hash if suffix is None else f"{request_hash}.{suffix}"
+        return f"{prefix}/{name}.json"
+
+    @staticmethod
+    def clip_pinned_video(clip_id: int, seq: int) -> str:
+        """The renderer's copy of a chunk's video that a clip uses (`renders.pinned_keys`, §20):
+        the chunk's own video goes with the blind ~48 h retention, the pinned copy with the
+        clip's (re-renders after review still work)."""
+        return f"clips/{clip_id}/pinned/{seq:06d}.ts"
+
+    @staticmethod
+    def render_file(clip_id: int, render_id: int, name: str) -> str:
+        """One output of a render (§20): `clip.mp4`, `preview.mp4`, `thumb.jpg`,
+        `captions.ass`, `render.json`. `name` is a plain file name."""
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*", name) or ".." in name:
+            raise ValueError(f"not a plain file name: {name!r}")
+        return f"clips/{clip_id}/renders/{render_id}/{name}"
 
 
 class ObjectStore:
@@ -95,6 +128,14 @@ class ObjectStore:
 
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self.bucket, Key=key)
+
+    def copy(self, src_key: str, dst_key: str) -> None:
+        """Server-side copy inside the bucket (S3 CopyObject: nothing passes through this
+        process; objects up to 5 GB, a ~60 s chunk is ~60 MB). Raises botocore's ClientError
+        (code `NoSuchKey`/`404`) when `src_key` doesn't exist."""
+        self._client.copy_object(
+            Bucket=self.bucket, Key=dst_key, CopySource={"Bucket": self.bucket, "Key": src_key}
+        )
 
     def presigned_url(self, key: str, expires_s: int = 3600) -> str:
         return self._client.generate_presigned_url(

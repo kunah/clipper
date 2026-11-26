@@ -1,0 +1,23 @@
+# Renderer layouts (DESIGN §20 "Layouts"). Mounted read-only into the renderer at /config; it is
+# read for every render (edits need no restart) and its sha256 goes into each render.
+#
+# Rects are normalised source rects (0..1 of the source frame's width/height), so 720p and 1080p
+# sources share one config. Fit a channel's facecam with
+#   uv run clipper-renderer layout-preview <login> --at <utc>
+# which draws the rects on a frame of a recorded chunk.
+#
+# Choice per render: the plan's layout hint where the config allows it; `auto` -> the category's
+# layout, else the channel's `default`, else facecam_gameplay when a facecam rect exists, else
+# the `default` below.
+
+version = 1
+default = "blurred_fit"   # PROPOSED: the whole frame, full width, over a blurred copy
+
+# ohnepixel (fitted 2026-11-26 with layout-preview on stream 2415, GTA VI, 1080p60): a keyed
+# cutout cam (no border) bottom-left, over the minimap. The rect has the facecam panel's aspect
+# (1080 x 760 = 1.42) so nothing of the head is cropped; it ends at the frame's bottom edge.
+[channels.ohnepixel]
+facecam = { x = 0.0344, y = 0.6111, w = 0.3109, h = 0.3889 }   # x 66-663, y 660-1080 at 1080p
+default = "facecam_gameplay"
+# gameplay_focus_x stays 0.5 (centred; approved 2026-11-26): the crop shows a sliver of the cam at
+# its bottom-left, accepted; 0.6 removes it but puts the character off centre.

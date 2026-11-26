@@ -44,8 +44,11 @@ DEFAULT_LEVELS = {
     "asyncio": "WARNING",
     "boto3": "WARNING",
     "botocore": "WARNING",
+    "faster_whisper": "WARNING",  # one INFO line per transcribe call
     "httpcore": "WARNING",
+    "httpcore2": "WARNING",
     "httpx": "WARNING",
+    "httpx2": "WARNING",  # huggingface_hub's client: one INFO line per request
     "s3transfer": "WARNING",
     "sqlalchemy.engine": "WARNING",
     "urllib3": "WARNING",
@@ -187,7 +190,8 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         doc: dict[str, Any] = {
             "timestamp": _timestamp(record),
-            "level": record.levelname,
+            # upper(): streamlink renames the stdlib levels to lowercase when it is imported
+            "level": record.levelname.upper(),
             "service": _process["service"],
             "worker": _process["worker"],
             "logger": record.name,
@@ -203,7 +207,7 @@ class ConsoleFormatter(logging.Formatter):
         exception = fields.pop("exception", None)
         fields.pop("exc_type", None)
         line = (
-            f"{_timestamp(record)[11:]} {record.levelname:<7} {_process['service']} "
+            f"{_timestamp(record)[11:]} {record.levelname.upper():<7} {_process['service']} "
             f"{record.name}: {record.getMessage()}"
         )
         if fields:

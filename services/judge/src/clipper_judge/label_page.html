@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clipper labels</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6a66; --line: #dddad3;
+    --accent: #2f5fd0; --clip: #1f8a4c; --reject: #c2412d; --moment: rgba(47, 95, 208, 0.18);
+    --gap: #b9b5ab; --cut: rgba(31, 138, 76, 0.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #1f1f1d; --text: #ecebe7; --muted: #a09e97; --line: #34332f;
+      --accent: #7d9cf0; --clip: #4cc283; --reject: #f07a64; --moment: rgba(125, 156, 240, 0.22);
+      --gap: #55534d; --cut: rgba(76, 194, 131, 0.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #progress { color: var(--muted); }
+  #bar { flex: 1; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  #bar > div { height: 100%; background: var(--accent); width: 0; }
+  main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 47px); }
+  nav { border-right: 1px solid var(--line); overflow-y: auto; max-height: calc(100vh - 47px);
+        background: var(--panel); }
+  nav button { display: flex; width: 100%; gap: 8px; align-items: center; padding: 6px 12px;
+               border: 0; background: none; color: var(--text); text-align: left; cursor: pointer;
+               font: inherit; }
+  nav button:hover { background: var(--bg); }
+  nav button.current { background: var(--moment); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line); flex: none; }
+  .dot.clip { background: var(--clip); } .dot.reject { background: var(--reject); }
+  .cut-mark { color: var(--muted); font-size: 12px; margin-left: auto; }
+  section { padding: 14px 18px; max-width: 1100px; }
+  #meta { margin-bottom: 8px; }
+  #meta .title { font-weight: 600; }
+  #meta .sub { color: var(--muted); }
+  video { width: 100%; max-height: 62vh; background: #000; border-radius: 6px; display: block; }
+  #timeline { position: relative; height: 34px; margin: 10px 0 4px; background: var(--panel);
+              border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+  #timeline .moment { position: absolute; top: 0; bottom: 0; background: var(--moment); }
+  #timeline .cut { position: absolute; top: 9px; bottom: 9px; background: var(--cut);
+                   border-radius: 3px; }
+  #timeline .t { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); }
+  #timeline .gap { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--gap); }
+  #timeline .edge { position: absolute; top: 2px; bottom: 2px; width: 3px; background: var(--clip);
+                    border-radius: 2px; }
+  #timeline .head { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+  #times { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px;
+           font-variant-numeric: tabular-nums; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+  .row button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line);
+                background: var(--panel); color: var(--text); cursor: pointer; }
+  .row button:hover { border-color: var(--accent); }
+  .row button.clip { border-color: var(--clip); color: var(--clip); font-weight: 600; }
+  .row button.reject { border-color: var(--reject); color: var(--reject); font-weight: 600; }
+  .row button.active.clip { background: var(--clip); color: #fff; }
+  .row button.active.reject { background: var(--reject); color: #fff; }
+  #cut { font-variant-numeric: tabular-nums; min-width: 260px; }
+  #note { flex: 1; min-width: 200px; font: inherit; padding: 6px 8px; border-radius: 6px;
+          border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+  kbd { font: 12px ui-monospace, monospace; padding: 1px 4px; border: 1px solid var(--line);
+        border-radius: 3px; background: var(--panel); }
+  #help { color: var(--muted); margin-top: 14px; font-size: 13px; }
+  #status { color: var(--muted); margin-left: 8px; }
+  #status.err { color: var(--reject); }
+  @media (max-width: 720px) {
+    main { grid-template-columns: 1fr; }
+    nav { max-height: 160px; border-right: 0; border-bottom: 1px solid var(--line); }
+    section { padding: 12px 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Clipper labels</h1>
+  <span id="progress">loading…</span>
+  <div id="bar"><div></div></div>
+</header>
+<main>
+  <nav id="list"></nav>
+  <section>
+    <div id="meta"></div>
+    <video id="video" controls preload="auto"></video>
+    <div id="timeline" title="click to seek"></div>
+    <div id="times"><span id="tnow"></span><span id="tlen"></span></div>
+    <div class="row">
+      <button id="bMoment" title="J">⟲ moment</button>
+      <button id="bIn" title="I">mark in</button>
+      <button id="bOut" title="O">mark out</button>
+      <button id="bClear">clear cut</button>
+      <span id="cut"></span>
+    </div>
+    <div class="row">
+      <button id="bClip" class="clip" title="C">clip</button>
+      <button id="bReject" class="reject" title="R">reject</button>
+      <button id="bUnset" title="U">unlabel</button>
+      <input id="note" placeholder="note (optional)" maxlength="300">
+      <button id="bPrev" title="P">◀ prev</button>
+      <button id="bNext" title="N">next ▶</button>
+      <span id="status"></span>
+    </div>
+    <div id="help">
+      Would this moment make a good short clip on its own? <b>Clip</b> or <b>reject</b>; for a clip,
+      optionally mark where you'd cut it (in/out). The shaded band is the moment the detector saw;
+      the blue line is T. Keys: <kbd>Space</kbd> play/pause · <kbd>←</kbd>/<kbd>→</kbd> ±1 s ·
+      <kbd>Shift</kbd>+arrows ±5 s · <kbd>J</kbd> moment · <kbd>I</kbd>/<kbd>O</kbd> in/out ·
+      <kbd>C</kbd> clip · <kbd>R</kbd> reject · <kbd>U</kbd> unlabel · <kbd>N</kbd>/<kbd>P</kbd>
+      next/prev. Saving moves on to the next unlabelled case.
+    </div>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const video = $("video");
+let cases = [];
+let idx = 0;
+let cut = { in: null, out: null };  // seconds from T
+
+const ms = (iso) => Date.parse(iso);
+const fmt = (s) => (s < 0 ? "−" : "+") + Math.abs(s).toFixed(1) + " s";
+
+function cur() { return cases[idx]; }
+
+function vToUtc(c, v) {
+  const segs = c.segments;
+  for (const s of segs) {
+    if (v <= s.v + s.d) return ms(s.u) + Math.max(0, v - s.v) * 1000;
+  }
+  const last = segs[segs.length - 1];
+  return ms(last.u) + last.d * 1000;
+}
+
+function utcToV(c, t) {
+  for (const s of c.segments) {
+    const a = ms(s.u), b = a + s.d * 1000;
+    if (t < a) return s.v;  // in a gap: the next piece's start
+    if (t <= b) return s.v + (t - a) / 1000;
+  }
+  return c.duration_s;
+}
+
+const relT = (c, v) => (vToUtc(c, v) - ms(c.anchor_utc)) / 1000;
+const vOfRel = (c, r) => utcToV(c, ms(c.anchor_utc) + r * 1000);
+
+// pieces whose start isn't where the previous one ended (a recording gap): the video jumps
+function jumps(c) {
+  const out = [];
+  for (let i = 1; i < c.segments.length; i++) {
+    const prev = c.segments[i - 1], s = c.segments[i];
+    if (Math.abs(ms(s.u) - (ms(prev.u) + prev.d * 1000)) > 500) out.push(s);
+  }
+  return out;
+}
+
+function pct(c, v) { return (100 * Math.min(Math.max(v, 0), c.duration_s) / c.duration_s) + "%"; }
+
+function el(cls, left, width) {
+  const d = document.createElement("div");
+  d.className = cls;
+  d.style.left = left;
+  if (width !== undefined) d.style.width = width;
+  return d;
+}
+
+function drawTimeline() {
+  const c = cur(), tl = $("timeline");
+  tl.replaceChildren();
+  const m0 = utcToV(c, ms(c.moment[0])), m1 = utcToV(c, ms(c.moment[1]));
+  tl.append(el("moment", pct(c, m0), `calc(${pct(c, m1)} - ${pct(c, m0)})`));
+  for (const s of jumps(c)) tl.append(el("gap", pct(c, s.v)));
+  if (cut.in !== null && cut.out !== null) {
+    const a = vOfRel(c, cut.in), b = vOfRel(c, cut.out);
+    tl.append(el("cut", pct(c, a), `calc(${pct(c, b)} - ${pct(c, a)})`));
+  }
+  for (const r of [cut.in, cut.out]) if (r !== null) tl.append(el("edge", pct(c, vOfRel(c, r))));
+  tl.append(el("t", pct(c, utcToV(c, ms(c.anchor_utc)))));
+  const head = el("head", pct(c, video.currentTime || 0));
+  head.id = "head";
+  tl.append(head);
+}
+
+function drawCut() {
+  const parts = [];
+  if (cut.in !== null) parts.push("in " + fmt(cut.in));
+  if (cut.out !== null) parts.push("out " + fmt(cut.out));
+  if (cut.in !== null && cut.out !== null) parts.push((cut.out - cut.in).toFixed(1) + " s long");
+  $("cut").textContent = parts.length ? parts.join(" · ") : "no cut marked";
+}
+
+function drawList() {
+  const nav = $("list");
+  nav.replaceChildren();
+  cases.forEach((c, i) => {
+    const b = document.createElement("button");
+    if (i === idx) b.className = "current";
+    const dot = document.createElement("span");
+    dot.className = "dot" + (c.label ? " " + c.label.verdict : "");
+    const name = document.createElement("span");
+    name.textContent = "Case " + (i + 1);
+    b.append(dot, name);
+    if (c.label && c.label.in_s !== null && c.label.in_s !== undefined) {
+      const m = document.createElement("span");
+      m.className = "cut-mark";
+      m.textContent = "cut";
+      b.append(m);
+    }
+    b.onclick = () => select(i);
+    nav.append(b);
+  });
+  const done = cases.filter((c) => c.label).length;
+  $("progress").textContent = `${done} / ${cases.length} labelled`;
+  $("bar").firstElementChild.style.width = (100 * done / Math.max(cases.length, 1)) + "%";
+}
+
+function drawVerdict() {
+  const v = cur().label ? cur().label.verdict : null;
+  $("bClip").classList.toggle("active", v === "clip");
+  $("bReject").classList.toggle("active", v === "reject");
+}
+
+function select(i) {
+  idx = Math.max(0, Math.min(i, cases.length - 1));
+  const c = cur();
+  const l = c.label;
+  cut = { in: l && l.in_s !== undefined ? l.in_s : null, out: l && l.out_s !== undefined ? l.out_s : null };
+  $("note").value = (l && l.note) || "";
+  const when = new Date(ms(c.anchor_utc));
+  const meta = $("meta");
+  meta.replaceChildren();
+  const t = document.createElement("div");
+  t.className = "title";
+  t.textContent = `Case ${idx + 1} · ${c.channel} · ${c.title || "(no title)"}`;
+  const s = document.createElement("div");
+  s.className = "sub";
+  s.textContent = `${c.category || "no category"} · T = ${when.toISOString().replace("T", " ").slice(0, 19)} UTC · `
+    + `${c.duration_s.toFixed(0)} s of video` + (jumps(c).length ? `, ${jumps(c).length} jump(s) where the recording has a gap (grey marks)` : "");
+  meta.append(t, s);
+  video.src = "video/" + c.key + ".mp4";
+  video.addEventListener("loadedmetadata", () => jumpToMoment(), { once: true });
+  $("tlen").textContent = "";
+  status("");
+  drawList(); drawCut(); drawVerdict(); drawTimeline();
+  const btn = $("list").children[idx];
+  if (btn) btn.scrollIntoView({ block: "nearest" });
+}
+
+function jumpToMoment() {
+  const c = cur();
+  video.currentTime = Math.max(0, utcToV(c, ms(c.moment[0])) - 5);
+}
+
+function status(msg, err) {
+  const s = $("status");
+  s.textContent = msg;
+  s.className = err ? "err" : "";
+}
+
+function mark(which) {
+  const r = Math.round(relT(cur(), video.currentTime) * 10) / 10;
+  cut[which] = r;
+  if (cut.in !== null && cut.out !== null && cut.in >= cut.out) {
+    if (which === "in") cut.out = null; else cut.in = null;
+  }
+  drawCut(); drawTimeline();
+}
+
+async function save(verdict) {
+  const c = cur();
+  if ((cut.in === null) !== (cut.out === null)) {
+    status("mark both in and out, or clear the cut", true);
+    return;
+  }
+  const body = { key: c.key, verdict, note: $("note").value.trim() };
+  if (verdict && cut.in !== null) { body.in_s = cut.in; body.out_s = cut.out; }
+  const r = await fetch("api/label", { method: "POST", headers: { "Content-Type": "application/json" },
+                                       body: JSON.stringify(body) });
+  const data = await r.json();
+  if (!r.ok) { status(data.error || "not saved", true); return; }
+  c.label = data.label;
+  if (!verdict) { cut = { in: null, out: null }; drawCut(); drawTimeline(); }
+  drawList(); drawVerdict();
+  status(verdict ? "saved" : "label removed");
+  if (verdict) {
+    const next = cases.findIndex((x, i) => i > idx && !x.label);
+    const first = cases.findIndex((x) => !x.label);
+    if (next >= 0) select(next); else if (first >= 0) select(first); else status("all labelled — thank you");
+  }
+}
+
+video.addEventListener("timeupdate", () => {
+  const c = cur();
+  if (!c) return;
+  const head = $("head");
+  if (head) head.style.left = pct(c, video.currentTime);
+  $("tnow").textContent = "T " + fmt(relT(c, video.currentTime));
+});
+
+$("timeline").addEventListener("click", (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  video.currentTime = cur().duration_s * (e.clientX - r.left) / r.width;
+});
+
+$("bMoment").onclick = jumpToMoment;
+$("bIn").onclick = () => mark("in");
+$("bOut").onclick = () => mark("out");
+$("bClear").onclick = () => { cut = { in: null, out: null }; drawCut(); drawTimeline(); };
+$("bClip").onclick = () => save("clip");
+$("bReject").onclick = () => save("reject");
+$("bUnset").onclick = () => save(null);
+$("bPrev").onclick = () => select(idx - 1);
+$("bNext").onclick = () => select(idx + 1);
+
+document.addEventListener("keydown", (e) => {
+  if (e.target === $("note") || e.ctrlKey || e.metaKey || e.altKey) return;
+  const step = e.shiftKey ? 5 : 1;
+  const k = e.key.toLowerCase();
+  const actions = {
+    " ": () => (video.paused ? video.play() : video.pause()),
+    "arrowleft": () => { video.currentTime = Math.max(0, video.currentTime - step); },
+    "arrowright": () => { video.currentTime = Math.min(cur().duration_s, video.currentTime + step); },
+    "j": jumpToMoment, "i": () => mark("in"), "o": () => mark("out"),
+    "c": () => save("clip"), "r": () => save("reject"), "u": () => save(null),
+    "n": () => select(idx + 1), "p": () => select(idx - 1),
+  };
+  if (actions[k]) { e.preventDefault(); actions[k](); }
+});
+
+fetch("api/cases").then((r) => r.json()).then((data) => {
+  cases = data.cases;
+  if (!cases.length) { $("progress").textContent = "no cases"; return; }
+  const first = cases.findIndex((c) => !c.label);
+  select(first >= 0 ? first : 0);
+}).catch((e) => { $("progress").textContent = "could not load the cases: " + e; });
+</script>
+</body>
+</html>

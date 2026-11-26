@@ -3,7 +3,17 @@
 # Add new services to `members` as they are created.
 
 [tool.uv.workspace]
-members = ["libs/*", "db", "services/*"]
+members = ["libs/*", "db", "services/*", "tools/backfill"]  # not tools/*: asr-bench stays out
+
+[tool.uv]
+# faster-whisper requires the CPU package `onnxruntime`. On Linux (the transcriber's CUDA image)
+# the transcriber has onnxruntime-gpu instead, which installs the same `onnxruntime` module: with
+# both, uninstalling or upgrading either breaks the other. An override replaces every
+# requirement on the package (the transcriber's own pin too), so it keeps the CPU package where
+# it is wanted (Windows dev env, tests) at the transcriber's version, and drops CPU onnxruntime
+# on Linux for EVERY workspace member (a member that needs it on Linux must use onnxruntime-gpu
+# or change this). A test keeps the pin equal to the transcriber's.
+override-dependencies = ["onnxruntime==1.31.1; sys_platform != 'linux'"]
 
 [dependency-groups]
 dev = [
@@ -15,16 +25,33 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Code blocks in the docs (DESIGN.md) are sketches; ruff would reformat them.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "RUF"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["clipper_core", "clipper_db", "clipper_twitch", "clipper_chat_ingest", "clipper_controller", "clipper_recorder"]
+known-first-party = [
+    "clipper_core",
+    "clipper_db",
+    "clipper_twitch",
+    "clipper_chat_ingest",
+    "clipper_controller",
+    "clipper_recorder",
+    "clipper_transcriber",
+    "clipper_backfill",
+    "clipper_detector",
+    "clipper_judge",
+    "clipper_renderer",
+]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-testpaths = ["libs", "db", "services"]
-markers = ["integration: needs the Postgres from compose.yaml (skipped when unreachable)"]
+testpaths = ["libs", "db", "services", "tools/backfill"]
+markers = [
+    "integration: needs the Postgres from compose.yaml (skipped when unreachable)",
+    "twitch_live: anonymous requests to the real Twitch (skipped unless CLIPPER_TWITCH_LIVE_TESTS=1)",
+]

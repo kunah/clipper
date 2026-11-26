@@ -37,6 +37,51 @@ def test_privmsg_with_twitch_and_third_party_emotes():
     assert out.events == []
 
 
+# A PRIVMSG's tags as Twitch sends them today, without the optional ones (bits, msg-id, reward...)
+TWITCH_TAGS = (
+    "badge-info=subscriber/14;badges=subscriber/12,premium/1;client-nonce=8c1f0b6e8e2a4f3d9b7c;"
+    "color=#1E90FF;display-name=Bob;emotes=;first-msg=0;flags=;"
+    "id=7f3c2a1e-0b9d-4c55-8e21-5a6b7c8d9e0f;mod=0;returning-chatter=0;room-id=42;subscriber=1;"
+    f"tmi-sent-ts={TS};turbo=0;user-id=99;user-type="
+)
+REWARD = "2d9a1a7c-1c6e-4f1b-9e2e-6b4d0e7f3a11"
+
+
+def tags_of(line: str) -> tuple:
+    row = m(line).message
+    return row.first_message, row.highlighted, row.reward_id, row.msg_type
+
+
+def test_privmsg_tags_first_message_highlight_reward_and_msg_type():
+    first = TWITCH_TAGS.replace("first-msg=0", "first-msg=1")
+    tail = ":bob!bob@bob.tmi.twitch.tv PRIVMSG #dallas :"
+    assert tags_of(f"@{TWITCH_TAGS} {tail}hello") == (False, False, None, None)
+    assert tags_of(f"@{first} {tail}hi chat, first time here") == (True, False, None, None)
+    highlight = f"@{TWITCH_TAGS};msg-id=highlighted-message {tail}look at me"
+    assert tags_of(highlight) == (False, True, None, "highlighted-message")
+    reward = f"@custom-reward-id={REWARD};{TWITCH_TAGS} {tail}hydrate!"
+    assert tags_of(reward) == (False, False, REWARD, None)
+    # other msg-ids (Power-ups, sub-mode skip, first-chat intro) aren't highlights; an empty
+    # reward tag is no reward
+    for msg_type in (
+        "gigantified-emote-message",
+        "animated-message",
+        "skip-subs-mode-message",
+        "user-intro",
+    ):
+        line = f"@{TWITCH_TAGS};msg-id={msg_type};custom-reward-id= {tail}Kappa"
+        assert tags_of(line) == (False, False, None, msg_type)
+    # first-msg missing or empty: unknown, not False; an empty msg-id is none
+    assert tags_of(f"@id=x;tmi-sent-ts={TS} {tail}hi") == (None, False, None, None)
+    empty = TWITCH_TAGS.replace("first-msg=0", "first-msg=")
+    assert tags_of(f"@{empty};msg-id= {tail}hi") == (None, False, None, None)
+    # no tags at all (no twitch.tv/tags): all unknown
+    assert tags_of(f"{tail}hi") == (None, None, None, None)
+    row = m(f"@{first};msg-id=highlighted-message {tail}\x01ACTION waves\x01").message
+    assert row.badges == {"subscriber": "12", "premium": "1", "_action": "1"}  # as before
+    assert (row.first_message, row.highlighted) == (True, True)
+
+
 def test_action_bits_and_missing_timestamp():
     out = m("@id=x;bits=100 :bob!bob@b PRIVMSG #dallas :\x01ACTION cheers\x01")
     assert out.message.text == "cheers" and out.message.badges == {"_action": "1"}

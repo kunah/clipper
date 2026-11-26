@@ -238,6 +238,84 @@ async def test_runner_wakes_on_notify_and_records_failures(sessions, settings):
     assert row.last_error == "RuntimeError: bad chunk"
 
 
+class BrokenInput(jobs.PermanentJobError):
+    pass
+
+
+async def test_permanent_error_fails_the_job_at_once(sessions):
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session)
+        broken = await add_chunk(session, stream_id, 0)
+        flaky = await add_chunk(session, stream_id, 1)
+        broken_job = await enqueue_transcribe(session, broken, Priority.TRIGGER)
+        flaky_job = await enqueue_transcribe(session, flaky, Priority.LIVE)
+
+    async def handler(job: jobs.ClaimedJob) -> None:
+        if job.ref_id == broken:
+            raise BrokenInput("file can't be decoded")
+        raise RuntimeError("try again")
+
+    runner = jobs.JobRunner(sessions, "unused", "runner-1", {JobKind.TRANSCRIBE: handler})
+    assert await runner.run_once() and await runner.run_once()
+    row = await job_row(sessions, broken_job)
+    assert row.status == JobStatus.FAILED and row.attempts == 1 < row.max_attempts
+    assert row.last_error == "BrokenInput: file can't be decoded"
+    assert row.finished_at is not None and row.locked_by is None
+    row = await job_row(sessions, flaky_job)  # ordinary errors still retry with backoff
+    assert row.status == JobStatus.QUEUED and row.attempts == 1 and row.finished_at is None
+
+
+async def test_retry_later_defers_without_using_an_attempt(sessions):
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session)
+        job_id = await enqueue_transcribe(session, await add_chunk(session, stream_id, 0))
+    until = utc_now() + timedelta(hours=2)
+
+    async def handler(job: jobs.ClaimedJob) -> None:
+        raise jobs.RetryLater(until, "usage limit until reset")
+
+    runner = jobs.JobRunner(sessions, "unused", "runner-1", {JobKind.TRANSCRIBE: handler})
+    for _ in range(3):  # deferring again and again never uses up the attempts
+        assert await runner.run_once()
+        row = await job_row(sessions, job_id)
+        assert row.status == JobStatus.QUEUED and row.attempts == 0 and row.locked_by is None
+        assert row.run_after == until and row.last_error == "deferred: usage limit until reset"
+        assert not await runner.run_once()  # not runnable before run_after
+        async with sessions.begin() as session:
+            await session.execute(
+                text("UPDATE jobs SET run_after = now() WHERE id = :id"), {"id": job_id}
+            )
+
+
+async def test_defer_never_dates_a_job_in_the_past_and_needs_the_lock(sessions):
+    from datetime import datetime
+
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session)
+        job_id = await enqueue_transcribe(session, await add_chunk(session, stream_id, 0))
+    with pytest.raises(ValueError, match="naive"):
+        jobs.RetryLater(datetime(2026, 11, 22, 12, 0))
+    job = await claim_one(sessions)
+    async with sessions.begin() as session:  # another worker can't defer it
+        assert not await jobs.defer(session, job, utc_now(), "x", worker_id="someone-else")
+    before = utc_now()
+    async with sessions.begin() as session:  # a past run_after: at least DEFER_MIN from now
+        assert await jobs.defer(session, job, before - timedelta(hours=1), "x", worker_id="w1")
+    row = await job_row(sessions, job_id)
+    assert row.status == JobStatus.QUEUED and row.attempts == 0
+    assert row.run_after >= before + jobs.DEFER_MIN - timedelta(seconds=1)
+
+
+async def test_fail_permanent_ignores_remaining_attempts(sessions):
+    async with sessions.begin() as session:
+        stream_id = await make_stream(session)
+        await enqueue_transcribe(session, await add_chunk(session, stream_id, 0))
+    job = await claim_one(sessions)
+    async with sessions.begin() as session:
+        assert await jobs.fail(session, job, "broken", permanent=True) == JobStatus.FAILED
+    assert (await job_row(sessions, job.id)).status == JobStatus.FAILED
+
+
 async def test_leases(sessions):
     ttl = timedelta(seconds=30)
     async with sessions.begin() as session:

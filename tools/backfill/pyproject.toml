@@ -1,0 +1,25 @@
+[project]
+name = "clipper-backfill"
+version = "0.1.0"
+description = "Backfills past Twitch broadcasts (VOD media, chat replay, viewer clips) in the live format."
+requires-python = ">=3.12"
+dependencies = [
+    "clipper-core",
+    "clipper-twitch[vod]",
+    "httpx>=0.27",
+    "numpy>=2.1",  # calibrate: audio cross-correlation
+]
+
+[project.scripts]
+clipper-backfill = "clipper_backfill.cli:main"
+
+[tool.uv.sources]
+clipper-core = { workspace = true }
+clipper-twitch = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clipper_backfill"]

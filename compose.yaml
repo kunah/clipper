@@ -1,7 +1,12 @@
 # Clipper stack. Every service is its own app + image (see services/*/Dockerfile).
 # Infra ports are bound to 127.0.0.1 only, so nothing is exposed to the network.
 #
-#   docker compose up -d            # postgres + object storage + migrate (and services later)
+#   docker compose up -d            # postgres + object storage + migrate + CPU services
+#   docker compose up -d transcriber   # the GPU worker (profile `gpu`; naming it enables it)
+#   docker compose up -d detector      # live detector (profile `detector`)
+#   docker compose up -d judge         # judge (profile `judge`; CLIPPER_JUDGE_MODEL, fake by default)
+#   docker compose up -d renderer      # renderer (profile `renderer`; GPU, NVENC or libx264)
+#   docker compose run --rm backfill vod <id> --dry-run   # one-off tool (profile `tools`)
 #   docker compose logs -f migrate
 #
 # Data lives in named volumes inside Docker's disk image (on E: on this PC).
@@ -116,7 +121,165 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s   # close open chunks and upload them
 
+  # GPU worker: transcribes chunks (faster-whisper large-v3-turbo and CED sound classes, ONNX on
+  # onnxruntime-gpu, both on CUDA; Silero VAD and CED baked into the image). Whisper's weights
+  # (~1.5 GB) are downloaded into the `models` volume on first start. One per GPU; SIGTERM
+  # finishes the job in progress.
+  # Profile `gpu`: a bare `docker compose up -d` leaves it out; start it by name (see the header).
+  transcriber:
+    profiles: [gpu]
+    build:
+      context: .
+      dockerfile: services/transcriber/Dockerfile
+    image: clipper/transcriber:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: transcriber
+      CLIPPER_WORKER_ID: transcriber-1   # stable id: one heartbeat row across restarts
+    volumes:
+      - models:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  # Live detector (DESIGN §18): chat spikes -> candidates + media requests (+ judge jobs once
+  # CLIPPER_DETECTOR_JUDGE_JOBS=1, i.e. when the judge exists). Needs migration 0004.
+  # Profile `detector`: a bare `docker compose up -d` leaves it out; start it by name.
+  # Viewer clips (Helix Get Clips) are polled only with Twitch credentials.
+  detector:
+    profiles: [detector]
+    build:
+      context: .
+      dockerfile: services/detector/Dockerfile
+    image: clipper/detector:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: detector
+      # Stable id: a restart takes its channel leases right back. Leases are per worker id, so
+      # `--scale detector=2` would make two processes share one owner (both score every
+      # channel): run more detectors as separate services, each with its own id.
+      CLIPPER_WORKER_ID: detector-1
+      CLIPPER_DETECTOR_MODE: live
+      CLIPPER_DETECTOR_JUDGE_JOBS: "0"
+      CLIPPER_TWITCH_CLIENT_ID: ${CLIPPER_TWITCH_CLIENT_ID:-}
+      CLIPPER_TWITCH_CLIENT_SECRET: ${CLIPPER_TWITCH_CLIENT_SECRET:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Judge (DESIGN §19): judge jobs -> clips, edit plans, render jobs; context rounds; revisions.
+  # Profile `judge`: a bare `docker compose up -d` leaves it out; start it by name. Model `fake`
+  # (deterministic rules) unless CLIPPER_JUDGE_MODEL=claude-cli in .env: the Claude Code CLI
+  # pinned in the image, on the user's subscription, with the token of `claude setup-token`
+  # (CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN in .env). It checks `claude auth status` at start and exits
+  # unless that shows the token (authMethod oauth_token), and runs one call at a time. Never
+  # give it an ANTHROPIC_API_KEY (the adapter builds the CLI's environment from scratch anyway).
+  # Nothing enqueues judge jobs until the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=1; its
+  # `render` jobs wait for the renderer (profile `renderer`, §20). The usage guard is off (no caps set).
+  # Needs migration 0005.
+  judge:
+    profiles: [judge]
+    build:
+      context: .
+      dockerfile: services/judge/Dockerfile
+    image: clipper/judge:dev
+    init: true   # tini as PID 1: reaps what a killed `claude` process tree leaves behind
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: judge
+      CLIPPER_WORKER_ID: judge-1   # stable id: one heartbeat row across restarts
+      CLIPPER_JUDGE_MODEL: ${CLIPPER_JUDGE_MODEL:-fake}
+      CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN: ${CLIPPER_JUDGE_CLAUDE_OAUTH_TOKEN:-}
+      # the token's expiry (one year after `claude setup-token`; the CLI reports none for it)
+      CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES: ${CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES:-}
+      CLIPPER_JUDGE_CLAUDE_MODEL: ${CLIPPER_JUDGE_CLAUDE_MODEL:-claude-opus-5-5}
+      CLIPPER_JUDGE_CLAUDE_EFFORT: ${CLIPPER_JUDGE_CLAUDE_EFFORT:-}   # empty: the CLI's default
+      CLIPPER_JUDGE_SHADOW: ${CLIPPER_JUDGE_SHADOW:-}   # JSON list of {model, effort, prompt}
+      CLIPPER_JUDGE_CLAUDE_CONFIG_DIR: /var/lib/clipper-judge
+    volumes:
+      - judge-claude:/var/lib/clipper-judge   # the CLI's own HOME/config (not the user's ~/.claude)
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s   # jobs in progress get 20 s to finish
+
+  # Renderer (DESIGN §20): `render` jobs -> 9:16 clip + preview + thumbnail + captions + manifest
+  # under clips/{id}/renders/, chunk video pinned under clips/{id}/pinned/, a `review` job per
+  # render (they queue until review exists, §21). One render at a time; one per GPU.
+  # Profile `renderer`: a bare `docker compose up -d` leaves it out; start it by name. Encoder
+  # `auto`: h264_nvenc if a test encode works at start (NVENC in Docker Desktop/WSL2 is checked in
+  # build item 7c), else libx264. Layouts: services/renderer/config/layouts.toml (read per render,
+  # no restart needed). SFX/music: the user's licensed library (manifest.toml) in ./data/assets
+  # (gitignored) or CLIPPER_RENDERER_ASSETS; none = cues skipped. Needs migration 0007.
+  renderer:
+    profiles: [renderer]
+    build:
+      context: .
+      dockerfile: services/renderer/Dockerfile
+    image: clipper/renderer:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: renderer
+      CLIPPER_WORKER_ID: renderer-1   # stable id: one heartbeat row across restarts
+      CLIPPER_RENDERER_ENCODER: ${CLIPPER_RENDERER_ENCODER:-auto}
+      CLIPPER_RENDERER_LAYOUTS_PATH: /config/layouts.toml
+      CLIPPER_RENDERER_ASSETS_DIR: /assets
+      CLIPPER_RENDERER_ASSET_PLATFORMS: ${CLIPPER_RENDERER_ASSET_PLATFORMS:-}
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility   # video = NVENC (libnvidia-encode)
+    volumes:
+      - ./services/renderer/config:/config:ro
+      - ${CLIPPER_RENDERER_ASSETS:-./data/assets}:/assets:ro
+      - renderer-work:/work
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 60s   # a render in progress gets 45 s to finish
+
+  # Backfill tool (one-off, profile `tools`): past VODs in the live format (DESIGN §17).
+  #   docker compose run --rm backfill vod 2932113307 --dry-run
+  #   docker compose run --rm backfill vod 2932113307 --max-minutes 30
+  #   docker compose run --rm backfill status
+  # Twitch access is anonymous; Helix credentials (for `channel`) are optional.
+  backfill:
+    profiles: [tools]
+    build:
+      context: .
+      dockerfile: tools/backfill/Dockerfile
+    image: clipper/backfill:dev
+    environment:
+      <<: *app-env
+      CLIPPER_SERVICE_NAME: backfill
+      CLIPPER_TWITCH_CLIENT_ID: ${CLIPPER_TWITCH_CLIENT_ID:-}
+      CLIPPER_TWITCH_CLIENT_SECRET: ${CLIPPER_TWITCH_CLIENT_SECRET:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+    stop_grace_period: 30s   # SIGTERM finishes the chunk in progress
+
 volumes:
   pgdata:
   objectdata:
   spool:
+  models:
+  judge-claude:
+  renderer-work:

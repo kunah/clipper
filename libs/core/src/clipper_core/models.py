@@ -1,5 +1,9 @@
 """Database tables. One writer service per table (noted on each class); anyone may read.
 
+Backfilled streams (`streams.source = 'backfill'`) are the exception: their rows in the live
+tables (the stream, its chunks, gaps, chat messages, chat metrics) are written only by the backfill
+tool, and the live services never touch them (one writer per table *and source*, DESIGN §17).
+
 Migrations are hand-written in db/ and must stay additive (add columns/tables; never rename or
 drop in the same release), because services are updated at different times.
 """
@@ -71,19 +75,28 @@ class Channel(Base):
     display_name: Mapped[str | None] = mapped_column(Text)
     recording_mode: Mapped[str] = mapped_column(Text, server_default="full")
     active: Mapped[bool] = mapped_column(server_default=sql_text("true"))
-    chat_delay_s: Mapped[float | None] = mapped_column(Float)  # learned per channel
+    # Manual override by the operator (the detector never writes channels). Learned delays live
+    # in the detector's `chat_delay_estimates`; the detector uses override -> learned -> default.
+    chat_delay_s: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
 
 
 class Stream(Base):
-    """One broadcast. Writer: controller."""
+    """One broadcast. Writer: controller (`source='live'`), backfill tool (`source='backfill'`).
+
+    The controller never updates a backfilled stream (its upsert only touches `source='live'`).
+    A backfilled stream is always `ended` (CHECK `backfill_ended`): the recorder and chat-ingest
+    follow every `status='live'` row, whatever its source.
+    """
 
     __tablename__ = "streams"
     __table_args__ = (
         UniqueConstraint("channel_id", "platform_stream_id"),
         Index(None, "channel_id", "started_at"),
         CheckConstraint("status IN ('live', 'ended')", name="status"),
+        CheckConstraint("source IN ('live', 'backfill')", name="source"),
+        CheckConstraint("source = 'live' OR status = 'ended'", name="backfill_ended"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -115,7 +128,10 @@ class ViewerSnapshot(Base):
 class Chunk(Base):
     """~60 s of recorded media. Storage unit only; everything else uses UTC times.
 
-    Writer: recorder (and backfill tool).
+    Writer: recorder (`source='live'`), backfill tool (`source='backfill'`): the chunks of
+    backfilled streams, and the chunks a `--fill-gaps` run adds to an ended LIVE stream inside its
+    `not_recorded` gaps and unrecorded tail/head (seq >= `contracts.FILL_SEQ_BASE`, DESIGN §17).
+    Neither side ever updates the other's rows.
     """
 
     __tablename__ = "chunks"
@@ -139,7 +155,12 @@ class Chunk(Base):
 
 
 class StreamGap(Base):
-    """Time ranges with no media (ads, reconnects). Writer: recorder."""
+    """Time ranges with no media (ads, reconnects, muted VOD parts).
+
+    Writer: recorder for live streams, backfill tool for backfilled ones (by the stream's source).
+    A `--fill-gaps` run writes none: a live stream's gap rows stay as the recorder wrote them, also
+    where fill chunks now lie inside them (chunks with audio win in `transcripts.coverage()`).
+    """
 
     __tablename__ = "stream_gaps"
     __table_args__ = (Index(None, "stream_id", "start_utc"),)
@@ -158,7 +179,24 @@ class StreamGap(Base):
 class ChatMessage(Base):
     """Raw chat. Partitioned by day on sent_at (see clipper_core.partitions).
 
-    No foreign keys on purpose: this is the highest-volume table. Writer: chat-ingest, backfill.
+    No foreign keys on purpose: this is the highest-volume table. Writer: chat-ingest
+    (`source='live'`), backfill tool (`source='backfill'`: backfilled streams, and the seconds of
+    a live stream's `--fill-gaps` ranges that have no live chat; insert-only).
+
+    PRIVMSG tags (migration 0006, DESIGN §18.3), set by chat-ingest; NULL = unknown (rows written
+    before 0006 or by the old chat-ingest until its redeploy, backfilled chat: the GQL replay has
+    none of these tags):
+    - `first_message`: `first-msg=1`, the user's first message in this channel (Twitch sends
+      `first-msg=0|1` on every tagged PRIVMSG; NULL when the tag is missing, empty or unexpected);
+    - `msg_type`: the raw `msg-id` (`highlighted-message`, `skip-subs-mode-message`,
+      `gigantified-emote-message`, `animated-message`, `user-intro`, ...); NULL also on a tagged
+      message without one (most messages);
+    - `highlighted`: `msg_type = 'highlighted-message'`, the "highlight my message" channel-point
+      redemption (False on a tagged message without it);
+    - `reward_id`: `custom-reward-id`, the UUID of the channel-point reward redeemed with this
+      message; NULL also means no reward.
+    `highlighted IS NULL` tells whether the tags were known (`msg_type`/`reward_id` NULL are
+    ambiguous on their own).
     """
 
     __tablename__ = "chat_messages"
@@ -181,10 +219,17 @@ class ChatMessage(Base):
     badges: Mapped[dict[str, Any] | None]  # {"subscriber": "12", "moderator": "1"}
     deleted: Mapped[bool] = mapped_column(server_default=sql_text("false"))
     source: Mapped[str] = mapped_column(Text, server_default="live")
+    first_message: Mapped[bool | None]  # `first-msg` tag (0006); NULL = unknown
+    highlighted: Mapped[bool | None]  # `msg-id=highlighted-message` (0006); NULL = unknown
+    reward_id: Mapped[str | None] = mapped_column(Text)  # `custom-reward-id` (0006)
+    msg_type: Mapped[str | None] = mapped_column(Text)  # the raw `msg-id` tag (0006)
 
 
 class ChatEvent(Base):
-    """Subs, gifts, raids, bits, clears... Needed by the fake-spike filter. Writer: chat-ingest."""
+    """Subs, gifts, raids, bits, clears... Needed by the fake-spike filter.
+
+    Writer: chat-ingest only (chat replay has no events, so backfilled streams have none).
+    """
 
     __tablename__ = "chat_events"
     __table_args__ = (Index(None, "channel_id", "sent_at"),)
@@ -200,7 +245,13 @@ class ChatEvent(Base):
 
 
 class ChatMetricSecond(Base):
-    """Per-second chat stats; the live detector reads these. Writer: chat-ingest."""
+    """Per-second chat stats; the live detector reads these.
+
+    Writer: chat-ingest for live streams, backfill tool for backfilled ones (by the stream's
+    source), plus the seconds of a live stream's `--fill-gaps` ranges that had no row (insert-only:
+    a `--fill-gaps` run never overwrites a row). Both compute them with
+    `clipper_core.chat.SecondAggregator`.
+    """
 
     __tablename__ = "chat_metrics_1s"
     __table_args__ = (PrimaryKeyConstraint("channel_id", "ts"), Index(None, "stream_id", "ts"))
@@ -214,13 +265,127 @@ class ChatMetricSecond(Base):
     event_counts: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
 
 
+# --------------------------------------------------------------------------- backfill
+
+
+class Vod(Base):
+    """A platform archive we backfilled, and the time anchor of its media. Writer: backfill tool.
+
+    `t0_utc` = UTC of VOD offset 0 (= the stream's `started_at`), frozen on the first run; every
+    backfilled time is `t0_utc + offset` (shifted per part after a timeline step, see flags).
+    A `--fill-gaps` row (`flags.mode = 'fill_gaps'`) references the LIVE stream it fills; its
+    `t0_utc` is the T0 measured against that stream's live audio (`t0_method = 'audio'`, else
+    'pdt' + `flags.fill_t0_pdt`), not `streams.started_at`.
+    - `t0_method`: a `contracts.T0Method`; `t0_candidates` holds every estimate, e.g.
+      `{"helix": iso, "path_epoch": iso, "chat": iso, "chat_spread_s": 1.0, "comments": 812}`.
+    - `media_status` / `chat_status`: `contracts.VodMediaStatus` / `contracts.VodChatStatus`.
+    - `media_done_s`: VOD offset up to which chunks + gaps are committed (resume point).
+    - `chat_done_s`: VOD offset up to which chat messages are committed; `chat_metrics_to`:
+      `chat_metrics_1s` rows of the stream before it are final (both commit together).
+    - `flags`: e.g. `{"t0_conflict": true, "timeline_uncertain_s": 3.2, "steps": [...],
+      "muted_s": 840, "chat_time_fallbacks": 3, "comments_without_user": 12}`.
+    """
+
+    __tablename__ = "vods"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "platform_video_id"),
+        UniqueConstraint("stream_id"),
+        CheckConstraint(
+            "media_status IN ('pending', 'done', 'restricted', 'gone', 'off')", name="media_status"
+        ),
+        CheckConstraint(
+            "chat_status IN ('pending', 'done', 'skipped', 'unavailable', 'off')",
+            name="chat_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    platform_video_id: Mapped[str] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(Text)
+    platform_created_at: Mapped[datetime]  # Helix created_at
+    duration_s: Mapped[float] = mapped_column(Float)
+    t0_utc: Mapped[datetime]
+    t0_method: Mapped[str] = mapped_column(Text)  # contracts.T0Method
+    t0_candidates: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    rendition: Mapped[str | None] = mapped_column(Text)  # audio_only, 720p60, chunked, ...
+    media_status: Mapped[str] = mapped_column(Text, server_default="pending")
+    media_done_s: Mapped[float] = mapped_column(Float, server_default="0")
+    chat_status: Mapped[str] = mapped_column(Text, server_default="pending")
+    chat_done_s: Mapped[int] = mapped_column(Integer, server_default="0")
+    chat_metrics_to: Mapped[datetime | None]
+    flags: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class ViewerClip(Base):
+    """Viewer-made platform clips: ground truth for the detector. Writer: backfill tool.
+
+    `start_utc`/`end_utc` = the VOD's T0 + `vod_offset_s` (+ `duration_s`); the moment lies within
+    ± `slack_s`. NULL while the platform hasn't assigned a VOD offset yet. `platform_created_at` is
+    when the clip was made, not the moment. `stream_id`: our live or backfilled stream (matched by
+    the VOD's platform stream id), NULL when we have none.
+    """
+
+    __tablename__ = "viewer_clips"
+    __table_args__ = (
+        PrimaryKeyConstraint("platform", "clip_id"),
+        Index(None, "stream_id", "start_utc"),
+        Index(None, "channel_id", "platform_created_at"),
+    )
+
+    platform: Mapped[str] = mapped_column(Text, server_default="twitch")
+    clip_id: Mapped[str] = mapped_column(Text)  # Twitch clip slug
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int | None] = mapped_column(ForeignKey("streams.id"))
+    platform_video_id: Mapped[str | None] = mapped_column(Text)  # Helix "" -> NULL
+    vod_offset_s: Mapped[int | None] = mapped_column(Integer)
+    duration_s: Mapped[float] = mapped_column(Float)
+    start_utc: Mapped[datetime | None]
+    end_utc: Mapped[datetime | None]
+    slack_s: Mapped[float | None] = mapped_column(Float)
+    time_source: Mapped[str | None] = mapped_column(Text)  # vod_t0 | helix_created_at
+    title: Mapped[str | None] = mapped_column(Text)
+    creator_login: Mapped[str | None] = mapped_column(Text)
+    view_count: Mapped[int] = mapped_column(Integer)
+    is_featured: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    platform_created_at: Mapped[datetime]
+    fetched_at: Mapped[datetime] = _created_at()  # last refresh
+
+
 # --------------------------------------------------------------------------- transcripts
 
 
 class ChunkTranscript(Base):
-    """Marks a chunk as transcribed; words live in object storage. Writer: transcriber."""
+    """Marks a chunk as transcribed; words live in object storage. Writer: transcriber.
+
+    Ownership: the words file (`words_key`, a `contracts.WordsFile`) is authoritative only for
+    `[owned_from, owned_to)`; a word belongs to the chunk whose owned range contains its start.
+    Owned ranges of contiguous chunks tile: `P.owned_to == N.owned_from` for neighbours P, N.
+    - `owned_from`: start of the transcribed window (= the words file's `t0`). Normally the
+      chunk's `start_utc`; earlier when this chunk took over the previous chunk's provisional
+      tail.
+    - `owned_to`: the chunk's `end_utc`; on a takeover the previous chunk's `owned_to` becomes
+      this chunk's `owned_from` in the same transaction (and its `tail_from` NULL), so owned
+      ranges never overlap. A re-run while the next contiguous chunk is already transcribed
+      writes `owned_to = min(end_utc, next.owned_from)`.
+    - `tail_from`: words at or after it are provisional (the last sentence ran into the cut and
+      the next chunk will re-transcribe it). NULL = nothing provisional.
+    The writer clamps words to the window and drops a tail that would start at or after
+    `owned_to` (the CHECK requires `owned_from <= tail_from < owned_to`).
+    Read through `clipper_core.transcripts` (`words()`, `coverage()`), never the files directly.
+    """
 
     __tablename__ = "chunk_transcripts"
+    __table_args__ = (
+        CheckConstraint(
+            "owned_to >= owned_from"
+            " AND (tail_from IS NULL OR (tail_from >= owned_from AND tail_from < owned_to))",
+            name="owned_range",
+        ),
+    )
 
     chunk_id: Mapped[int] = mapped_column(ForeignKey("chunks.id"), primary_key=True)
     model: Mapped[str] = mapped_column(Text)
@@ -228,15 +393,27 @@ class ChunkTranscript(Base):
     words_key: Mapped[str] = mapped_column(Text)
     segment_count: Mapped[int] = mapped_column(Integer)
     processing_s: Mapped[float | None] = mapped_column(Float)
+    owned_from: Mapped[datetime]
+    owned_to: Mapped[datetime]
+    tail_from: Mapped[datetime | None]
     created_at: Mapped[datetime] = _created_at()
 
 
 class TranscriptSegment(Base):
-    """Sentence-level text with full-text search. Writer: transcriber."""
+    """Sentence-level text with full-text search. Writer: transcriber.
+
+    `chunk_id` is the chunk whose words file the sentence came from (it may start before that
+    chunk's `start_utc` when the chunk took over the previous chunk's tail). `provisional`: the
+    sentence ran into the end of the chunk and will be replaced by the next contiguous chunk's
+    version (its words are at or after the chunk's `tail_from`). Quality scores (NULL when the
+    engine has none): `avg_logprob` / `no_speech_prob` (whisper-style), `confidence` 0..1 (the
+    engine's segment score, else the mean word probability).
+    """
 
     __tablename__ = "transcript_segments"
     __table_args__ = (
         Index(None, "stream_id", "start_utc"),
+        Index(None, "chunk_id"),
         Index("ix_transcript_segments_text_tsv", "text_tsv", postgresql_using="gin"),
     )
 
@@ -249,11 +426,378 @@ class TranscriptSegment(Base):
     language: Mapped[str | None] = mapped_column(Text)
     avg_logprob: Mapped[float | None] = mapped_column(Float)
     no_speech_prob: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[float | None] = mapped_column(Float)  # 0..1: engine score or mean word prob
     model: Mapped[str] = mapped_column(Text)
+    provisional: Mapped[bool] = mapped_column(server_default=sql_text("false"))
     text_tsv: Mapped[Any] = mapped_column(
         TSVECTOR, Computed("to_tsvector('simple', text)", persisted=True)
     )
     created_at: Mapped[datetime] = _created_at()
+
+
+class AudioMetricSecond(Base):
+    """Per-second audio features; the detector reads them next to `chat_metrics_1s`.
+
+    Writer: transcriber (upserts the seconds of each chunk it processes).
+    - `ts`: start of the UTC second; the row describes `[ts, ts + 1 s)`.
+    - `loudness_db`: RMS level in dBFS (<= 0; the writer floors digital silence at a finite
+      value, never -inf).
+    - `speech_ratio`: fraction of the second the voice-activity detector marked as speech (0..1).
+    - `classes`: sound-class group -> score 0..1 (laughter, screaming, shouting, cheering, gasp,
+      crying, music, singing, speech, gunfire_explosion; each the max over its AudioSet labels).
+      `{}` when no sound tagger ran.
+    The CHECK also rejects NaN (NaN compares greater than every number in Postgres).
+    """
+
+    __tablename__ = "audio_metrics_1s"
+    __table_args__ = (
+        PrimaryKeyConstraint("stream_id", "ts"),
+        CheckConstraint(
+            "speech_ratio BETWEEN 0 AND 1 AND loudness_db <= 0"
+            " AND loudness_db > '-Infinity'::float8",
+            name="ranges",
+        ),
+    )
+
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    ts: Mapped[datetime]
+    loudness_db: Mapped[float] = mapped_column(Float)
+    speech_ratio: Mapped[float] = mapped_column(Float)
+    classes: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+
+
+# --------------------------------------------------------------------------- detector
+
+
+class Candidate(Base):
+    """A moment the detector found (DESIGN §18). Writer: detector; rows are its output only.
+
+    The lifecycle after that lives in the judge's `clips` (`candidate_id`), so §7's "candidate" is
+    an `emitted` row with a judge job and no clip yet. Times (CHECK `nesting`: the moment and the
+    peak lie inside the window):
+    - `peak_utc` = T, the moment in **video** time (= `chat_peak_utc - chat_delay_s` for chat
+      triggers); `chat_peak_utc` = the chat peak (NULL for triggers without chat, e.g. audio).
+    - `chat_delay_s` + `delay_source` (`contracts.DelaySource`: `override` =
+      `channels.chat_delay_s`, `learned` = the median of recent `chat_delay_estimates`,
+      `default`): the delay used, fixed per stream.
+    - `moment_from`..`moment_to`: the moment itself (video time); `window_from`..`window_to`: the
+      media window requested for it (§7), linked through `media_request_id`.
+    `status`: `contracts.CandidateStatus`. `suppressed` rows carry `suppress_reason` (raid, subs,
+    bits, commands, copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget:
+    `contracts.SuppressReason`) and get no judge job. Re-emitting one (a viewer clip or clip
+    mentions arrived) is an in-place UPDATE to `emitted` that keeps the reason (audit), with its
+    media request and judge job in the same transaction. `trigger`: chat, clip_mentions,
+    viewer_clips, audio, transcript (no CHECK: it grows). `moment_type`: a `contracts.MomentType`
+    (CHECK); the scorer maps other lexicon categories (greeting, uncategorised) to
+    `mixed`/`unknown`. `features`: what the scorer saw (z, ratio, baseline, uniques, viewers,
+    shares, categories, top emotes, events, explicit signals, audio, transcript hits, followups,
+    prev_candidate_id). `detector_version` = code + params hash + lexicon version.
+
+    Idempotency: the detector inserts with `ON CONFLICT DO NOTHING` (UNIQUE `stream_id, peak_utc,
+    source`) and creates the media request and the judge job only when a row was inserted, all in
+    one transaction. Before that it dedupes in code against every candidate of the stream within
+    ± 60 s (any source and version): a new chat delay shifts `peak_utc`, so the UNIQUE alone
+    doesn't catch a re-run. No index on `media_request_id` yet: add one in the first migration
+    that deletes `media_requests` rows.
+    """
+
+    __tablename__ = "candidates"
+    __table_args__ = (
+        # also serves lookups by (stream_id, peak_utc)
+        UniqueConstraint("stream_id", "peak_utc", "source"),
+        Index(None, "channel_id", "created_at"),
+        CheckConstraint("source IN ('live', 'offline')", name="source"),
+        CheckConstraint("status IN ('emitted', 'suppressed')", name="status"),
+        CheckConstraint(
+            "status <> 'suppressed' OR suppress_reason IS NOT NULL", name="suppress_reason"
+        ),
+        CheckConstraint(
+            "moment_type IN ('funny', 'hype', 'shock', 'tense', 'sad', 'cringe', 'wholesome',"
+            " 'mixed', 'unknown')",
+            name="moment_type",
+        ),
+        CheckConstraint("moment_to >= moment_from", name="moment_range"),
+        CheckConstraint("window_to > window_from", name="window_range"),
+        CheckConstraint(
+            "window_from <= moment_from AND moment_to <= window_to"
+            " AND peak_utc BETWEEN window_from AND window_to",
+            name="nesting",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    source: Mapped[str] = mapped_column(Text)  # contracts.CandidateSource
+    status: Mapped[str] = mapped_column(Text)  # contracts.CandidateStatus
+    suppress_reason: Mapped[str | None] = mapped_column(Text)  # contracts.SuppressReason
+    trigger: Mapped[str] = mapped_column(Text)
+    peak_utc: Mapped[datetime]  # video time (T)
+    chat_peak_utc: Mapped[datetime | None]  # chat time
+    chat_delay_s: Mapped[float] = mapped_column(Float)
+    delay_source: Mapped[str] = mapped_column(Text)  # contracts.DelaySource
+    moment_from: Mapped[datetime]
+    moment_to: Mapped[datetime]
+    window_from: Mapped[datetime]
+    window_to: Mapped[datetime]
+    score: Mapped[float] = mapped_column(Float)
+    moment_type: Mapped[str] = mapped_column(Text, server_default="unknown")
+    features: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    detector_version: Mapped[str] = mapped_column(Text)
+    media_request_id: Mapped[int | None] = mapped_column(ForeignKey("media_requests.id"))
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class ChatDelayEstimate(Base):
+    """Learned chat delay (chat time - video time) of one stream (DESIGN §18). Writer: detector.
+
+    Computed by the offline pass: event-triggered average of chat activity after loud audio
+    events (`method = 'audio_events'`). `events`: audio events used; `strength`: the peak above
+    the median over lags; `valid` when there were enough events and a clear peak (CHECK
+    `valid_has_delay`: a valid row has `delay_s` and `strength`; an invalid one may have neither,
+    e.g. no events at all). Upserted: `ON CONFLICT (stream_id, method) DO UPDATE ...,
+    computed_at = now()`.
+
+    Later streams of the channel use the median of its last 5 valid estimates **ordered by the
+    stream's `streams.started_at`** (join; not `computed_at`, since a backfill may compute old
+    streams late), skipping backfilled streams whose `vods.flags` has `timeline_uncertain_s`,
+    unless `channels.chat_delay_s` (manual override) is set.
+    """
+
+    __tablename__ = "chat_delay_estimates"
+    __table_args__ = (
+        UniqueConstraint("stream_id", "method"),
+        Index(None, "channel_id", "computed_at"),
+        CheckConstraint("events >= 0", name="events"),
+        CheckConstraint(
+            "NOT valid OR (delay_s IS NOT NULL AND strength IS NOT NULL)", name="valid_has_delay"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    method: Mapped[str] = mapped_column(Text)  # audio_events
+    delay_s: Mapped[float | None] = mapped_column(Float)
+    events: Mapped[int] = mapped_column(Integer)
+    strength: Mapped[float | None] = mapped_column(Float)
+    valid: Mapped[bool]
+    detector_version: Mapped[str] = mapped_column(Text)
+    computed_at: Mapped[datetime] = _created_at()
+
+
+# --------------------------------------------------------------------------- judge
+
+
+class Clip(Base):
+    """A candidate the judge works on (DESIGN §19), one per candidate. Writer: judge.
+
+    `status`: `contracts.ClipStatus` (`waiting_for_media -> judging -> rejected | planned`, or
+    `failed` with `error`); `reject_reason` (`contracts.ClipRejectReason`) is set iff `rejected`.
+    §7's later states are derived from the renderer's, review's and publisher's tables by
+    `clipper_core.lifecycle`, never stored here. Times:
+    - `anchor_utc` = T (the candidate's `peak_utc`, video time), inside the context.
+    - `context_from`..`context_to`: the media the judge reads; starts as the candidate's window,
+      grows per context round (`round`, 0-based), clamped to [T - 10 min, T + 2 min] and the
+      stream.
+    - `waiting_since`: wall clock when it last started waiting for media (soft/hard deadlines).
+    `priority`: of its judge/render jobs. `plan_version`: the latest non-shadow `clip` plan
+    (`clip_plans.version`, revisions included), NULL before the first. `flags`: e.g.
+    `{"partial_context": true}`. Score and moment type are read from the candidate.
+    """
+
+    __tablename__ = "clips"
+    __table_args__ = (
+        Index(None, "stream_id", "anchor_utc"),
+        # the waiter's sweep: waiting clips per stream
+        Index(
+            "ix_clips_waiting",
+            "stream_id",
+            postgresql_where=sql_text("status = 'waiting_for_media'"),
+        ),
+        CheckConstraint(
+            "status IN ('waiting_for_media', 'judging', 'rejected', 'planned', 'failed')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(status = 'rejected') = (reject_reason IS NOT NULL)", name="reject_reason"
+        ),
+        CheckConstraint("round >= 0", name="round"),
+        CheckConstraint("context_to > context_from", name="context_range"),
+        CheckConstraint("anchor_utc BETWEEN context_from AND context_to", name="anchor_in_context"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    candidate_id: Mapped[int] = mapped_column(ForeignKey("candidates.id"), unique=True)
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"))
+    status: Mapped[str] = mapped_column(Text, server_default="waiting_for_media")
+    reject_reason: Mapped[str | None] = mapped_column(Text)  # contracts.ClipRejectReason
+    round: Mapped[int] = mapped_column(Integer, server_default="0")
+    anchor_utc: Mapped[datetime]
+    context_from: Mapped[datetime]
+    context_to: Mapped[datetime]
+    priority: Mapped[int] = mapped_column(Integer)
+    waiting_since: Mapped[datetime]  # wall clock
+    plan_version: Mapped[int | None] = mapped_column(Integer)
+    flags: Mapped[dict[str, Any]] = mapped_column(server_default=sql_text("'{}'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text)
+    judged_at: Mapped[datetime | None]
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+
+class JudgeCall(Base):
+    """One model call (DESIGN §19). Writer: judge; committed alone, right after the call, so a
+    crash or retry reuses the paid answer (lookup by `request_hash` = sha256 of model, prompt
+    version, schema version and the rendered request).
+
+    `cost_usd` from the price table in the judge's settings; `answer`: the parsed JSON answer,
+    `error`: what went wrong (provider error, invalid JSON); full request + raw response in
+    object storage at `io_key` (`storage.keys.judge_io`, keyed on the request hash, so it can be
+    uploaded before this row exists). `clip_id` NULL for calls outside a clip (evals).
+    `shadow`: an extra model/prompt pair on the same input, never rendered.
+    """
+
+    __tablename__ = "judge_calls"
+    __table_args__ = (
+        Index(None, "request_hash"),
+        Index(None, "clip_id"),  # a clip's calls (analytics, revisions)
+        Index(None, "stream_id", "created_at"),  # cost guard: spend per stream-hour
+        Index(None, "created_at"),  # cost guard: daily spend
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    clip_id: Mapped[int | None] = mapped_column(ForeignKey("clips.id"))
+    stream_id: Mapped[int] = mapped_column(ForeignKey("streams.id"))
+    model: Mapped[str] = mapped_column(Text)
+    prompt_version: Mapped[str] = mapped_column(Text)
+    request_hash: Mapped[str] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(Integer)
+    cached_input_tokens: Mapped[int] = mapped_column(Integer)
+    output_tokens: Mapped[int] = mapped_column(Integer)
+    cost_usd: Mapped[float] = mapped_column(Float)
+    latency_s: Mapped[float] = mapped_column(Float)
+    answer: Mapped[dict[str, Any] | None]
+    error: Mapped[str | None] = mapped_column(Text)
+    io_key: Mapped[str | None] = mapped_column(Text)
+    provider_request_id: Mapped[str | None] = mapped_column(Text)
+    shadow: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class ClipPlan(Base):
+    """One judge round or revision of a clip (DESIGN §19). Writer: judge; rows are immutable.
+
+    `version` counts per clip (UNIQUE `clip_id, version`; shadow plans take versions too);
+    `round`: the clip's context round it answered. `verdict` (`contracts.Verdict`): `clip` rows
+    carry `plan` (a `contracts.EditPlan`), `need_context` rows `context_request`
+    (`{"before_s", "after_s", "why"}`), both enforced by CHECKs. `reasons`, `repairs`: copies of
+    the plan's lists (also for rejects). `author` (`contracts.PlanAuthor`): `judge` (the model)
+    or `operator` (a review PlanPatch); revisions set `parent_id` (the plan they changed),
+    `review_event_id` (its FK comes with review's migration, 0008) and `instruction`.
+    """
+
+    __tablename__ = "clip_plans"
+    __table_args__ = (
+        UniqueConstraint("clip_id", "version"),
+        CheckConstraint("verdict IN ('clip', 'reject', 'need_context')", name="verdict"),
+        CheckConstraint("(verdict = 'clip') = (plan IS NOT NULL)", name="plan"),
+        CheckConstraint(
+            "(verdict = 'need_context') = (context_request IS NOT NULL)", name="context_request"
+        ),
+        CheckConstraint("author IN ('judge', 'operator')", name="author"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    clip_id: Mapped[int] = mapped_column(ForeignKey("clips.id"))
+    version: Mapped[int] = mapped_column(Integer)
+    round: Mapped[int] = mapped_column(Integer)
+    verdict: Mapped[str] = mapped_column(Text)
+    plan: Mapped[dict[str, Any] | None]
+    context_request: Mapped[dict[str, Any] | None]
+    confidence: Mapped[float | None] = mapped_column(Float)
+    reasons: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    repairs: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    model: Mapped[str] = mapped_column(Text)
+    prompt_version: Mapped[str] = mapped_column(Text)
+    shadow: Mapped[bool] = mapped_column(server_default=sql_text("false"))
+    judge_call_id: Mapped[int | None] = mapped_column(ForeignKey("judge_calls.id"))
+    author: Mapped[str] = mapped_column(Text, server_default="judge")
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("clip_plans.id"))
+    review_event_id: Mapped[int | None] = mapped_column(BigInteger)  # FK added by 0008 (§21)
+    instruction: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+
+
+# --------------------------------------------------------------------------- renderer
+
+
+class Render(Base):
+    """One render of a `clip` plan (DESIGN §20), one row per `render` job. Writer: renderer.
+
+    `job_id` is the render job's id (UNIQUE, no FK: a retry of the job resumes the row).
+    `status` (`contracts.RenderStatus`): `rendering` while the job holds it (between failed
+    attempts too, with the last `error`), `done` (outputs uploaded; the `review` job is enqueued
+    in the same transaction), `failed` (the last attempt failed; a `notify(render_failed)` job
+    went with it), `unrenderable` (`unrenderable_reason`, `contracts.UnrenderableReason`:
+    `no_video`, `video_expired`; no retry). Keys: `pinned_keys` = the chunk copies under
+    `clips/{clip_id}/pinned/` (`storage.keys.clip_pinned_video`), the outputs under
+    `clips/{clip_id}/renders/{id}/` (`storage.keys.render_file`). `graph_hash` = sha256 of
+    everything that decides the output (plan, filter graph, captions, inputs, layout config,
+    assets, fonts, versions); `warnings`: e.g. a gap inside a segment (hard cut), a layout
+    fallback. Read by review (§21) and `clipper_core.lifecycle` (the clip's latest render).
+    """
+
+    __tablename__ = "renders"
+    __table_args__ = (
+        Index(None, "clip_id", "created_at"),
+        Index(None, "plan_id"),
+        CheckConstraint("status IN ('rendering', 'done', 'failed', 'unrenderable')", name="status"),
+        CheckConstraint(
+            "(status = 'unrenderable') = (unrenderable_reason IS NOT NULL)",
+            name="unrenderable_reason",
+        ),
+        CheckConstraint(
+            "status <> 'done' OR (video_key IS NOT NULL AND video_sha256 IS NOT NULL"
+            " AND finished_at IS NOT NULL)",
+            name="done_outputs",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    job_id: Mapped[int] = mapped_column(BigInteger, unique=True)
+    clip_id: Mapped[int] = mapped_column(ForeignKey("clips.id"))
+    plan_id: Mapped[int] = mapped_column(ForeignKey("clip_plans.id"))
+    profile: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, server_default="rendering")
+    unrenderable_reason: Mapped[str | None] = mapped_column(Text)
+    layout: Mapped[str | None] = mapped_column(Text)  # the resolved contracts.LayoutKind
+    encoder: Mapped[str | None] = mapped_column(Text)  # h264_nvenc | libx264
+    renderer_version: Mapped[str | None] = mapped_column(Text)
+    ffmpeg_version: Mapped[str | None] = mapped_column(Text)
+    graph_hash: Mapped[str | None] = mapped_column(Text)
+    pinned_keys: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    video_key: Mapped[str | None] = mapped_column(Text)
+    preview_key: Mapped[str | None] = mapped_column(Text)
+    thumb_key: Mapped[str | None] = mapped_column(Text)
+    captions_key: Mapped[str | None] = mapped_column(Text)
+    manifest_key: Mapped[str | None] = mapped_column(Text)
+    video_sha256: Mapped[str | None] = mapped_column(Text)
+    duration_s: Mapped[float | None] = mapped_column(Float)
+    fps: Mapped[float | None] = mapped_column(Float)
+    loudness_lufs: Mapped[float | None] = mapped_column(Float)
+    true_peak_db: Mapped[float | None] = mapped_column(Float)
+    render_s: Mapped[float | None] = mapped_column(Float)  # wall clock of the last attempt
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    bytes: Mapped[int | None] = mapped_column(BigInteger)
+    preview_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    warnings: Mapped[list[Any]] = mapped_column(server_default=sql_text("'[]'::jsonb"))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None]
 
 
 # --------------------------------------------------------------------------- coordination
@@ -300,7 +844,9 @@ class MediaRequest(Base):
     """A request: "I need transcripts for this time range at this priority."
 
     Raises the priority of matching queued jobs, and of chunks recorded later inside the range.
-    Writers: detector, judge (anyone who needs a window).
+    Writers: detector, judge (anyone who needs a window), each for its own rows (and each marks
+    only its own rows fulfilled). Detector rows are linked from `candidates.media_request_id`;
+    judge rows carry `clip_id` (FK clips, from 0005).
     """
 
     __tablename__ = "media_requests"
@@ -321,7 +867,9 @@ class MediaRequest(Base):
     to_utc: Mapped[datetime]
     priority: Mapped[int] = mapped_column(Integer)
     requested_by: Mapped[str] = mapped_column(Text)
-    clip_id: Mapped[int | None] = mapped_column(BigInteger)  # FK added when clips table exists
+    # use_alter: clips -> candidates -> media_requests -> clips is a cycle, so create_all adds
+    # this FK after the tables (as migration 0005 does)
+    clip_id: Mapped[int | None] = mapped_column(ForeignKey("clips.id", use_alter=True))
     created_at: Mapped[datetime] = _created_at()
     fulfilled_at: Mapped[datetime | None]
 

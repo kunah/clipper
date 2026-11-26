@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clipper ideas</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6a66; --line: #dddad3;
+    --accent: #2f5fd0; --current: rgba(47, 95, 208, 0.14); --note: rgba(47, 95, 208, 0.08);
+    --publish: #1f8a4c; --changes: #b7791f; --no: #c2412d; --warn: #b7791f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --panel: #1f1f1d; --text: #ecebe7; --muted: #a09e97; --line: #34332f;
+      --accent: #7d9cf0; --current: rgba(125, 156, 240, 0.2); --note: rgba(125, 156, 240, 0.1);
+      --publish: #4cc283; --changes: #e0a84a; --no: #f07a64; --warn: #e0a84a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 9px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0;
+           z-index: 2; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header select { font: inherit; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--line);
+                  background: var(--panel); color: var(--text); }
+  #progress { color: var(--muted); font-variant-numeric: tabular-nums; }
+  #bar { flex: 1; min-width: 80px; height: 6px; background: var(--line); border-radius: 3px;
+         overflow: hidden; }
+  #bar > div { height: 100%; background: var(--accent); width: 0; }
+  .tally { display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
+  .tally span::before { content: ""; display: inline-block; width: 8px; height: 8px;
+                        border-radius: 50%; margin-right: 4px; background: currentColor; }
+  .t-publish { color: var(--publish); } .t-changes { color: var(--changes); } .t-no { color: var(--no); }
+  main { display: grid; grid-template-columns: 300px 1fr; height: calc(100vh - 47px); }
+  nav { border-right: 1px solid var(--line); overflow-y: auto; background: var(--panel); }
+  nav h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
+           margin: 0; padding: 10px 12px 4px; position: sticky; top: 0; background: var(--panel); }
+  nav button { display: grid; grid-template-columns: 10px 26px 1fr auto; gap: 6px; width: 100%;
+               align-items: center; padding: 5px 12px; border: 0; background: none;
+               color: var(--text); text-align: left; cursor: pointer; font: inherit; }
+  nav button:hover { background: var(--bg); }
+  nav button.current { background: var(--current); }
+  nav .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  nav .ttl { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  nav .len { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--line); }
+  .dot.publish { background: var(--publish); border-color: var(--publish); }
+  .dot.changes { background: var(--changes); border-color: var(--changes); }
+  .dot.no { background: var(--no); border-color: var(--no); }
+  .dot.noted { border-color: var(--accent); }
+  .req { font-size: 11px; font-weight: 600; color: var(--accent); }
+  section { overflow-y: auto; padding: 14px 20px 40px; }
+  .inner { max-width: 1000px; }
+  #title { font-size: 18px; font-weight: 600; margin: 0 0 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .chip { font-size: 12px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line);
+          color: var(--muted); background: var(--panel); }
+  .chip.req { color: var(--accent); border-color: var(--accent); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  video { width: 100%; max-height: 58vh; background: #000; border-radius: 6px; display: block; }
+  #novideo { padding: 40px; text-align: center; color: var(--muted); border: 1px dashed var(--line);
+             border-radius: 6px; }
+  .rate { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; margin: 12px 0; }
+  .rate button { font: inherit; font-weight: 600; padding: 7px 14px; border-radius: 6px;
+                 background: var(--panel); cursor: pointer; border: 1.5px solid; }
+  .rate button.publish { color: var(--publish); border-color: var(--publish); }
+  .rate button.changes { color: var(--changes); border-color: var(--changes); }
+  .rate button.no { color: var(--no); border-color: var(--no); }
+  .rate button.active { color: #fff; }
+  .rate button.publish.active { background: var(--publish); }
+  .rate button.changes.active { background: var(--changes); }
+  .rate button.no.active { background: var(--no); }
+  .rate button.clear { color: var(--muted); border-color: var(--line); font-weight: 400; }
+  textarea { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line);
+             background: var(--panel); color: var(--text); width: 100%; resize: vertical; }
+  #note { flex: 1; min-width: 240px; min-height: 36px; }
+  #status { color: var(--muted); font-size: 12px; min-height: 18px; }
+  #status.err { color: var(--no); }
+  .callout { background: var(--note); border-left: 3px solid var(--accent); padding: 8px 12px;
+             border-radius: 4px; margin: 10px 0; }
+  .callout b { color: var(--accent); }
+  dl { display: grid; grid-template-columns: 130px 1fr; gap: 4px 12px; margin: 10px 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 6px 0 14px; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  td.t { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.role { white-space: nowrap; color: var(--muted); }
+  h3 { font-size: 13px; margin: 18px 0 4px; color: var(--muted); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .04em; }
+  details { margin-top: 6px; }
+  summary { cursor: pointer; color: var(--muted); }
+  #missed { min-height: 60px; margin-top: 6px; }
+  kbd { font: 12px ui-monospace, monospace; padding: 1px 4px; border: 1px solid var(--line);
+        border-radius: 3px; background: var(--panel); }
+  #help { color: var(--muted); font-size: 13px; margin-top: 18px; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; height: auto; }
+    nav { max-height: 220px; border-right: 0; border-bottom: 1px solid var(--line); }
+    section { padding: 12px 16px 40px; }
+    dl { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Clipper ideas</h1>
+  <select id="run" title="prompt version"></select>
+  <select id="stream" title="stream"></select>
+  <select id="show" title="which ideas">
+    <option value="all">all ideas</option>
+    <option value="unrated">not rated yet</option>
+    <option value="requests">for your notes</option>
+    <option value="own">its own ideas</option>
+  </select>
+  <span id="progress">loading…</span>
+  <div id="bar"><div></div></div>
+  <div class="tally"><span class="t-publish" id="c-publish">0</span><span class="t-changes"
+    id="c-changes">0</span><span class="t-no" id="c-no">0</span></div>
+</header>
+<main>
+  <nav id="list"></nav>
+  <section><div class="inner">
+    <h2 id="title"></h2>
+    <div class="chips" id="chips"></div>
+    <video id="video" controls preload="auto"></video>
+    <div id="novideo" hidden>no preview cut for this idea</div>
+    <div class="rate">
+      <button class="publish" data-r="publish"><kbd>1</kbd> Publish</button>
+      <button class="changes" data-r="changes"><kbd>2</kbd> With changes</button>
+      <button class="no" data-r="no"><kbd>3</kbd> No</button>
+      <button class="clear" data-r=""><kbd>0</kbd> Clear</button>
+      <textarea id="note" rows="1" placeholder="note: what to change, why not, what's missing…"></textarea>
+    </div>
+    <div id="status"></div>
+    <div id="request" class="callout" hidden></div>
+    <dl id="facts"></dl>
+    <h3>Pieces (in the order shown)</h3>
+    <table><thead><tr><th>#</th><th>role</th><th>stream time</th><th>s</th><th>what</th></tr></thead>
+      <tbody id="beats"></tbody></table>
+    <h3 id="stream-h">This stream</h3>
+    <details id="summary-box"><summary>What Opus says happened</summary><p id="summary"></p></details>
+    <label for="missed" style="display:block;margin-top:10px">What did it miss in this stream?
+      (clips you'd cut that aren't in its list)</label>
+    <textarea id="missed" placeholder="e.g. 2:14 the bridge jump, the running joke about…"></textarea>
+    <div id="help">
+      <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> rate · <kbd>0</kbd> clear · <kbd>←</kbd> <kbd>→</kbd>
+      previous / next · <kbd>n</kbd> next not rated · <kbd>space</kbd> play / pause ·
+      <kbd>r</kbd> replay · <kbd>Esc</kbd> leave the note. Stream time = time since the stream went
+      live (about the VOD's timestamp). Ratings are saved as you go to <span id="file"></span>.
+    </div>
+  </div></section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = String(text);
+  return e;
+};
+let state = { sets: [], ideas: [] };
+let visible = [];
+let cur = null;
+let noteTimer = null;
+
+function setByKey(k) { return state.sets.find((s) => s.key === k); }
+function secs(x) { return x == null ? "?" : `${Math.round(x)} s`; }
+function ratingOf(i) { return i.rating && i.rating.rating ? i.rating.rating : ""; }
+
+function status(text, err) {
+  const s = $("status");
+  s.textContent = text || "";
+  s.className = err ? "err" : "";
+}
+
+function filters() {
+  const runs = [...new Set(state.sets.map((s) => s.prompt))];
+  const run = $("run");
+  if (!run.options.length) {
+    for (const r of runs) run.add(new Option(r, r));
+    try { const saved = localStorage.getItem("ideas.run"); if (runs.includes(saved)) run.value = saved; } catch (e) {}
+  }
+  const streams = [...new Set(state.sets.filter((s) => s.prompt === run.value).map((s) => s.stream))];
+  const st = $("stream");
+  const keep = st.value;
+  st.innerHTML = "";
+  st.add(new Option("all streams", "all"));
+  for (const s of streams) st.add(new Option(`stream ${s}`, String(s)));
+  st.value = streams.map(String).includes(keep) ? keep : "all";
+}
+
+function computeVisible() {
+  const run = $("run").value, stream = $("stream").value, show = $("show").value;
+  visible = state.ideas.filter((i) => {
+    const set = setByKey(i.set);
+    if (set.prompt !== run) return false;
+    if (stream !== "all" && String(set.stream) !== stream) return false;
+    if (show === "unrated" && ratingOf(i)) return false;
+    if (show === "requests" && !i.request) return false;
+    if (show === "own" && i.request) return false;
+    return true;
+  });
+}
+
+function renderList() {
+  const nav = $("list");
+  nav.innerHTML = "";
+  let lastSet = null;
+  for (const i of visible) {
+    if (i.set !== lastSet) {
+      const set = setByKey(i.set);
+      const day = set.started_at ? set.started_at.slice(0, 10) : "";
+      nav.append(el("h2", null, `stream ${set.stream} · ${set.channel || ""} · ${day}`));
+      lastSet = i.set;
+    }
+    const b = el("button");
+    b.dataset.key = i.key;
+    if (cur && cur.key === i.key) b.className = "current";
+    const dot = el("span", "dot " + ratingOf(i) + (i.rating && i.rating.note ? " noted" : ""));
+    const n = el("span", "n", `#${i.n}`);
+    const t = el("span", "ttl");
+    if (i.request) t.append(el("span", "req", i.request + " "));
+    t.append(document.createTextNode(i.title || "(no title)"));
+    const len = el("span", "len", secs(i.preview ? i.preview.seconds ?? i.seconds : i.seconds));
+    b.append(dot, n, t, len);
+    b.title = `${i.kind} · ${i.title}`;
+    b.onclick = () => showIdea(i.key, true);
+    nav.append(b);
+  }
+  if (!visible.length) nav.append(el("p", "n", "  nothing to show with these filters"));
+}
+
+function renderCounts() {
+  const run = $("run").value;
+  const ideas = state.ideas.filter((i) => setByKey(i.set).prompt === run);
+  const rated = ideas.filter((i) => ratingOf(i));
+  $("progress").textContent = `${rated.length} / ${ideas.length} rated (${run})`;
+  $("bar").firstElementChild.style.width = ideas.length ? `${(100 * rated.length) / ideas.length}%` : "0";
+  for (const r of ["publish", "changes", "no"]) {
+    $("c-" + r).textContent = `${rated.filter((i) => ratingOf(i) === r).length} ${r === "changes" ? "with changes" : r}`;
+  }
+}
+
+function showIdea(key, play) {
+  const i = state.ideas.find((x) => x.key === key);
+  if (!i) return;
+  saveNoteNow();
+  cur = i;
+  try { localStorage.setItem("ideas.current", key); } catch (e) {}
+  const set = setByKey(i.set);
+  $("title").textContent = i.title || "(no title)";
+  const chips = $("chips");
+  chips.innerHTML = "";
+  chips.append(el("span", "chip", `stream ${set.stream} · #${i.n}`), el("span", "chip", i.kind));
+  if (i.request) chips.append(el("span", "chip req", `your note ${i.request}`));
+  const p = i.preview;
+  const lenText = p && p.seconds != null
+    ? (p.planned_s && p.planned_s - p.seconds > 0.5 ? `${secs(p.seconds)} (${secs(p.planned_s)} before pauses were cut)` : secs(p.seconds))
+    : secs(i.seconds);
+  chips.append(el("span", "chip", lenText));
+  chips.append(el("span", "chip", `confidence ${Math.round((i.confidence || 0) * 100)}%`));
+  if (i.needs_visual) chips.append(el("span", "chip warn", "needs a look at the frames"));
+  if (i.stale) chips.append(el("span", "chip warn", "rated on an older answer"));
+  const v = $("video");
+  if (p) {
+    $("novideo").hidden = true; v.hidden = false;
+    if (v.dataset.src !== p.url) { v.src = p.url; v.dataset.src = p.url; }
+    if (play) { v.currentTime = 0; v.play().catch(() => {}); }
+  } else {
+    v.pause(); v.removeAttribute("src"); v.dataset.src = ""; v.load(); v.hidden = true;
+    $("novideo").hidden = false;
+  }
+  for (const b of document.querySelectorAll(".rate button[data-r]")) {
+    b.classList.toggle("active", b.dataset.r !== "" && b.dataset.r === ratingOf(i));
+  }
+  $("note").value = (i.rating && i.rating.note) || "";
+  status(i.rating && i.rating.at ? `saved ${i.rating.at.slice(11, 19)} UTC` : "");
+  const req = $("request");
+  if (i.request) {
+    req.hidden = false; req.innerHTML = "";
+    req.append(el("b", null, `Your note ${i.request}${i.request_case ? ` (case ${i.request_case})` : ""}: `));
+    req.append(document.createTextNode(i.request_note || "(no note: you marked it a clip)"));
+  } else { req.hidden = true; }
+  const facts = $("facts");
+  facts.innerHTML = "";
+  const fact = (k, val) => { if (val) facts.append(el("dt", null, k), el("dd", null, val)); };
+  fact("Angle", i.angle); fact("Why", i.why); fact("Hook text", i.hook_text);
+  if (i.needs_visual) fact("Check the frames", i.visual_check || "(not said)");
+  fact("Censor", i.censor);
+  if (i.issues && i.issues.length) fact("Issues", i.issues.join("; "));
+  const tb = $("beats");
+  tb.innerHTML = "";
+  (i.beats || []).forEach((b, k) => {
+    const tr = el("tr");
+    tr.append(el("td", "t", k + 1), el("td", "role", b.role + (b.keep_whole ? " · keep whole" : "")),
+      el("td", "t", `${b.from} → ${b.to}`), el("td", "t", b.seconds == null ? "?" : Math.round(b.seconds)),
+      el("td", null, b.what));
+    tb.append(tr);
+  });
+  $("stream-h").textContent = `Stream ${set.stream} (${set.prompt})`;
+  $("summary").textContent = set.summary || "(none)";
+  $("missed").value = set.missed || "";
+  $("missed").dataset.set = set.key;
+  renderList();
+  const btn = document.querySelector(`nav button[data-key="${CSS.escape(key)}"]`);
+  if (btn) btn.scrollIntoView({ block: "nearest" });
+}
+
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+async function rate(rating) {
+  if (!cur) return;
+  const i = cur;
+  clearTimeout(noteTimer); noteTimer = null;
+  const note = $("note").value;
+  try {
+    const data = await post("/api/rate", { key: i.key, rating, note });
+    i.rating = data.rating; i.stale = false;
+    if (cur === i) {
+      for (const b of document.querySelectorAll(".rate button[data-r]")) {
+        b.classList.toggle("active", b.dataset.r !== "" && b.dataset.r === ratingOf(i));
+      }
+      status(data.rating ? `saved ${data.rating.at.slice(11, 19)} UTC` : "cleared");
+    }
+    renderCounts(); renderList();
+  } catch (e) { status(`not saved: ${e.message}`, true); }
+}
+
+function saveNoteNow() {
+  if (noteTimer && cur) { clearTimeout(noteTimer); noteTimer = null; rate(ratingOf(cur)); }
+}
+
+$("note").addEventListener("input", () => {
+  clearTimeout(noteTimer);
+  const i = cur;
+  noteTimer = setTimeout(() => { noteTimer = null; if (cur === i) rate(ratingOf(i)); }, 700);
+  status("typing…");
+});
+$("note").addEventListener("blur", saveNoteNow);
+$("missed").addEventListener("change", async () => {
+  const set = $("missed").dataset.set;
+  try {
+    const data = await post("/api/missed", { set, text: $("missed").value });
+    setByKey(set).missed = data.missed ? data.missed.text : "";
+    status("saved what it missed");
+  } catch (e) { status(`not saved: ${e.message}`, true); }
+});
+for (const b of document.querySelectorAll(".rate button[data-r]")) b.onclick = () => rate(b.dataset.r);
+for (const id of ["run", "stream", "show"]) {
+  $(id).addEventListener("change", () => {
+    if (id === "run") { try { localStorage.setItem("ideas.run", $("run").value); } catch (e) {} filters(); }
+    computeVisible(); renderCounts();
+    if (!cur || !visible.includes(cur)) { if (visible.length) showIdea(visible[0].key, false); else renderList(); }
+    else renderList();
+  });
+}
+
+function step(d) {
+  if (!visible.length) return;
+  const k = cur ? visible.findIndex((x) => x.key === cur.key) : -1;
+  const next = visible[Math.min(Math.max(k + d, 0), visible.length - 1)];
+  if (next) showIdea(next.key, true);
+}
+function nextUnrated() {
+  const k = cur ? visible.findIndex((x) => x.key === cur.key) : -1;
+  const order = [...visible.slice(k + 1), ...visible.slice(0, k + 1)];
+  const next = order.find((x) => !ratingOf(x));
+  if (next) showIdea(next.key, true); else status("everything here is rated");
+}
+
+document.addEventListener("keydown", (e) => {
+  const typing = ["TEXTAREA", "INPUT", "SELECT"].includes(document.activeElement.tagName);
+  if (typing) { if (e.key === "Escape") document.activeElement.blur(); return; }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const v = $("video");
+  if (e.key === "1") rate("publish");
+  else if (e.key === "2") rate("changes");
+  else if (e.key === "3") rate("no");
+  else if (e.key === "0") rate("");
+  else if (e.key === "ArrowRight" || e.key === "j") step(1);
+  else if (e.key === "ArrowLeft" || e.key === "k") step(-1);
+  else if (e.key === "n") nextUnrated();
+  else if (e.key === " ") { if (v.src) { v.paused ? v.play().catch(() => {}) : v.pause(); } }
+  else if (e.key === "r") { if (v.src) { v.currentTime = 0; v.play().catch(() => {}); } }
+  else return;
+  e.preventDefault();
+});
+
+(async () => {
+  try {
+    const r = await fetch("/api/state");
+    state = await r.json();
+  } catch (e) { status(`could not load: ${e.message}`, true); return; }
+  $("file").textContent = state.ratings_file;
+  filters(); computeVisible(); renderCounts();
+  let start = null;
+  try { start = localStorage.getItem("ideas.current"); } catch (e) {}
+  const first = visible.find((i) => i.key === start) || visible[0];
+  if (first) showIdea(first.key, false); else renderList();
+})();
+</script>
+</body>
+</html>

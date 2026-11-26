@@ -19,10 +19,9 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from clipper_chat_ingest.aggregator import SecondAggregator
-from clipper_chat_ingest.mapping import ChannelState, EventRow, MessageRow, map_message
-from clipper_chat_ingest.writer import ChatWriter
+from clipper_chat_ingest.mapping import ChannelState, map_message
 from clipper_core import heartbeat
+from clipper_core.chat import ChatWriter, EventRow, MessageRow, SecondAggregator
 from clipper_core.logs import get_logger
 from clipper_core.timeline import utc_now
 from clipper_twitch.emotes import fetch_channel_emotes, fetch_global_emotes
@@ -82,13 +81,7 @@ class ChatIngest:
             m = mapped.message
             self.messages.append(m)
             self.stats["messages"] += 1
-            self.aggregator.add_message(
-                channel.channel_id,
-                channel.stream_id,
-                m.sent_at,
-                m.user_id or m.user_login,
-                ((e["name"], e["count"]) for e in m.emotes or ()),
-            )
+            self.aggregator.add_row(m)  # channel_id/stream_id: map_message took them from `channel`
         for event in mapped.events:
             self.events.append(event)
             self.stats["events"] += 1

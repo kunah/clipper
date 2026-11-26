@@ -1,0 +1,46 @@
+[Script Info]
+; clipper-renderer captions (DESIGN §20)
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: None
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,Montserrat SemiBold,74,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,3,3,5,80,80,0,1
+Style: Title,Montserrat ExtraBold,54,&H00FFFFFF,&H000000FF,&H50000000,&H50000000,0,0,0,0,100,100,0,0,3,16,0,5,90,90,0,1
+Style: Hook,Montserrat Black,80,&H00FFFFFF,&H000000FF,&H003B24E5,&H003B24E5,0,0,0,0,100,100,0,0,3,18,0,5,90,90,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.05,0:00:00.40,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}to{\r} me
+Dialogue: 0,0:00:00.40,0:00:00.70,Caption,,0,0,0,,{\an5\pos(540,1300)}to {\1c&H7AE2FF&}me{\r}
+Dialogue: 0,0:00:01.80,0:00:02.15,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}I{\r} have a
+Dialogue: 0,0:00:02.15,0:00:02.50,Caption,,0,0,0,,{\an5\pos(540,1300)}I {\1c&H7AE2FF&}have{\r} a
+Dialogue: 0,0:00:02.50,0:00:02.85,Caption,,0,0,0,,{\an5\pos(540,1300)}I have {\1c&H7AE2FF&}a{\r}
+Dialogue: 0,0:00:02.85,0:00:03.20,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}plan{\r}
+Dialogue: 0,0:00:03.20,0:00:03.55,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}trust{\r} me
+Dialogue: 0,0:00:03.55,0:00:03.85,Caption,,0,0,0,,{\an5\pos(540,1300)}trust {\1c&H7AE2FF&}me{\r}
+Dialogue: 0,0:00:05.00,0:00:05.35,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}we{\r} jump right
+Dialogue: 0,0:00:05.35,0:00:05.70,Caption,,0,0,0,,{\an5\pos(540,1300)}we {\1c&H7AE2FF&}jump{\r} right
+Dialogue: 0,0:00:05.70,0:00:06.05,Caption,,0,0,0,,{\an5\pos(540,1300)}we jump {\1c&H7AE2FF&}right{\r}
+Dialogue: 0,0:00:06.05,0:00:06.40,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}here{\r} and
+Dialogue: 0,0:00:06.40,0:00:06.70,Caption,,0,0,0,,{\an5\pos(540,1300)}here {\1c&H7AE2FF&}and{\r}
+Dialogue: 0,0:00:07.40,0:00:07.75,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}NO{\r} {\1c&HFFD47F&\fscx120\fscy120}WAY{\r} that
+Dialogue: 0,0:00:07.75,0:00:08.10,Caption,,0,0,0,,{\an5\pos(540,1300)}NO {\1c&HFFD47F&\fscx120\fscy120}WAY{\r} that
+Dialogue: 0,0:00:08.10,0:00:08.45,Caption,,0,0,0,,{\an5\pos(540,1300)}NO {\1c&HFFD47F&\fscx120\fscy120}WAY{\r} {\1c&H7AE2FF&}that{\r}
+Dialogue: 0,0:00:08.45,0:00:08.80,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}actually{\r} worked!
+Dialogue: 0,0:00:08.80,0:00:09.10,Caption,,0,0,0,,{\an5\pos(540,1300)}actually {\1c&H7AE2FF&}worked!{\r}
+Dialogue: 0,0:00:10.40,0:00:10.75,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}chat{\r} did you
+Dialogue: 0,0:00:10.75,0:00:11.10,Caption,,0,0,0,,{\an5\pos(540,1300)}chat {\1c&H7AE2FF&}did{\r} you
+Dialogue: 0,0:00:11.10,0:00:11.45,Caption,,0,0,0,,{\an5\pos(540,1300)}chat did {\1c&H7AE2FF&}you{\r}
+Dialogue: 0,0:00:11.45,0:00:11.80,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}see{\r} that
+Dialogue: 0,0:00:11.80,0:00:12.10,Caption,,0,0,0,,{\an5\pos(540,1300)}see {\1c&H7AE2FF&}that{\r}
+Dialogue: 0,0:00:12.50,0:00:12.85,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&HFFD47F&\fscx106\fscy106}unbelievable!!{\r}
+Dialogue: 0,0:00:12.85,0:00:13.25,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}(honestly){\r}
+Dialogue: 0,0:00:14.05,0:00:14.45,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}try{\r}
+Dialogue: 0,0:00:19.30,0:00:19.65,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}what{\r} just
+Dialogue: 0,0:00:19.65,0:00:20.00,Caption,,0,0,0,,{\an5\pos(540,1300)}what {\1c&H7AE2FF&}just{\r}
+Dialogue: 0,0:00:20.00,0:00:20.40,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H7AE2FF&}happened{\r}

@@ -15,7 +15,14 @@ from clipper_core.timeline import utc_now
 log = get_logger(__name__)
 
 # How long a job may stay "running" before we assume its worker died.
-STALE_AFTER = {JobKind.TRANSCRIBE: timedelta(minutes=15)}
+STALE_AFTER = {
+    JobKind.TRANSCRIBE: timedelta(minutes=15),
+    JobKind.JUDGE: timedelta(minutes=10),  # LLM calls; the judge commits each call right after it
+    JobKind.DETECT_OFFLINE: timedelta(minutes=30),  # a whole stream's offline pass
+    JobKind.REVISE_PLAN: timedelta(minutes=10),  # one judge call at most (an instruction)
+    # pin + two-pass loudnorm + encode; a 3 min clip with x264 on the CPU stays well below it
+    JobKind.RENDER: timedelta(minutes=20),
+}
 
 
 async def run_maintenance(sessions: async_sessionmaker[AsyncSession]) -> None:

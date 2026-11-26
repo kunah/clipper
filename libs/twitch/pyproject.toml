@@ -1,7 +1,7 @@
 [project]
 name = "clipper-twitch"
 version = "0.1.0"
-description = "Twitch clients: chat (IRC over WebSocket), Helix API, third-party emotes (7TV/BTTV/FFZ)."
+description = "Twitch clients: chat (IRC over WebSocket), Helix API, third-party emotes (7TV/BTTV/FFZ), VOD playlists, VOD chat replay (GQL)."
 requires-python = ">=3.12"
 dependencies = [
     "clipper-core",
@@ -9,6 +9,11 @@ dependencies = [
     "websockets>=13.0",
     "pydantic-settings>=2.6",
 ]
+
+# `clipper_twitch.vod` resolves VOD playlists with streamlink (imported only when used), so
+# services that only read chat or Helix don't install it.
+[project.optional-dependencies]
+vod = ["streamlink>=7.0"]
 
 [tool.uv.sources]
 clipper-core = { workspace = true }

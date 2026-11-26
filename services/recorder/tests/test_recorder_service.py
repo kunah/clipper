@@ -68,8 +68,8 @@ def make_recorder(sessions, tmp_path, worker="rec-1") -> Recorder:
 
 
 async def test_records_live_channels_it_can_lease(sessions, tmp_path):
-    full, _ = await add_channel(sessions, "full")
-    audio, _ = await add_channel(sessions, "audio", mode="audio_only")
+    full, full_sid = await add_channel(sessions, "full")
+    audio, audio_sid = await add_channel(sessions, "audio", mode="audio_only")
     taken, _ = await add_channel(sessions, "taken")
     await add_channel(sessions, "off", mode="off")
     await add_channel(sessions, "offline", live=False)
@@ -87,6 +87,12 @@ async def test_records_live_channels_it_can_lease(sessions, tmp_path):
         assert r.tracker.media_end == T0 and r.tracker.reason == GapReason.NOT_RECORDED
         async with sessions() as s:
             assert await leases.holder(s, recording_lease(full)) == "rec-1"
+        # the heartbeat names the streams (`clipper-backfill vod --fill-gaps` reads them)
+        await rec.beat()
+        beat = text("SELECT info FROM worker_heartbeats WHERE worker_id = 'rec-1'")
+        async with sessions() as s:
+            info = (await s.execute(beat)).scalar_one()
+        assert {r["stream_id"] for r in info["recording"]} == {full_sid, audio_sid}
 
         # stream ends -> the recorder is told to stop, and forgotten once it has
         async with sessions.begin() as s:

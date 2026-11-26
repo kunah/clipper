@@ -1,9 +1,11 @@
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
 
-from clipper_twitch.helix import HelixClient, HelixError
+from clipper_twitch.helix import HelixClient, HelixError, MutedSegment, parse_duration
 from clipper_twitch.settings import TwitchSettings
 
 
@@ -102,3 +104,169 @@ def test_missing_credentials():
     with pytest.raises(HelixError):
         HelixClient.from_settings(TwitchSettings(_env_file=None))
     assert TwitchSettings(client_id="x", client_secret="y", _env_file=None).has_credentials
+
+
+# --------------------------------------------------------------------------- videos and clips
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+class PagedHelix:
+    """Serves fixture items (shaped like the Helix docs) in pages of `first`, cursor "c<index>".
+
+    Like Helix, a non-empty last page still carries a cursor; the page after it is empty.
+    """
+
+    def __init__(self) -> None:
+        self.videos = json.loads((FIXTURES / "helix_videos.json").read_text())["data"]
+        self.clips = json.loads((FIXTURES / "helix_clips.json").read_text())["data"]
+        self.requests: list[httpx.QueryParams] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.host == "id.twitch.tv":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 5000000})
+        params = request.url.params
+        self.requests.append(params)
+        if request.url.path == "/helix/videos" and "id" in params:
+            found = [v for v in self.videos if v["id"] in params.get_list("id")]
+            if not found:
+                return httpx.Response(404, json={"error": "Not Found", "status": 404})
+            return httpx.Response(200, json={"data": found, "pagination": {}})
+        if request.url.path == "/helix/videos":
+            kind = params["type"]
+            items = [v for v in self.videos if kind == "all" or v["type"] == kind]
+        elif request.url.path == "/helix/clips":
+            items = self.clips
+        else:
+            return httpx.Response(404)
+        start = int(params.get("after", "c0")[1:])
+        page = items[start : start + int(params["first"])]
+        cursor = {"cursor": f"c{start + len(page)}"} if page else {}
+        return httpx.Response(200, json={"data": page, "pagination": cursor})
+
+
+@pytest.fixture
+def paged():
+    return PagedHelix()
+
+
+@pytest.fixture
+def paged_helix(paged):
+    http = httpx.AsyncClient(transport=httpx.MockTransport(paged.handler))
+    return HelixClient("cid", "secret", http=http)
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("1h0m5s", 3605), ("3m21s", 201), ("45s", 45), ("2h", 7200), ("23h15m35s", 83735), ("0s", 0)],
+)
+def test_parse_duration(text, seconds):
+    assert parse_duration(text) == seconds
+
+
+@pytest.mark.parametrize("text", ["", "1d", "5m1h", "abc", "1h 5m", "-3s"])
+def test_parse_duration_rejects_other_formats(text):
+    with pytest.raises(ValueError):
+        parse_duration(text)
+
+
+async def test_get_videos_parses_archives(paged_helix, paged):
+    page = await paged_helix.get_videos("71092938")
+    assert [v.id for v in page.items] == ["2932113307", "2929044358", "2926188923", "2924308181"]
+    assert page.cursor is None
+    first, second = page.items[:2]
+    assert first.stream_id == "321206426716" and first.type == "archive"
+    assert first.created_at == datetime(2026, 11, 18, 6, 27, 53, tzinfo=UTC)
+    assert first.created_at.tzinfo is UTC and first.published_at == first.created_at
+    assert first.duration_s == 83735 and first.view_count == 51234
+    assert first.muted_segments is None  # app tokens always get null
+    assert second.published_at is None
+    assert second.muted_segments == (MutedSegment(120, 30), MutedSegment(7200, 360))
+    req = paged.requests[0]
+    assert (req["user_id"], req["type"], req["sort"], req["first"]) == (
+        "71092938", "archive", "time", "100"
+    )  # fmt: skip
+
+
+async def test_get_videos_follows_cursors_until_an_empty_page(paged_helix, paged):
+    page = await paged_helix.get_videos("71092938", type="all", first=2)
+    assert len(page.items) == 5 and page.cursor is None
+    assert page.items[2].stream_id is None and page.items[2].type == "upload"
+    # 2 + 2 + 1 items, then the empty page after the last cursor
+    assert [r.get("after") for r in paged.requests] == [None, "c2", "c4", "c5"]
+
+
+async def test_get_videos_limit_asks_only_for_what_is_wanted_and_resumes(paged_helix, paged):
+    page = await paged_helix.get_videos("71092938", first=2, limit=3)
+    assert [v.id for v in page.items] == ["2932113307", "2929044358", "2926188923"]
+    assert [r["first"] for r in paged.requests] == ["2", "1"]
+    assert page.cursor == "c3"
+    rest = await paged_helix.get_videos("71092938", first=2, after=page.cursor)
+    assert [v.id for v in rest.items] == ["2924308181"] and rest.cursor is None
+
+
+async def test_get_videos_rejects_bad_page_sizes(paged_helix):
+    with pytest.raises(ValueError):
+        await paged_helix.get_videos("1", first=101)
+    with pytest.raises(ValueError):
+        await paged_helix.get_videos("1", limit=0)
+
+
+async def test_get_clips_window_and_fields(paged_helix, paged):
+    cest = timezone(timedelta(hours=2))
+    page = await paged_helix.get_clips(
+        "71092938",
+        started_at=datetime(2026, 11, 18, 8, 27, 53, tzinfo=cest),
+        ended_at=datetime(2026, 11, 19, 5, 44, tzinfo=UTC),
+    )
+    req = paged.requests[0]
+    assert req["broadcaster_id"] == "71092938"
+    assert (req["started_at"], req["ended_at"]) == ("2026-11-18T06:27:53Z", "2026-11-19T05:44:00Z")
+    top, fresh, no_vod = page.items
+    assert top.video_id == "2932113307" and top.vod_offset == 1980 and top.duration == 30.1
+    assert top.is_featured and top.view_count == 9001 and top.creator_name == "Clipper1"
+    assert top.created_at == datetime(2026, 11, 18, 7, 1, 12, tzinfo=UTC)
+    assert fresh.vod_offset is None and fresh.duration == 60.0
+    assert no_vod.video_id is None and not no_vod.is_featured
+
+
+async def test_get_clips_refuses_naive_times(paged_helix):
+    with pytest.raises(ValueError, match="naive"):
+        await paged_helix.get_clips(
+            "1", started_at=datetime(2026, 11, 18), ended_at=datetime(2026, 11, 19, tzinfo=UTC)
+        )
+
+
+async def test_a_repeated_cursor_raises_instead_of_looping():
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.host == "id.twitch.tv":
+            return httpx.Response(200, json={"access_token": "t", "expires_in": 5000})
+        calls += 1
+        name = "helix_videos.json" if request.url.path.endswith("videos") else "helix_clips.json"
+        item = json.loads((FIXTURES / name).read_text())["data"][0]
+        return httpx.Response(200, json={"data": [item], "pagination": {"cursor": "same"}})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    helix = HelixClient("cid", "secret", http=http)
+    day = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(HelixError, match="cursor repeated"):
+        await helix.get_clips("1", started_at=day, ended_at=day + timedelta(days=1))
+    assert calls == 2
+    with pytest.raises(HelixError, match="cursor repeated"):  # also when resuming from it
+        await helix.get_videos("1", after="same")
+
+
+async def test_get_video_by_id(paged_helix, paged):
+    video = await paged_helix.get_video("2932113307")
+    assert video.stream_id == "321206426716" and video.user_login == "alpha"
+    assert paged.requests[-1].get_list("id") == ["2932113307"]
+    assert await paged_helix.get_video("1") is None  # Helix answers 404
+
+
+async def test_other_errors_carry_the_status(helix):
+    with pytest.raises(HelixError) as err:
+        await helix.get("nothing-here", [])
+    assert err.value.status == 404

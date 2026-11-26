@@ -1,0 +1,44 @@
+[Script Info]
+; clipper-renderer captions (DESIGN §20)
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: None
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Caption,Montserrat ExtraBold,84,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,6,0,5,80,80,0,1
+Style: Title,Montserrat ExtraBold,54,&H00FFFFFF,&H000000FF,&H50000000,&H50000000,0,0,0,0,100,100,0,0,3,16,0,5,90,90,0,1
+Style: Hook,Montserrat Black,80,&H00FFFFFF,&H000000FF,&H003B24E5,&H003B24E5,0,0,0,0,100,100,0,0,3,18,0,5,90,90,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 1,0:00:00.00,0:00:14.00,Title,,0,0,0,,{\an2\pos(540,484)}he really thought that would work
+Dialogue: 2,0:00:00.00,0:00:02.60,Hook,,0,0,0,,{\an5\pos(540,1000)}HE DID IT (really)
+Dialogue: 0,0:00:00.05,0:00:00.40,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}TO{\r} ME
+Dialogue: 0,0:00:00.40,0:00:00.70,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}TO{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}ME{\r}
+Dialogue: 0,0:00:01.80,0:00:02.15,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}I{\r} HAVE A
+Dialogue: 0,0:00:02.15,0:00:02.50,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}I{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}HAVE{\r} A
+Dialogue: 0,0:00:02.50,0:00:02.85,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}I{\r} {\1c&H1FD2FF&}HAVE{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}A{\r}
+Dialogue: 0,0:00:02.85,0:00:03.20,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}PLAN{\r}
+Dialogue: 0,0:00:03.20,0:00:03.55,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}TRUST{\r} ME
+Dialogue: 0,0:00:03.55,0:00:03.85,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}TRUST{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}ME{\r}
+Dialogue: 0,0:00:05.00,0:00:05.35,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}WE{\r} JUMP RIGHT
+Dialogue: 0,0:00:05.35,0:00:05.70,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}WE{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}JUMP{\r} RIGHT
+Dialogue: 0,0:00:05.70,0:00:06.05,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}WE{\r} {\1c&H1FD2FF&}JUMP{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}RIGHT{\r}
+Dialogue: 0,0:00:06.05,0:00:06.40,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}HERE{\r} AND
+Dialogue: 0,0:00:06.40,0:00:06.70,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}HERE{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}AND{\r}
+Dialogue: 0,0:00:07.40,0:00:07.75,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}NO{\r} {\1c&H5A5AFF&\fscx135\fscy135}WAY{\r} THAT
+Dialogue: 0,0:00:07.75,0:00:08.10,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}NO{\r} {\1c&H5A5AFF&\fscx135\fscy135\t(0,80,\fscx146\fscy146)}WAY{\r} THAT
+Dialogue: 0,0:00:08.10,0:00:08.45,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}NO{\r} {\1c&H5A5AFF&\fscx135\fscy135}WAY{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}THAT{\r}
+Dialogue: 0,0:00:08.45,0:00:08.80,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}ACTUALLY{\r} WORKED!
+Dialogue: 0,0:00:08.80,0:00:09.10,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}ACTUALLY{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}WORKED!{\r}
+Dialogue: 0,0:00:10.40,0:00:10.75,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}CHAT{\r} DID YOU
+Dialogue: 0,0:00:10.75,0:00:11.10,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}CHAT{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}DID{\r} YOU
+Dialogue: 0,0:00:11.10,0:00:11.45,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}CHAT{\r} {\1c&H1FD2FF&}DID{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}YOU{\r}
+Dialogue: 0,0:00:11.45,0:00:11.80,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}SEE{\r} THAT
+Dialogue: 0,0:00:11.80,0:00:12.10,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&}SEE{\r} {\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}THAT{\r}
+Dialogue: 0,0:00:12.50,0:00:12.85,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H5A5AFF&\fscx110\fscy110\t(0,80,\fscx119\fscy119)}UNBELIEVABLE!!{\r}
+Dialogue: 0,0:00:12.85,0:00:13.25,Caption,,0,0,0,,{\an5\pos(540,1300)}{\1c&H1FD2FF&\fscx100\fscy100\t(0,80,\fscx108\fscy108)}(HONESTLY){\r}

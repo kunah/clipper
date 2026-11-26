@@ -226,6 +226,7 @@ class Recorder:
     # ------------------------------------------------------------------ status
 
     async def beat(self) -> None:
+        # `stream_id`: `clipper-backfill vod --fill-gaps` waits while a recorder lists the stream
         recording = [
             {
                 "channel": r.assignment.login,
