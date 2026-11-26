@@ -87,7 +87,14 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   as cases) + `evaluate` (`clipper-judge eval`: read-only DB or fixtures, `--drafts` -> agreement,
   repairs, latency, usage), `label` + `label_page.html` (`clipper-judge label prepare|serve`: blind
   labelling set, videos cut from the chunks, a 127.0.0.1 page writing `labels.json`; sets live in
-  the gitignored `data/labels/`). Shadow runs (`CLIPPER_JUDGE_SHADOW`, `adapters.make_shadows`,
+  the gitignored `data/labels/`). `ideas` (`clipper-judge ideas`, read-only trial of post-stream
+  clips: one call over a whole stream's timeline, prompt `prompts/ideas-v{N}/` (v2 default: editor
+  requests from `--requests`, e.g. `data/labels/v1/requests.json` built from the label notes; pause
+  markers), writes input.md, response.json, ideas.md and `--previews` cuts (pauses cut out by
+  `tighten` unless `--no-tighten`) into the gitignored `data/ideas/<stream>/<prompt>/`; a saved
+  answer is reused, no call) + `ideas_rate` + `ideas_rate_page.html` (`clipper-judge rate-ideas`: a
+  127.0.0.1 page to rate every run's ideas publish / with changes / no + a note, and what each
+  run missed; writes `data/ideas/ratings.json`). Shadow runs (`CLIPPER_JUDGE_SHADOW`, `adapters.make_shadows`,
   `rounds`: same inputs, `shadow` rows, best effort); operator-instruction revisions
   (`prompts/v1/revise.md`, `prompt.build_revision_request`, `resolver.resolve_instruction`); the
   heartbeat queues `notify` jobs for `credential_expiring` (`CLIPPER_JUDGE_CLAUDE_TOKEN_EXPIRES`:
@@ -163,6 +170,8 @@ uv run clipper-detector backtest --stream 2415 --params loose.toml --export-draf
 uv run clipper-judge label prepare --stream 2415 --drafts drafts.json --out data/labels/v1
 uv run clipper-judge label serve data/labels/v1 --open      # http://127.0.0.1:8765, blind labels
 uv run clipper-judge eval --labels data/labels/v1/labels.json --drafts data/labels/v1/drafts.json
+uv run clipper-judge ideas --stream 1412 [--requests data/labels/v1/requests.json] [--model claude-cli --yes] [--previews]
+uv run clipper-judge rate-ideas --open      # http://127.0.0.1:8766, rate the ideas -> data/ideas/ratings.json
 docker compose up -d --build renderer       # profile renderer (GPU; needs migration 0007)
 uv run clipper-renderer layout-preview ohnepixel --at 2026-11-23T20:15:00Z   # data/layout-preview/
 uv run clipper-renderer assets check --dir data/assets   # the licensed SFX/music library

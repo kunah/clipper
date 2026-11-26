@@ -4,10 +4,12 @@ Automated clipper for Twitch (Kick/YouTube later). It watches chat and viewers, 
 moments where chat spikes compared to the channel's own history, then records, transcribes,
 judges, edits and publishes short vertical clips.
 
-> **Status (2026-11-25):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
+> **Status (2026-11-26):** Phase 1 / steps 1–5 done (workspace, shared core, schema, job queue,
 > unified logging, Twitch lib, controller, chat-ingest, recorder, transcriber, backfill).
-> **Deployed for testing 2026-11-21** (user's OK; from branch `transcriber` @1778961, so compose runs
-> from that worktree until it is merged): live DB migrated to 0005; controller, chat-ingest and
+> Branch `transcriber` **merged into main 2026-11-26** (PR #1, merge commit, history kept); deploys
+> still go through the detached `clips-deploy` checkout at an approved commit.
+> **Deployed for testing 2026-11-21** (user's OK; from branch `transcriber` @1778961, run from that
+> worktree until the merge): live DB migrated to 0005; controller, chat-ingest and
 > recorder rebuilt; the transcriber (profile `gpu`) works through the queued `transcribe` jobs; the
 > live detector (profile `detector`) runs with judge jobs off and viewer clips on (the whole stack
 > was stopped cleanly at 15:26Z the same day, not restarted since). The backfill
@@ -47,6 +49,24 @@ judges, edits and publishes short vertical clips.
 > transcriber (needs recording). Taste
 > values (caption look, title band, layouts) are PROPOSED defaults; 7d (the licensed SFX/music
 > library) waits for the user.
+> **Label set v1 labelled 2026-11-26** (20 clip, 55 reject; 8 of the rejects mean "a clip with
+> another edit"): the notes split clips into live bursts and **post-stream clips** (stories,
+> callbacks, running bits across the whole stream; decision log). **Post-stream ideas trial
+> 2026-11-26** (`clipper-judge ideas`, read-only, prompt `ideas-v1`): Opus read stream 1412's
+> 4.4 recorded hours in one call (96k tokens in, 7k out, 68 s, ~$0.91 list price) and listed 13
+> ideas (2 stories, 2 callbacks, 2 running bits, 7 single moments) with rough preview cuts; the
+> same prompt on 1930 (86k in, 10 ideas) and 2415 (118k in, 9 ideas), ~1 min and ~$0.8–1.1 each.
+> Against the user's label notes: found the strip club callback (30 min apart), the gold AK story,
+> the vape-MLM storyline and a driving bit per stream; missed most in-game dialogue (cutscenes,
+> radio ads, the scam course, the addict customer), the perfume story and everything visual
+> (crashes, a fall, a car theft); `ideas-v1` also steers away from single moments. **`ideas-v2`
+> 2026-11-26** (user's go): the label notes as editor requests (`data/labels/v1/requests.json`, 28),
+> in-game dialogue counts, moments listed too, length targets (moment 15–40 s, story 30–60 s), 1–3 s
+> hook, `[N s no speech]` markers, and previews with pauses cut out (`tighten`): 58 ideas over the
+> three streams (all 28 requests answered, 30 ideas for them, 28 own), previews median 38 s (v1:
+> 73 s), ~2–2.5 min and ~$1.1–1.3 list price per stream. The user rates them on a local page
+> (`clipper-judge rate-ideas`, 127.0.0.1:8766: publish / with changes / no + note per idea, "what
+> did it miss" per run; `data/ideas/ratings.json`). All data is still one streamer and one game: generality is unchecked.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -403,6 +423,11 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-26 | ohnepixel's layout: `facecam_gameplay`, the fitted cam rect, the gameplay crop **centred** (a sliver of the cam at its bottom-left accepted) (user's answer; §20 build item 3) | the better crop depends on the video; centred keeps the character centred |
 | 2026-11-25 | **Live judging starts after the eval** (real-CLI checks, then the eval on the user's labels and prompt fixes, then `CLIPPER_DETECTOR_JUDGE_JOBS=1`), render jobs off until the renderer exists (user's answer; §19) | the prompt is tuned before it spends plan usage on live candidates |
 | 2026-11-25 | Recording stays **off** for now (no controller, chat-ingest, recorder): stream 2415 (2026-11-23, 5.2 h with video) is enough material; Postgres and object storage run for the eval (user's answer) | the judge work needs stored data, not new recordings |
+| 2026-11-26 | **Two kinds of clips** (user's answer after labelling set v1): **live clips** are bursts (a funny moment, ~60 s, one candidate's window, as §18/§19 build them); **post-stream clips** come from understanding the whole stream: a story or callback whose payoff comes minutes to an hour after its setup (he says he'll never go to the strip club; he's in one), or funny moments of one running bit cut together ("no crashes allowed", then ~30 crashes in 3 min). Post-stream clips need their own pass over the whole stream; design to follow, not agreed yet | the labels' notes: most of the clips the user wants are edits the one-cut, one-window judge can't make |
+| 2026-11-26 | Label set v1: a **reject with a note or a marked cut means "not cut like this, but a clip with that edit"**, counted as a clip that needs the edit; "already clipped by viewers" is not handled for now (case 39 stays out of the agreement number) (user's answer) | the reject/clip split alone hid 8 positive cases |
+| 2026-11-26 | Every clip gets a **hook in its first seconds**; clip length follows the content (keep the good bits, no fixed cap below the contract's 180 s); **censoring** (blurring part of the frame) applies on **every platform** (user's answer) | viewers decide in the first seconds; a story can't be cut to a fixed length; one render for all platforms |
+| 2026-11-26 | Clipper stays **general: any streamer, any game** (or no game). Prompts, rules and defaults name no channel or game; specifics live only in per-channel/per-game config (lexicon overrides, layouts). All data so far is ohnepixel GTA VI, so a result counts as general only once it is checked on another streamer and genre (user's answer) | the tool is for whatever channel is added, not one streamer |
+| 2026-11-26 | Post-stream clips start with a **read-only trial on stream 1412**: one model call over the whole stream (transcript, chat, sound, live candidates) returns a list of clip ideas for the user to judge (user's answer) | shows whether a whole-stream read finds the stories and running bits before anything is designed around it |
 
 ## 16. Transcriber design (step 4)
 
