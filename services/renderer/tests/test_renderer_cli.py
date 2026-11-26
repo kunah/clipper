@@ -1,6 +1,7 @@
 """`clipper-renderer layout-preview` (drawing part) and `assets check`; the encoder choice."""
 
 import argparse
+import asyncio
 import io
 import shutil
 from datetime import UTC, datetime, timedelta
@@ -117,3 +118,23 @@ def test_choose_encoder():
         "youtube",
         "tiktok",
     ]
+
+
+@pytest.mark.parametrize(
+    ("argv", "target"),
+    [([], "amain"), (["layout-preview", "x", "--at", "2026-11-25T12:00:00Z"], "layout_preview")],
+)
+def test_main_hands_run_a_coroutine_function(monkeypatch, argv, target):
+    """`runtime.run` takes the function, not a coroutine (7c: the service crash-looped)."""
+    called = []
+
+    async def fake(*args):
+        called.append(args)
+        return 0
+
+    monkeypatch.setattr(main, target, fake)
+    monkeypatch.setattr(main, "run", lambda fn: asyncio.run(fn()))
+    with pytest.raises(SystemExit) as exc:
+        main.main(argv)
+    assert exc.value.code == 0
+    assert len(called) == 1

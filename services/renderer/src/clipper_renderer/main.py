@@ -224,10 +224,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.cmd == "layout-preview":
-        sys.exit(run(layout_preview(args)))
+        sys.exit(run(lambda: layout_preview(args)))
     if args.cmd == "assets":
         sys.exit(check_assets(args))
-    sys.exit(run(amain()))
+    sys.exit(run(amain))
 
 
 if __name__ == "__main__":
