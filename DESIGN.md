@@ -39,9 +39,13 @@ judges, edits and publishes short vertical clips.
 > (contracts + migration 0007 `renders` + `clipper_core.assets`, the pure parts of
 > `services/renderer`) and 7b (the render loop on libx264 and synthetic chunks, the
 > `clipper-renderer` service, image with a pinned jellyfin-ffmpeg 8.1.3-2, compose profile
-> `renderer`) built 2026-11-25; not deployed, 0007 is not on the live DB. Taste values (caption
-> look, title band, layouts) are PROPOSED defaults; 7c (NVENC in the container, a real stream,
-> ohnepixel's layout) and 7d (the licensed SFX/music library) wait for the user.
+> `renderer`) built 2026-11-25. **7c 2026-11-26**: migration 0007 on the live DB (applied alone),
+> the renderer deployed (from `clips-deploy`), NVENC works in the container, the first real clip
+> of stream 2415 rendered (candidate 297, judged by Opus in a one-off job), ohnepixel's facecam
+> rect fitted; open: the user's approval of the layout (gameplay focus), the loudness of peaky
+> stream audio (−15.7 LUFS, see §20 build item 3), the timing beside the transcriber. Taste
+> values (caption look, title band, layouts) are PROPOSED defaults; 7d (the licensed SFX/music
+> library) waits for the user.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -194,7 +198,7 @@ Services talk only through Postgres and object storage.
 | transcriber | faster-whisper on GPU, audio features | chunk_transcripts, transcript_segments, audio_metrics_1s; words files (S3) | CUDA |
 | detector | live (reads per-second stats, ~10 s behind, §18) + offline (not built yet). Separate so tuning never restarts chat logging. Claims channels via leases | candidates, chat_delay_estimates, own media_requests | slim (profile `detector`) |
 | judge | LLM verdict + edit plan, context requests, revisions (§19; contract + 0005 built; the service with a deterministic fake model built 2026-11-22, not deployed; the Claude Code CLI adapter built 2026-11-22 (6d), not run for real yet). Enqueues `judge` rounds, `render`, `notify` | clips, clip_plans, judge_calls, own media_requests | slim (profile `judge`) |
-| renderer | ffmpeg + NVENC (libx264 fallback), 9:16, captions, two-pass loudness (§20; 7a+7b built 2026-11-25, not deployed). Pins chunk video, enqueues `review`, `notify` | renders; `clips/{id}/pinned/`, `clips/{id}/renders/` | slim + static ffmpeg, GPU (profile `renderer`) |
+| renderer | ffmpeg + NVENC (libx264 fallback), 9:16, captions, two-pass loudness (§20; 7a+7b built 2026-11-25, deployed 2026-11-26 with NVENC). Pins chunk video, enqueues `review`, `notify` | renders; `clips/{id}/pinned/`, `clips/{id}/renders/` | slim + static ffmpeg, GPU (profile `renderer`) |
 | review | FastAPI UI + Discord bot (§21) | clip decisions (later) | slim |
 | publisher | platform uploads, tokens, retries; later analytics | publications (later) | slim |
 | tools/backfill | past VODs + chat replay + top clips, written in the live format; one-off CLI (`clipper-backfill`) | for backfilled streams: streams, vods, chunks, stream_gaps (5c), chat_messages, chat_metrics_1s (5d); viewer_clips (5d, all streams); in an ended live stream (`--fill-gaps`, §17): vods, `source='backfill'` chunks, chat rows of seconds without live chat | slim + ffmpeg (profile `tools`) |
@@ -318,8 +322,9 @@ deterministic fake model, compose profile `judge`, not deployed) 2026-11-22, 6d'
 run and 6e (notices, shadow runs, instruction revisions, drafts export, blind labelling)
 2026-11-25, see §19; next the user's labels on the first set (75 cases), `clipper-judge eval` with
 Opus on them, prompt fixes, then live judging. Renderer build items 7a (contract, migration 0007,
-pure parts) and 7b (render loop, service, image, compose) built 2026-11-25, see §20; next 7c (NVENC
-in the container, a real stream, ohnepixel's layout) and 7d (licensed assets) with the user.
+pure parts) and 7b (render loop, service, image, compose) built 2026-11-25, 7c (deployed, NVENC,
+a real clip of 2415, ohnepixel's rect) 2026-11-26, see §20; next the user's sign-off on the layout
+and the loudness question, then 7d (licensed assets) with the user.
 Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
@@ -3129,8 +3134,9 @@ detector's filter helpers (bots, commands, dup normalisation), moved there so bo
 
 **Status:** proposal (not yet agreed). **7a and 7b built 2026-11-25** (see build plan items 1 and
 2: the contract, migration 0007, `clipper_core.assets`, the renderer's pure parts with golden tests,
-the render loop, the service, its image and compose service; not deployed). NVENC inside
-Docker Desktop/WSL2 is **UNVERIFIED** (smoke test 7c; x264 keeps everything working without it).
+the render loop, the service, its image and compose service). **7c 2026-11-26** (build item 3):
+deployed, 0007 on the live DB; **NVENC works** inside Docker Desktop/WSL2; first real renders of
+stream 2415.
 Per-channel layouts, caption taste and the SFX/music library need the user: the taste values built
 are **PROPOSED defaults** (`styles.py`, `layout.py`, `graph.py` mark them), to be signed off with
 real renders (7c/7d).
@@ -3322,7 +3328,49 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
 3. **7c GPU + real stream** (smoke on this PC). *Done:* NVENC works in the container (else x264-only
    is documented); a 30 s 1080p60 clip renders in ≤ 30 s p50 while the transcriber runs and its
    realtime factor drops < 10 % (numbers in §20); ohnepixel's layout fitted with `layout-preview`
-   and approved by the user.
+   and approved by the user. **Run 2026-11-26:**
+   - **Deploy**: `clips-deploy` at 23db7b7, `docker compose up --build migrate` alone (0006 ->
+     0007), then `up -d --build renderer`. Found: `main()` handed `runtime.run` a coroutine
+     (`run(amain())`, also `layout-preview`), so the service crash-looped on its first start; fixed
+     with a test (23db7b7). Now at 261d964.
+   - **NVENC in the container: works.** Docker Desktop + WSL2, RTX 4060, driver 610.88 (KMD), CUDA
+     UMD 13.3, `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`: the start probe chose
+     `h264_nvenc`; a 10 s 1080p60 `testsrc2` encode (p5, 8 Mbps) took ~2 s.
+   - **A real clip**: candidate 297 of 2415 (chat trigger, funny, score 6.19, 15:20:59Z) got a
+     judge job by hand (the detector's dedupe key); the judge ran natively with `claude-cli`
+     (Opus, one call: 8.1k input / 0.9k output tokens, 10 s, five-hour window at 5 %) and planned
+     clip 1 / plan 1: 37.4 s, a text hook, one 1.2x face punch-in, three emphasis words, no SFX or
+     music (repairs `snap_in`, `snap_out`), render job enqueued. Not live judging: the detector
+     still writes no judge jobs. Render 1 (`blurred_fit`, before the rect): 14.9 s; render 2
+     (`facecam_gameplay`, a second job for the same plan, dedupe key `render:1:7c-facecam`):
+     **13.3 s for a 37.4 s 1080p60 clip** (ffmpeg 12.5 s), NVENC, `clip.mp4` 39.5 MB, preview
+     7.4 MB. Frames, captions (pages, emphasis colour), the hook card, the punch-in and the
+     thumbnail look as designed. Both renders queue a `review` job (no review service yet).
+   - **Loudness on real stream audio: −15.7 LUFS, −1.2 dBTP** (warning `loudness_dynamic`). The
+     clip's source: I −25.7 LUFS, true peak −3.8 dBFS, i.e. a 22 dB peak-to-loudness ratio (quiet
+     speech, loud game audio; peaks of −4 to −10 dBFS most seconds). −14 LUFS at −1.5 dBTP needs
+     ≤ 12.5 dB, so loudnorm can't stay linear and its dynamic mode ends 1.7 LU short. Tried on the
+     same audio: +11.7 dB then `alimiter` at −2 dBFS: −16.0 LUFS (the peaks are not rare
+     transients, limiting lowers the loudness too); `acompressor` alone (threshold −30 dB, ratio
+     3–6): the ratio only drops to 14–16 dB. Reaching −14 takes a compressor and a limiter, which
+     changes how the stream sounds: **open, the user's taste** (recommended meanwhile: keep the
+     dynamic fallback; platforms turn loud uploads down, not quiet ones up, so the clip plays
+     ~1.7 dB quieter than ideal).
+   - **ohnepixel's facecam** (`config/layouts.toml`): a keyed cutout (no border) bottom-left over
+     the minimap, in the same place across the stream (checked at 13:50, 15:20, 17:30, 19:55: PS5
+     menu, rooftop, character creator, gym). Rect x 66–663, y 660–1080 at 1080p (normalised 0.0344,
+     0.6111, 0.3109, 0.3889): the facecam panel's aspect (1.42), so the crop keeps all of it, with
+     headroom; the minimap shows at its left. `default = "facecam_gameplay"`, gameplay focus 0.5
+     (the character centred): the gameplay crop (x 456–1462) **shows a sliver of the cam at its
+     bottom-left** (his glasses). Focus 0.6 (x 648–1654) removes it but puts the character off
+     centre (the gym shot cuts her at the left edge). **Waiting for the user's choice/approval**
+     (`data/layout-preview/compare_focus_0.5_top_0.6_bottom.png`).
+   - `layout-preview` loaded no config natively (`CLIPPER_RENDERER_LAYOUTS_PATH` unset): it now
+     falls back to the checkout's `services/renderer/config/layouts.toml` (`--layouts` overrides)
+     and prints the file it used (261d964).
+   - Not measured yet: the render time while the transcriber runs and its realtime factor
+     (recording is off and the transcriber not running; re-transcribing stored chunks would
+     rewrite their transcripts).
 4. **7d Assets + polish** (needs the user's licensed library). *Done:* `assets check` rejects a
    missing licence and a hash mismatch; a clip with 2 SFX + music meets the loudness targets; the
    user signs off 5 real renders (captions, layout, hook).

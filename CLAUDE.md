@@ -108,7 +108,8 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   (`render_files`: one render from files on disk), `handler` (the `render` job: pin by S3 copy,
   download, words, render, upload, row `done` + `review` job; `unrenderable` no_video /
   video_expired; last attempt -> `failed` + `notify(render_failed)`), `service`, `settings`
-  (`CLIPPER_RENDERER_*`), `main` (`clipper-renderer`, `layout-preview`, `assets check`). Goldens
+  (`CLIPPER_RENDERER_*`), `main` (`clipper-renderer`, `layout-preview` (natively: this checkout's
+  `config/layouts.toml` unless `--layouts`/`CLIPPER_RENDERER_LAYOUTS_PATH`), `assets check`). Goldens
   in `tests/fixtures/` (`CLIPPER_RENDERER_UPDATE_GOLDEN=1` rewrites them); tests need ffmpeg and
   ffprobe on PATH. Compose service `renderer` (profile `renderer`, GPU; image with jellyfin-ffmpeg
   8.1.3-2 static by sha256). Needs migration 0007 (`renders`). Depends on core only.

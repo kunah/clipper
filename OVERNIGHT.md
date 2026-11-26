@@ -320,6 +320,24 @@ Your task: DESIGN §20 build items 7a and 7b; taste defaults proposed, 7c/7d wai
   Montserrat ExtraBold 62/54/46 px (by length) in a 70 %-opaque black box; text hook white on red
   for 2.6 s; layouts: blurred_fit unless `layouts.toml` says otherwise (facecam panel 760 px).
 
+## Session 2026-11-26 (renderer 7c, this worktree)
+
+Your task: 7c (0007 alone, start the renderer, NVENC, a real clip of 2415, ohnepixel's facecam).
+Details in DESIGN §20 build item 3.
+- Done: 0007 on the live DB (alone); renderer deployed from `../clips-deploy` (now 261d964). Its
+  entry crash-looped (`run(amain())`), fixed (23db7b7). NVENC works in the container.
+- Done: a real clip: a one-off judge job for candidate 297 (Opus, one call, natively), clip 1 /
+  plan 1 (37.4 s); render 2 (facecam_gameplay, NVENC) in 13.3 s. Files: `data/renders/1|2/`.
+- Done: ohnepixel's rect in `services/renderer/config/layouts.toml`; `layout-preview` now reads
+  that file natively (it read none).
+- **For you**: (1) gameplay focus 0.5 (centred, a sliver of the cam bottom-left) or 0.6 (no
+  sliver, character off-centre): `data/layout-preview/compare_focus_0.5_top_0.6_bottom.png`;
+  (2) loudness: peaky stream audio ends at −15.7 LUFS with the dynamic fallback; reaching −14
+  needs a compressor + limiter (changes the sound). Recommended: keep it for now.
+- Open: render time beside a running transcriber (not measured: recording off).
+- Mistake: while stopping my native judge I killed your `clipper-judge label serve` (pid 24832)
+  at ~06:30Z; restarted within a minute on the same port (labels.json kept your 3 labels).
+
 ## Next
 
 - Done 2026-11-21 after the resume: `channel` list-only (b556ed4); `calibrate` reads fMP4 VODs
