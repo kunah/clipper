@@ -19,3 +19,5 @@ default = "blurred_fit"   # PROPOSED: the whole frame, full width, over a blurre
 [channels.ohnepixel]
 facecam = { x = 0.0344, y = 0.6111, w = 0.3109, h = 0.3889 }   # x 66-663, y 660-1080 at 1080p
 default = "facecam_gameplay"
+# gameplay_focus_x stays 0.5 (centred; approved 2026-11-26): the crop shows a sliver of the cam at
+# its bottom-left, accepted; 0.6 removes it but puts the character off centre.

@@ -42,8 +42,9 @@ judges, edits and publishes short vertical clips.
 > `renderer`) built 2026-11-25. **7c 2026-11-26**: migration 0007 on the live DB (applied alone),
 > the renderer deployed (from `clips-deploy`), NVENC works in the container, the first real clip
 > of stream 2415 rendered (candidate 297, judged by Opus in a one-off job), ohnepixel's facecam
-> rect fitted; open: the user's approval of the layout (gameplay focus), the loudness of peaky
-> stream audio (−15.7 LUFS, see §20 build item 3), the timing beside the transcriber. Taste
+> rect fitted and approved as is (gameplay crop centred); peaky stream audio stays at loudnorm's
+> dynamic fallback for now (−15.7 LUFS, see §20 build item 3); open: the timing beside the
+> transcriber (needs recording). Taste
 > values (caption look, title band, layouts) are PROPOSED defaults; 7d (the licensed SFX/music
 > library) waits for the user.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
@@ -323,8 +324,8 @@ run and 6e (notices, shadow runs, instruction revisions, drafts export, blind la
 2026-11-25, see §19; next the user's labels on the first set (75 cases), `clipper-judge eval` with
 Opus on them, prompt fixes, then live judging. Renderer build items 7a (contract, migration 0007,
 pure parts) and 7b (render loop, service, image, compose) built 2026-11-25, 7c (deployed, NVENC,
-a real clip of 2415, ohnepixel's rect) 2026-11-26, see §20; next the user's sign-off on the layout
-and the loudness question, then 7d (licensed assets) with the user.
+a real clip of 2415, ohnepixel's rect, approved) 2026-11-26, see §20; left of 7c: the timing beside
+the transcriber (when recording runs again); next 7d (licensed assets) with the user.
 Designs (all proposed 2026-11-19, not yet agreed):
 detector [§18](#18-detector-phase-2--proposed-2026-11-19-not-yet-agreed), judge
 [§19](#19-judge-phase-2--proposed-2026-11-19-not-yet-agreed), renderer
@@ -399,6 +400,7 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-21 | Backfill may **fill the `not_recorded` gaps of a live-recorded stream from its VOD**, while the VOD exists: on request only (`clipper-backfill vod <id> --fill-gaps`), it fills only the gaps and never touches what was recorded live; a gone VOD leaves the gap. First targets: stream 803 (VOD 2934862154, live part ends 17:29:24Z), then the 7134 s gap in stream 1412 (user's answer; design in §17, proposed) | recorder or Docker outages lose hours of a broadcast whose VOD still has them |
 | 2026-11-25 | Judge eval labels come from a **blind labelling page**: `clipper-judge label` cuts each candidate's context from our recordings into local video files and serves a local page (127.0.0.1) where the user marks clip/reject and optionally the ideal in/out, without seeing any model answer; loosened-detector drafts are added so the set has negatives (user's answer; §19) | an unbiased agreement number; nearly all live candidates come from viewer clips, i.e. are likely positives |
 | 2026-11-25 | Build now, besides the real CLI run, the image and the eval: **instruction revisions**, **shadow runs** and the **token-expiry notice** (user's answer; §19) | the rest of §19's judge before review exists |
+| 2026-11-26 | ohnepixel's layout: `facecam_gameplay`, the fitted cam rect, the gameplay crop **centred** (a sliver of the cam at its bottom-left accepted) (user's answer; §20 build item 3) | the better crop depends on the video; centred keeps the character centred |
 | 2026-11-25 | **Live judging starts after the eval** (real-CLI checks, then the eval on the user's labels and prompt fixes, then `CLIPPER_DETECTOR_JUDGE_JOBS=1`), render jobs off until the renderer exists (user's answer; §19) | the prompt is tuned before it spends plan usage on live candidates |
 | 2026-11-25 | Recording stays **off** for now (no controller, chat-ingest, recorder): stream 2415 (2026-11-23, 5.2 h with video) is enough material; Postgres and object storage run for the eval (user's answer) | the judge work needs stored data, not new recordings |
 
@@ -3353,9 +3355,9 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
      same audio: +11.7 dB then `alimiter` at −2 dBFS: −16.0 LUFS (the peaks are not rare
      transients, limiting lowers the loudness too); `acompressor` alone (threshold −30 dB, ratio
      3–6): the ratio only drops to 14–16 dB. Reaching −14 takes a compressor and a limiter, which
-     changes how the stream sounds: **open, the user's taste** (recommended meanwhile: keep the
-     dynamic fallback; platforms turn loud uploads down, not quiet ones up, so the clip plays
-     ~1.7 dB quieter than ideal).
+     changes how the stream sounds. **Kept for now** (the recommendation; the user answered only
+     the layout question): the dynamic fallback stays; platforms turn loud uploads down, not quiet
+     ones up, so such a clip plays ~1.7 dB quieter than ideal. Revisit with 7d's sign-off.
    - **ohnepixel's facecam** (`config/layouts.toml`): a keyed cutout (no border) bottom-left over
      the minimap, in the same place across the stream (checked at 13:50, 15:20, 17:30, 19:55: PS5
      menu, rooftop, character creator, gym). Rect x 66–663, y 660–1080 at 1080p (normalised 0.0344,
@@ -3363,8 +3365,10 @@ contiguous chunks with a 0.3 s jitter hole. Test profile: 270×480, libx264 ultr
      headroom; the minimap shows at its left. `default = "facecam_gameplay"`, gameplay focus 0.5
      (the character centred): the gameplay crop (x 456–1462) **shows a sliver of the cam at its
      bottom-left** (his glasses). Focus 0.6 (x 648–1654) removes it but puts the character off
-     centre (the gym shot cuts her at the left edge). **Waiting for the user's choice/approval**
-     (`data/layout-preview/compare_focus_0.5_top_0.6_bottom.png`).
+     centre (the gym shot cuts her at the left edge). **Approved by the user 2026-11-26: stays
+     centred** ("it really depends on the video"; `data/layout-preview/crop_A_vs_B.png`). A per-clip
+     gameplay focus would be a later addition: the plan's `layout.focus_x` reaches only `full_crop`
+     today (`layout.resolve`).
    - `layout-preview` loaded no config natively (`CLIPPER_RENDERER_LAYOUTS_PATH` unset): it now
      falls back to the checkout's `services/renderer/config/layouts.toml` (`--layouts` overrides)
      and prints the file it used (261d964).

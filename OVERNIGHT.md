@@ -330,10 +330,8 @@ Details in DESIGN §20 build item 3.
   plan 1 (37.4 s); render 2 (facecam_gameplay, NVENC) in 13.3 s. Files: `data/renders/1|2/`.
 - Done: ohnepixel's rect in `services/renderer/config/layouts.toml`; `layout-preview` now reads
   that file natively (it read none).
-- **For you**: (1) gameplay focus 0.5 (centred, a sliver of the cam bottom-left) or 0.6 (no
-  sliver, character off-centre): `data/layout-preview/compare_focus_0.5_top_0.6_bottom.png`;
-  (2) loudness: peaky stream audio ends at −15.7 LUFS with the dynamic fallback; reaching −14
-  needs a compressor + limiter (changes the sound). Recommended: keep it for now.
+- Your answer: the layout stays centred ("depends on the video"). Loudness: the dynamic fallback
+  stays for now (−15.7 LUFS on peaky audio; −14 would need a compressor + limiter), revisit at 7d.
 - Open: render time beside a running transcriber (not measured: recording off).
 - Mistake: while stopping my native judge I killed your `clipper-judge label serve` (pid 24832)
   at ~06:30Z; restarted within a minute on the same port (labels.json kept your 3 labels).
