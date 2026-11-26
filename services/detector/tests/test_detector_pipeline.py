@@ -155,22 +155,15 @@ def test_a_burst_every_45_s_stays_one_candidate():
     assert len(out.folded) == 5 and len(draft.features["followups"]) == 5
 
 
-def test_budget_caps_emitted_candidates_per_hour():
+def test_no_hourly_cap_every_moment_is_emitted():
+    """11 moments 5 min apart in one hour, each weaker than the one before: none is dropped for
+    the number before it (the per-stream-hour budget was removed 2026-11-26)."""
     sim = chat(4, 1200 + 3600)
-    centers = [1300 + 300 * k for k in range(11)]  # 11 moments 5 min apart in one hour
-    for k, center in enumerate(centers):  # each weaker than the one before
+    centers = [1300 + 300 * k for k in range(11)]
+    for k, center in enumerate(centers):
         burst(sim, ("KEKW", "OMEGALUL", "LMAO"), center=center, factor=6.0 - 0.2 * k)
     out = run(sim)
-    assert len(out.drafts) == len(centers)
-    budget = [d for d in out.drafts if d.suppress_reason is SuppressReason.BUDGET]
-    assert len(out.emitted) >= P.budget_per_hour and budget
-    for d in budget:  # each was no better than the 8 emitted in the hour before it
-        window = [
-            e
-            for e in out.emitted
-            if d.chat_peak_utc - timedelta(hours=1) < e.chat_peak_utc <= d.chat_peak_utc
-        ]
-        assert len(window) >= P.budget_per_hour and d.score <= min(e.score for e in window)
+    assert len(out.drafts) == len(out.emitted) == len(centers)
 
 
 def test_the_live_write_dedupe_drops_a_moment_45_s_after_a_suppressed_raid():

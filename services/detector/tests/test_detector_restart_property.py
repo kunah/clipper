@@ -13,7 +13,7 @@ status) or be folded into the candidate it followed; no moment may exist twice (
 or a candidate and another's follow-up, at one peak). Other differences are allowed only where
 the replay saw another baseline: episodes with an onset before the new process's own history is
 complete (start - 60 s) that the replay decided, and what follows from them in that channel
-(cooldown, budget). They are counted and printed.
+(the cooldown). They are counted and printed.
 """
 
 import asyncio

@@ -483,7 +483,7 @@ class Candidate(Base):
     - `moment_from`..`moment_to`: the moment itself (video time); `window_from`..`window_to`: the
       media window requested for it (§7), linked through `media_request_id`.
     `status`: `contracts.CandidateStatus`. `suppressed` rows carry `suppress_reason` (raid, subs,
-    bits, commands, copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget:
+    bits, commands, copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget (old):
     `contracts.SuppressReason`) and get no judge job. Re-emitting one (a viewer clip or clip
     mentions arrived) is an in-place UPDATE to `emitted` that keeps the reason (audit), with its
     media request and judge job in the same transaction. `trigger`: chat, clip_mentions,

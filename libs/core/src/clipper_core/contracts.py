@@ -167,7 +167,7 @@ class CandidateStatus(StrEnum):
     # transaction, except while the detector runs with CLIPPER_DETECTOR_JUDGE_JOBS=0 (until
     # the judge exists): then emitted rows have no judge job
     EMITTED = "emitted"
-    SUPPRESSED = "suppressed"  # fake-spike rule or budget; see `candidates.suppress_reason`
+    SUPPRESSED = "suppressed"  # fake-spike rule (or old rows' budget); see `suppress_reason`
 
 
 class SuppressReason(StrEnum):
@@ -186,7 +186,7 @@ class SuppressReason(StrEnum):
     BOTS = "bots"  # bot accounts' messages >= 30 %
     GREETING = "greeting"  # greetings that aren't reactions >= 40 % ("hi"/"bye" floods)
     WEAK = "weak"  # no rule, but z_clean below the emit bar (bots/commands/deleted mixed)
-    BUDGET = "budget"  # over the per-stream-hour budget of emitted candidates
+    BUDGET = "budget"  # old rows only: the hourly caps were deleted 2026-11-26
 
 
 class DelaySource(StrEnum):

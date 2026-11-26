@@ -16,7 +16,7 @@ judges, edits and publishes short vertical clips.
 > image is built, not run: backfill runs only on a VOD the user names (§17, decided 2026-11-21).
 > Designs §17–§22 stay proposed until the user has reviewed them, apart from the user's
 > 2026-11-21 answers in §15: backfill only on request (GQL, audio by default), detector defaults
-> (8 s delay, ≤ 8 candidates/stream-hour, raid/sub suppression, Get Clips), review on Discord,
+> (8 s delay, ~~≤ 8 candidates/stream-hour~~ no hourly cap since 2026-11-26, raid/sub suppression, Get Clips), review on Discord,
 > the judge on Opus via the Claude Code CLI in Docker with no usage limits for now, and publishing
 > per user-filled route (backfilled clips included). Detector build items 1–3 (contracts + 0004,
 > scorer/stage 2/lexicon/merge, live service) built 2026-11-20 and live since 2026-11-21; build
@@ -406,7 +406,7 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-21 | **Review runs on Discord instead of Telegram**: a bot posts each clip with buttons (approve / reject / edit), the web UI stays for detailed editing (user's answer; design in §21) | the user's choice of messenger |
 | 2026-11-21 | **The judge's first real LLM adapter is the Claude Code CLI** (headless `claude -p`, JSON output) on the user's Claude subscription, not an API key; the USD cost guard becomes a **usage guard** that keeps the judge from using up the plan's limits (user's answer; design in §19). Model and limits still open | uses the subscription the user already pays for; the `JudgeModel` protocol keeps API adapters possible |
 | 2026-11-21 | Everything built so far is deployed to the live stack for testing; redeploys are fine (user's OK, deploy done by the main session from branch `transcriber`) | test the pipeline on live data |
-| 2026-11-21 | Detector defaults accepted: chat delay **8 s** until learned per channel; **≤ 8** chat candidates per stream-hour to the judge; raid and gifted-sub spikes **suppressed** by the stage-2 rules (user's answers; §18) | as proposed in §18 |
+| 2026-11-21 | Detector defaults accepted: chat delay **8 s** until learned per channel; ~~**≤ 8** chat candidates per stream-hour to the judge~~ (**superseded 2026-11-26: no hourly cap**); raid and gifted-sub spikes **suppressed** by the stage-2 rules (user's answers; §18) | as proposed in §18 |
 | 2026-11-21 | The detector may hold the Twitch app credentials and polls Helix Get Clips itself (user's answer; §18) | fresh viewer clips are a live signal, and the detector is their only consumer |
 | 2026-11-21 | Extra IRC tags (first message, channel-point reward, highlighted message) get **proper columns** on `chat_messages`, not `_`-keys in `badges`; they ship with a chat-ingest redeploy (user's answer; §18) | typed and queryable |
 | 2026-11-21 | Judge model: **Opus**, through the Claude Code CLI; a pinned full model id, recorded with every call (user's answer; §19) | the user's choice of judgement quality; the subscription covers it |
@@ -428,6 +428,7 @@ gap rows become visible with the chunk after the gap (up to ~60 s later); video 
 | 2026-11-26 | Every clip gets a **hook in its first seconds**; clip length follows the content (keep the good bits, no fixed cap below the contract's 180 s); **censoring** (blurring part of the frame) applies on **every platform** (user's answer) | viewers decide in the first seconds; a story can't be cut to a fixed length; one render for all platforms |
 | 2026-11-26 | Clipper stays **general: any streamer, any game** (or no game). Prompts, rules and defaults name no channel or game; specifics live only in per-channel/per-game config (lexicon overrides, layouts). All data so far is ohnepixel GTA VI, so a result counts as general only once it is checked on another streamer and genre (user's answer) | the tool is for whatever channel is added, not one streamer |
 | 2026-11-26 | Post-stream clips start with a **read-only trial on stream 1412**: one model call over the whole stream (transcript, chat, sound, live candidates) returns a list of clip ideas for the user to judge (user's answer) | shows whether a whole-stream read finds the stories and running bits before anything is designed around it |
+| 2026-11-26 | **No hourly candidate caps**: the chat budget (≤ 8 per stream-hour, ranked) and the signal-only cap (4 per stream-hour, first come) are deleted from the code (`SCORER_VERSION` 2); every moment that passes stage 2, and every unclaimed signal, is emitted. Cooldown fold-in and the ± 60 s dedupe stay (they merge one moment, they don't drop others). Judge calls are bounded by the judge's usage guard, not by the detector (user's call after the Shorts teardown) | on ohnepixel ~30 viewer-clip candidates per stream-hour all scored 1.0, so the first-come cap dropped ~330 of 392, among them the moments behind 1.01M, 608K, 252K and 114K Shorts; the caps were a cost guess that turned into the main filter |
 
 ## 16. Transcriber design (step 4)
 
@@ -1492,8 +1493,8 @@ item 4) has its credentials now, so Helix viewer clips and channel lookups work.
 backfilled VODs, and those are only the ones the user names (§17, decided 2026-11-21): the first
 is yesterday's ohnepixel VOD (§15). **2026-11-22:** the backtest CLI is built (`clipper-detector
 backtest`, read-only, build item 4); not run on real data yet (first: stream 803). Defaults accepted by the user (2026-11-21): 8 s chat delay
-until learned, ≤ 8 chat candidates per stream-hour to the judge, raid and gifted-sub spikes
-suppressed.
+until learned, ~~≤ 8 chat candidates per stream-hour to the judge~~ (no hourly cap since
+2026-11-26, §15), raid and gifted-sub spikes suppressed.
 
 **Role.** `services/detector` (slim), one process for all channels, `CLIPPER_DETECTOR_MODE` =
 `live|offline|all`. Writer of `candidates`, `chat_delay_estimates` (new), its own `media_requests`
@@ -1620,9 +1621,8 @@ stage-2 features or suppress reasons; the judge's chat summary could mark such m
 - **Boosts** +2 (clip mentions), +1 (viewer clip). A signal within ±60 s of a candidate is attached
   to it; a *suppressed* one is then re-emitted (a viewer thought it was real): an in-place UPDATE
   to `emitted` that keeps `suppress_reason` (audit), with its media request and judge job in the
-  same transaction. A signal nobody claims becomes a candidate of its own; at most 4 such per
-  stream-hour (`signal_budget_per_hour`; more: suppressed `budget`, and further signals don't lift
-  that).
+  same transaction. A signal nobody claims becomes a candidate of its own (no hourly cap since
+  2026-11-26; the 4-per-stream-hour `signal_budget_per_hour` is deleted).
 
 **5. Merge, delay, media request.**
 - **Emit at episode close** (≤ ~20 s after the peak): stable peak/window; the judge waits for
@@ -1634,9 +1634,9 @@ stage-2 features or suppress reasons; the judge's chat summary could mark such m
   `timeline_uncertain_s` → **8 s**; fixed per stream. `T = peak_utc = chat_peak − d`. **Window**
   (§7) `[min(T − 90 s, onset − d − 30 s), max(T + 30 s, close − d + 15 s)]`, at most 5 min.
 - **Cooldown 60 s**: a weaker episode opening < 60 s after a candidate closed folds into it
-  (`features.followups`); a stronger one is emitted with `features.prev_candidate_id`. **Budget**:
-  ≤ 8 emitted per stream per rolling hour, then only above the lowest of them (caps LLM cost); it
-  counts chat candidates only (a signal-only candidate's score is just its boost).
+  (`features.followups`); a stronger one is emitted with `features.prev_candidate_id`. **No hourly
+  cap** (the ≤ 8 per rolling hour budget was deleted 2026-11-26, §15): LLM calls are bounded by the
+  judge's usage guard (§19).
 - **One transaction per candidate**: insert → `media.request_media(stream, window, Priority.TRIGGER,
   requested_by="detector")` → `jobs.enqueue(JUDGE, ref_id=id, dedupe_key=dedupe_key(JUDGE, id),
   priority=TRIGGER)` → commit. A 60 s sweep marks its requests fulfilled once `coverage(window)`
@@ -1661,7 +1661,7 @@ stage-2 features or suppress reasons; the judge's chat summary could mark such m
   ≥ 10 dB; not where music or gunfire_explosion ≥ 0.6; needs `z ≥ 2.5` in `[t + d − 5 s, t + d +
   15 s]` unless two groups fire or laughter ≥ 0.7 for 3 s (thresholds depend on the tagger picked);
   (c) transcript_segments text vs lexicon phrases, strongest the streamer saying "clip that".
-- **Score** = max trigger score + 0.5 per extra kind; top 4 *new* candidates per stream-hour; judge
+- **Score** = max trigger score + 0.5 per extra kind; no per-hour cap (as live, 2026-11-26); judge
   priority `LIVE`/`BACKFILL`. **Deferred**: stories/rants chat didn't spike on (LLM/embeddings over
   transcript windows; needs judge/review labels), emotion models, an incremental pass while live.
 - **Delay learning** (first step of each job): onsets of laughter/screaming/cheering ≥ 0.5 (≥ 20 s
@@ -1783,8 +1783,8 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
      the folded episode's end (`FoldIn.extended`), so the cooldown runs from the last close: a
      burst every ~45 s stays one candidate instead of every other burst being emitted. **Window
      clamp**: the side reaching further beyond `[T − 90 s, T + 30 s]` is trimmed first, then both
-     equally, the moment is clamped into the window. Budget counts emitted candidates by chat peak
-     in `(peak − 1 h, peak]`; suppressed ones don't count.
+     equally, the moment is clamped into the window. (The hourly budget built here was deleted
+     2026-11-26, §15.)
    - `SuppressReason` and `DelaySource` are in `clipper_core.contracts` (shared value sets of
      `candidates` that the judge and review read, §19/§21); the columns stay plain text.
    - Open (for build item 4): with these defaults pure Poisson noise at 0.3–1 unique chatters/s
@@ -1868,11 +1868,11 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
    - **Explicit signals** (§18.4, needed here; tunables added to `DetectorParams`, hashed:
      `mention_*`, `clip_*`, `signal_attach_s`): a signal attaches to a candidate or episode
      within ± 60 s (chat time), boosting once per kind; an episode decided with a signal that
-     stage 2 or the budget suppressed is **emitted with its reason kept** (the decision-time form
+     stage 2 suppressed is **emitted with its reason kept** (the decision-time form
      of the re-emit); a signal nothing claims becomes a candidate of its own (`trigger` =
-     `clip_mentions`/`viewer_clips`, score = the boost, moment type `unknown`, no cooldown, own
-     cap of 4 per stream-hour) once the scorer is 60 s past it with no episode open; the chat
-     budget counts chat candidates only (`PriorCandidate.trigger`). One mention signal per 60 s
+     `clip_mentions`/`viewer_clips`, score = the boost, moment type `unknown`, no cooldown; its
+     own cap of 4 per stream-hour was deleted 2026-11-26) once the scorer is 60 s past it with no
+     episode open. One mention signal per 60 s
      per channel; the mention rule and clip links as in §18.4 (review); a chat link is a clip made
      when posted, 30 s long, by its poster; a viewer-clip signal sits at the middle of the clips'
      common span. Helix Get Clips: per held channel in a live stream with a `platform_user_id`,
@@ -1931,7 +1931,7 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
      *any* candidate of the stream, also a suppressed one, so a real moment 40–55 s after a
      suppressed raid is never written live (16 of 16 seeded runs). `run_stream` kept it, so it
      didn't reproduce live; it now mirrors the dedupe (`dedupe=True` by default; the dropped
-     drafts go to `StreamRun.duplicates` and, as live, count for neither cooldown nor budget).
+     drafts go to `StreamRun.duplicates` and, as live, don't count for the cooldown).
      The backtest counts them as `deduped` and can name `dedupe` as a false-suppression reason.
      Whether live should keep dropping them (the dedupe is there for restarts) is open (build
      item 3's Open note).
@@ -1978,7 +1978,7 @@ chat-ingest sends no NOTIFY, is rarely redeployed, and its 5 s grace dominates l
      delay check = median (peak − clip start) over the truth clips hit, the best-ranked
      candidate inside each. **False suppressions**, per rate: each scored truth clip that none
      of the k hits, attributed to the reason of the best-ranked suppressed candidate inside it
-     (any reason, `weak`, `budget` and `dedupe` too); `suppressed_in_truth` (JSON) keeps the raw
+     (any reason, `weak` and `dedupe` too); `suppressed_in_truth` (JSON) keeps the raw
      count (every suppressed candidate inside a scored truth clip). The total row pools the
      streams (hits / candidates, hit views / truth views, span seconds / coverage seconds).
    - **Not replayed**: explicit signals (clip mentions, clip links in chat; their attach and
@@ -2046,7 +2046,7 @@ Accepted by the user on 2026-11-21 (§15): the 8 s default delay, ≤ 8 candidat
 | 2026-11-20 | Candidate writes of a stream are serialised by a transaction-level advisory lock | a lease handover can leave two processes deciding the same stream for up to one sync |
 | 2026-11-20 | Replay dedupe: an episode inside a candidate's chat span (extended by its follow-ups), or a replayed one whose burst `[onset − 10 s, end + 10 s]` holds an unclaimed peak or follow-up peak an earlier process decided (matched one to one, passed peaks dropped), is that candidate's | a restart's shorter baseline scored folded follow-ups above their candidate and re-emitted them (review probe: 2 extra candidates); a plain ± 60 s test swallowed bursts the earlier process never decided (re-review: chains split, a stronger burst lost) |
 | 2026-11-20 | Final lag 10 s plus a data watermark (newest row + 1 s, within 10 s), late rows counted | 8 s left ~1 s of margin over chat-ingest's grace and flush; a lagging flush must not turn chat into zeros |
-| 2026-11-20 | The chat budget counts chat candidates only; signal-only candidates have their own cap (4 per stream-hour) | a signal-only candidate's score is just its boost: as the budget's "lowest" it let every chat candidate through |
+| 2026-11-20 | ~~The chat budget counts chat candidates only; signal-only candidates have their own cap (4 per stream-hour)~~ **superseded 2026-11-26: both caps deleted (§15)** | a signal-only candidate's score is just its boost: as the budget's "lowest" it let every chat candidate through |
 | 2026-11-22 | `pipeline.run_stream` mirrors the live write dedupe (± `dedupe_s` on the video peak against every candidate kept, any status); the backtest reports the dropped drafts | live never wrote a real moment 40–55 s after a suppressed raid; without the mirror the backtest didn't reproduce live |
 | 2026-11-22 | Backtest k and candidates/h count chat-coverage hours (chat rows, cut at the broadcast's end, minus missing-chat runs); truth = top 10 ∪ ≥ p75 of all clips, picked before the exclusions (`no_span`, `muted`, `outside_chat`), which are counted; precision tests the truth before the exclusions and is read against a chance level | partly recorded streams (803: chat for ~5 of 9.7 h); views rank the broadcast's moments whatever part we recorded; offline chat logged into a stream ended late is no broadcast; a 30 s clip with 40 s slack covers 110 s |
 | 2026-11-22 | The backtest replays no explicit signals; Helix viewer clips are only the truth | signal timing follows the live ticks; clips as input would leak the truth |
@@ -2070,7 +2070,7 @@ class CandidateSource(StrEnum):
 
 class CandidateStatus(StrEnum):
     EMITTED = "emitted"  # judge job enqueued
-    SUPPRESSED = "suppressed"  # fake-spike rule or budget; see suppress_reason
+    SUPPRESSED = "suppressed"  # fake-spike rule (budget: old rows only); see suppress_reason
 
 class MomentType(StrEnum):
     FUNNY = "funny"
@@ -2105,7 +2105,8 @@ def detect_lease(channel_id: int) -> str:
 - **`Candidate`** (`candidates`), writer: detector. `id` bigint PK; `stream_id` FK streams,
   `channel_id` FK channels (not null); `source` text CHECK IN ('live','offline'); `status` text
   CHECK IN ('emitted','suppressed'); `suppress_reason` text null (raid, subs, bits, commands,
-  copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget: `contracts.SuppressReason`,
+  copypasta, vote, bots, greeting, mode_toggle, spam_wave, weak, budget (old rows only, no longer
+  written since 2026-11-26): `contracts.SuppressReason`,
   added with `weak` in build item 2; CHECK `suppress_reason`:
   `status <> 'suppressed' OR suppress_reason IS NOT NULL`, one-way so a re-emitted row keeps it);
   `trigger` text (chat, clip_mentions, viewer_clips, audio, transcript; no CHECK, it grows);
@@ -2375,7 +2376,7 @@ reasoning; list prices 2026-11-19, verify; a context round adds ~50 %):
 | OpenAI flagship (gpt-6.2-astra) / gpt-5.4-mini / -nano | 8 / 40 (0.40); 0.75 / 4.50; 0.20 / 1.25 | 0.10–0.15 / 0.01–0.02 / ~0.003 | 3–40 s | gpt-5 family reportedly retired Dec 2026 |
 | Local via Ollama (container exists on this PC) | 0 | 0 (power) | 8B ~30–60 s, 3–4B ~15–30 s | beside the transcriber (~2.8 GB) + NVENC only 3–4B Q4 fits; 8B stalls transcription; quality unmeasured |
 
-~200 calls/day (60 stream-hours × ~3) ≈ $12/day Opus, $6 Sonnet, < $1 Haiku/nano (§18's caps: ≤ ~5×).
+~200 calls/day (60 stream-hours × ~3) ≈ $12/day Opus, $6 Sonnet, < $1 Haiku/nano (§18 has no hourly cap since 2026-11-26: ohnepixel's viewer clips alone made ~30 candidates per stream-hour, ~10×).
 Batch APIs (−50 %, hours) suit only backfill; a cascade (small screens, large plans) is to be measured.
 On the CLI adapter (decided 2026-11-21) these dollars only compare models (list-price estimates):
 what limits the judge is the plan's usage windows (usage guard below).

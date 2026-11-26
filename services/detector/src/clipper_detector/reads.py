@@ -298,7 +298,7 @@ class CandidateRef:
     id: int
     status: CandidateStatus
     peak_utc: datetime
-    prior: PriorCandidate  # for cooldown and budget (chat time)
+    prior: PriorCandidate  # for the cooldown and the dedupe (chat time)
 
 
 def _iso(value: Any) -> datetime | None:
@@ -306,7 +306,7 @@ def _iso(value: Any) -> datetime | None:
 
 
 def candidate_ref(row: Row) -> CandidateRef:
-    """A `candidates` row as cooldown/budget/dedupe input: its chat span = the episode's onset
+    """A `candidates` row as cooldown/dedupe input: its chat span = the episode's onset
     to its end, extended by its fold-ins (`followups`), whose peaks it carries too."""
     delay = timedelta(seconds=row.chat_delay_s)
     chat_peak = row.chat_peak_utc or row.peak_utc + delay
@@ -318,15 +318,12 @@ def candidate_ref(row: Row) -> CandidateRef:
     chat_start = _iso(chat.get("onset")) or row.moment_from + delay
     peaks = tuple(p for p in (_iso(f.get("peak")) for f in followups) if p)
     status = CandidateStatus(row.status)
-    prior = PriorCandidate(
-        row.id, status, chat_peak, chat_end, float(row.score), row.trigger, chat_start, peaks
-    )
+    prior = PriorCandidate(row.id, status, chat_peak, chat_end, float(row.score), chat_start, peaks)
     return CandidateRef(row.id, status, row.peak_utc, prior)
 
 
 CANDIDATE_COLUMNS = (
-    "id, status, trigger, peak_utc, chat_peak_utc, chat_delay_s, moment_from, moment_to, score,"
-    " features"
+    "id, status, peak_utc, chat_peak_utc, chat_delay_s, moment_from, moment_to, score, features"
 )
 
 

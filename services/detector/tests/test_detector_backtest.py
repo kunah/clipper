@@ -337,8 +337,8 @@ def test_grid_is_the_cartesian_product_in_order():
         (["z_open="], "key=v1,v2"),
         (["z_open=4", "z_open=5"], "given twice"),
         (["z_open=2.5"], "z_stay <= z_suspect <= z_open"),  # below z_suspect = 3
-        (["budget_per_hour=lots"], "budget_per_hour"),
-        (["budget_per_hour=2.5"], "budget_per_hour"),
+        (["mention_min_users=lots"], "mention_min_users"),
+        (["mention_min_users=2.5"], "mention_min_users"),
         (["restart_emit_s=60,120"], "no effect here"),
         (["restart_replay_s=600"], "no effect here"),
     ],

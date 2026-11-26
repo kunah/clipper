@@ -1,4 +1,4 @@
-"""Merge: delay, video-time peak/moment/window, cooldown fold-in, budget, the draft row."""
+"""Merge: delay, video-time peak/moment/window, cooldown fold-in, no hourly cap, the draft row."""
 
 import json
 from datetime import UTC, datetime, timedelta
@@ -160,36 +160,13 @@ def test_cooldown_ignores_suppressed_and_old_candidates():
     assert isinstance(draft, CandidateDraft) and draft.suppress_reason is SuppressReason.VOTE
 
 
-def test_budget_per_rolling_hour():
-    recent = [prior(100 + 400 * i, score=10.0 + i, cid=i) for i in range(8)]  # 8 in < 1 h
-    ep = episode(T0 + s(3400))
-    over = plan(ep, stage2(9.0), recent)
-    assert over.status is CandidateStatus.SUPPRESSED
-    assert over.suppress_reason is SuppressReason.BUDGET
-    assert over.features["budget"] == {"in_window": 8, "lowest": 10.0}
-    assert plan(ep, stage2(10.5), recent).emitted  # above the lowest of them
-    later = episode(T0 + s(100 + 3600 + 10))  # the first one left the hour
-    assert plan(later, stage2(9.0), recent).emitted
-    suppressed = [
-        PriorCandidate(i, CandidateStatus.SUPPRESSED, c.chat_peak, c.chat_end, c.score)
-        for i, c in enumerate(recent)
-    ]
-    assert plan(ep, stage2(1.0), suppressed).emitted  # suppressed rows don't count
-
-
-def test_budget_counts_only_chat_candidates():
-    """Signal-only candidates (score = a boost of 1-3) neither fill the chat budget nor set
-    its lowest score."""
-    recent = [prior(100 + 400 * i, score=10.0 + i, cid=i) for i in range(7)]
-    own = PriorCandidate(
-        50, CandidateStatus.EMITTED, T0 + s(3000), T0 + s(3005), 2.0, "clip_mentions"
-    )
-    ep = episode(T0 + s(3400))
-    assert plan(ep, stage2(9.0), [*recent, own]).emitted  # 7 chat candidates: room left
-    full = [*recent, prior(3100, score=12.0, cid=8), own]
-    over = plan(ep, stage2(9.0), full)
-    assert over.suppress_reason is SuppressReason.BUDGET
-    assert over.features["budget"] == {"in_window": 8, "lowest": 10.0}  # not the mention's 2.0
+def test_no_hourly_cap():
+    """However many were emitted in the hour before, a weaker moment outside the cooldown is
+    emitted too (the per-stream-hour budget was removed 2026-11-26)."""
+    recent = [prior(100 + 400 * i, score=10.0 + i, cid=i) for i in range(20)]  # 20 in < 2.3 h
+    draft = plan(episode(T0 + s(8100)), stage2(1.0), recent)
+    assert isinstance(draft, CandidateDraft) and draft.emitted
+    assert draft.suppress_reason is None and "budget" not in draft.features
 
 
 def test_as_prior_round_trip():

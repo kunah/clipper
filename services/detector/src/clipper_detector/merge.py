@@ -14,10 +14,8 @@
   from the last close: a burst every ~45 s stays one candidate instead of every other burst being
   emitted. Suppressed rows don't block (a real moment right after a raid must not vanish into
   the raid's row).
-- **Budget**: at most 8 emitted per stream in a rolling hour (by chat peak); beyond that only
-  above the lowest of them, else `suppressed` with reason `budget`. Only candidates of the same
-  trigger count (chat): a signal-only candidate's score is just its boost, it would make every
-  chat candidate "above the lowest" (signal-only candidates have their own cap, `explicit`).
+- **No hourly cap**: every moment that passes stage 2 is emitted (the per-stream-hour budget was
+  removed 2026-11-26; bound the judge's calls with its usage guard instead).
 """
 
 from __future__ import annotations
@@ -66,8 +64,8 @@ def resolve_delay(
 
 @dataclass(frozen=True, slots=True)
 class PriorCandidate:
-    """A candidate already decided for the stream (cooldown, budget and the replay dedupe look
-    at these). `chat_start`..`chat_end` is its chat span, extended by the episodes folded into
+    """A candidate already decided for the stream (the cooldown and the replay dedupe look at
+    these). `chat_start`..`chat_end` is its chat span, extended by the episodes folded into
     it (`followup_peaks`)."""
 
     candidate_id: int | None
@@ -75,7 +73,6 @@ class PriorCandidate:
     chat_peak: datetime
     chat_end: datetime
     score: float
-    trigger: str = "chat"
     chat_start: datetime | None = None  # the episode's onset; None: the chat peak
     followup_peaks: tuple[datetime, ...] = ()
 
@@ -152,7 +149,6 @@ class CandidateDraft:
             self.chat_peak_utc or self.peak_utc,
             self.chat_end_utc or self.moment_to,
             self.score,
-            self.trigger,
             self.chat_onset_utc,
         )
 
@@ -275,7 +271,7 @@ def plan_candidate(
     extra_features: dict[str, Any] | None = None,
 ) -> Decision:
     """The decision for one closed episode. `recent`: this stream's candidates decided so far
-    (at least the last `budget_window_s` + `cooldown_s`, any order)."""
+    (at least the last `cooldown_s`, any order)."""
     p = params
     status, reason = stage2.status, stage2.reason
     features: dict[str, Any] = {
@@ -313,16 +309,6 @@ def plan_candidate(
                     },
                 )
             features["prev_candidate_id"] = prev.candidate_id
-        hour = timedelta(seconds=p.budget_window_s)
-        in_hour = [
-            c
-            for c in emitted
-            if c.trigger == trigger and episode.peak - hour < c.chat_peak <= episode.peak
-        ]
-        lowest = min((c.score for c in in_hour), default=0.0)
-        if len(in_hour) >= p.budget_per_hour and stage2.score <= lowest:
-            status, reason = CandidateStatus.SUPPRESSED, SuppressReason.BUDGET
-            features["budget"] = {"in_window": len(in_hour), "lowest": round(lowest, 3)}
 
     times = candidate_times(episode.peak, episode.onset, episode.end, delay, p)
     return CandidateDraft(

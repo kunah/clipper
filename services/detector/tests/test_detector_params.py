@@ -36,15 +36,15 @@ def test_defaults_are_the_design_values():
     assert (p.default_delay_s, p.learned_delay_count) == (8.0, 5)
     assert (p.window_before_s, p.window_after_s, p.window_max_s) == (90, 30, 300)
     assert (p.window_onset_pad_s, p.window_close_pad_s) == (30, 15)
-    assert (p.cooldown_s, p.budget_per_hour, p.budget_window_s) == (60, 8, 3600)
+    assert p.cooldown_s == 60
     assert (p.final_lag_s, p.restart_replay_s, p.restart_emit_s, p.dedupe_s) == (10, 1260, 900, 60)
 
 
 def test_toml_overrides_and_rejects_typos(tmp_path):
     good = tmp_path / "p.toml"
-    good.write_text("z_open = 5.0\nbudget_per_hour = 6\n", encoding="utf-8")
+    good.write_text("z_open = 5.0\ncooldown_s = 90\n", encoding="utf-8")
     p = load_params(good)
-    assert (p.z_open, p.budget_per_hour, p.rho_open) == (5.0, 6, 2.0)
+    assert (p.z_open, p.cooldown_s, p.rho_open) == (5.0, 90, 2.0)
     assert load_params() == DetectorParams()
 
     typo = tmp_path / "typo.toml"

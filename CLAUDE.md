@@ -45,8 +45,8 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   (`DetectorParams`, optional TOML, `detector_version`), `lexicon` + versioned
   `data/lexicon.toml` (emote/word categories, per-channel overrides; bots from core), `scorer` (stage 1:
   `ChannelScorer.step(second)` -> suspects/episodes), `stage2` (raw chat -> shares, clean uniques,
-  moment type, fake-spike rules), `merge` (episode -> candidate draft: delay, window, cooldown,
-  budget), `explicit` ("clip it" mentions, viewer clips -> signals), `pipeline` (scorer + stage 2
+  moment type, fake-spike rules), `merge` (episode -> candidate draft: delay, window, cooldown;
+  no hourly cap), `explicit` ("clip it" mentions, viewer clips -> signals), `pipeline` (scorer + stage 2
   + merge over in-memory rows), `synthetic` (seeded test chat). Live service `clipper-detector`:
   `service.LiveDetector` (loops with an injectable clock, leases `detect:channel:{id}`, restart
   replay), `reads`/`writes` (one transaction per candidate: row + media request + judge job),

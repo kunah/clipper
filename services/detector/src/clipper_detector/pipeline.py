@@ -5,7 +5,7 @@ is the reference it must match: for one stream's rows scored from its start, wit
 signals, `run_stream` gives the drafts an uninterrupted live run writes (tested in
 `test_detector_backtest_cli`). That includes the live write's dedupe (`writes.write_candidate`): a
 draft whose video peak lies within +- `dedupe_s` of a draft kept earlier (any status) is not
-written; it goes to `StreamRun.duplicates` and, as in live, counts for neither cooldown nor budget.
+written; it goes to `StreamRun.duplicates` and, as in live, doesn't count for the cooldown.
 Candidate ids here are local: the position of the draft in `StreamRun.drafts` (the database
 assigns real ones).
 """

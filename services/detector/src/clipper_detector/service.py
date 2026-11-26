@@ -114,7 +114,7 @@ class LiveStream:
     info: StreamInfo
     scorer: ChannelScorer
     delay: Delay
-    recent: list[PriorCandidate]  # the stream's candidates (cooldown, budget, dedupe)
+    recent: list[PriorCandidate]  # the stream's candidates (cooldown, dedupe)
     viewers: list[tuple[datetime, int]] | None  # None: unknown (backfilled stream)
     viewers_until: datetime  # snapshots before this are loaded
     video_id: str | None = None  # the live VOD's id, learned from Helix clips
@@ -170,7 +170,6 @@ class LiveStream:
             draft.chat_peak_utc or draft.peak_utc + d,
             draft.chat_end_utc or draft.moment_to + d,
             draft.score,
-            draft.trigger,
             draft.chat_onset_utc,
         )
 
@@ -906,7 +905,6 @@ class LiveDetector:
                 params=p,
                 detector_version=self.version,
                 signals=[pending[j] for j in group],
-                recent=live.recent,
             )
             await self._write(state, draft, now)
             handled.update(group)

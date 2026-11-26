@@ -23,12 +23,11 @@ from clipper_core.contracts import (
     JobKind,
     JudgePayload,
     Priority,
-    SuppressReason,
     dedupe_key,
 )
 from clipper_core.models import Candidate
 from clipper_core.timeline import Interval
-from clipper_detector.explicit import KINDS, Signal, boost, merge_data
+from clipper_detector.explicit import Signal, boost, merge_data
 from clipper_detector.merge import CandidateDraft
 from clipper_detector.params import DetectorParams
 from clipper_detector.reads import CandidateRef, nearest_candidate
@@ -123,7 +122,7 @@ async def _features_for_update(session: AsyncSession, candidate_id: int):
     return (
         await session.execute(
             text(
-                "SELECT id, stream_id, status, suppress_reason, trigger, score, features,"
+                "SELECT id, stream_id, status, score, features,"
                 " window_from, window_to FROM candidates WHERE id = :id FOR UPDATE"
             ),
             {"id": candidate_id},
@@ -197,8 +196,7 @@ async def attach_signals(
     """Explicit signals onto an existing candidate: `features.explicit[kind]` (merged), score +
     the boost of each kind not attached before, and a *suppressed* candidate is re-emitted: an
     in-place UPDATE to `emitted` that keeps `suppress_reason`, with its media request and judge
-    job in this transaction (DESIGN §18.4). Not a signal-only candidate suppressed for the
-    signal budget: more signals of the same moment don't lift that cap."""
+    job in this transaction (DESIGN §18.4)."""
     signals = list(signals)
     row = await _features_for_update(session, candidate_id) if signals else None
     if row is None:
@@ -211,8 +209,7 @@ async def attach_signals(
             added += boost(s.kind, params)
         explicit[s.kind] = merge_data(s.kind, explicit.get(s.kind), s.data)
     features["explicit"] = explicit
-    capped = row.suppress_reason == SuppressReason.BUDGET and row.trigger in KINDS
-    reemit = row.status == CandidateStatus.SUPPRESSED and not capped
+    reemit = row.status == CandidateStatus.SUPPRESSED
     if reemit:
         features["reemitted"] = {
             "by": sorted({s.kind for s in signals}),

@@ -19,7 +19,7 @@ from sqlalchemy.exc import DBAPIError
 from clipper_core.chat import ChatWriter, SecondAggregator
 from clipper_core.db import create_engine, session_factory
 from clipper_core.models import Base
-from clipper_detector import backtest_cli
+from clipper_detector import SCORER_VERSION, backtest_cli
 from clipper_detector.lexicon import Lexicon
 from clipper_detector.params import DetectorParams
 from clipper_detector.service import LiveDetector
@@ -345,7 +345,7 @@ async def test_grid_prints_one_row_per_combination_sorted_by_recall(sessions, re
     assert len(rows) == 4
     # floor 400 > any activity: nothing opens, recall 0 -> last
     assert [r.split()[0] for r in rows] == ["8", "8", "400", "400"]
-    assert all(r.split()[-1].startswith("d1-p") for r in rows)
+    assert all(r.split()[-1].startswith(f"d{SCORER_VERSION}-p") for r in rows)
     assert len({r.split()[-1] for r in rows}) == 4  # one detector_version per combination
 
     code, out = await backtest([*argv, "--json"], read_only)

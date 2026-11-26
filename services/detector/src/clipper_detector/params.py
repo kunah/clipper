@@ -5,7 +5,7 @@ clips. A TOML file may override any of them (flat keys, the field names below; u
 an error, so a typo can't silently keep a default):
 
     z_open = 5.0
-    budget_per_hour = 6
+    cooldown_s = 90
 
 `detector_version(params, lexicon)` = scorer code version + a hash of the effective scoring
 params + the lexicon's version and file hash: stored on every candidate and in
@@ -139,9 +139,6 @@ class DetectorParams(BaseModel):
     # and a suppressed candidate is re-emitted. Without one it becomes a candidate of its own once
     # the scorer is this far past it and no episode is open.
     signal_attach_s: int = Field(default=60, ge=0)
-    # Signal-only candidates (no chat episode claimed the signal) per stream in a rolling hour;
-    # more are stored suppressed (`budget`). The chat budget doesn't count them (`merge`).
-    signal_budget_per_hour: int = Field(default=4, ge=0)
     # A Helix clip whose vod_offset is set but further than this from where a live clip would
     # sit (created_at - stream start - duration) was cut from the VOD later: not a live signal.
     clip_vod_tolerance_s: float = Field(default=120.0, ge=0)
@@ -177,8 +174,6 @@ class DetectorParams(BaseModel):
     window_close_pad_s: float = Field(default=15.0, ge=0)
     window_max_s: float = Field(default=300.0, gt=0)
     cooldown_s: float = Field(default=60.0, ge=0)
-    budget_per_hour: int = Field(default=8, gt=0)  # emitted per stream per rolling window
-    budget_window_s: float = Field(default=3600.0, gt=0)
 
     @model_validator(mode="after")
     def _consistent(self) -> DetectorParams:

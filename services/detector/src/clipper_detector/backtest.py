@@ -31,7 +31,7 @@ the same scorer, stage 2 and merge as the live service (one scorer, three caller
   - `delay_median_s` = median of (peak - clip start) over the truth clips hit (the best-ranked
     candidate inside each): a check of the chat delay.
   - `false_suppressions`: per scored truth clip that none of the k hits, the reason of the
-    best-ranked suppressed candidate inside it (any reason, `weak` and `budget` too, and
+    best-ranked suppressed candidate inside it (any reason, `weak` too, and
     `dedupe`: a draft the live write drops within +- 60 s of an earlier candidate,
     `pipeline.Duplicate`). `suppressed_in_truth` (per stream) is the raw count: every suppressed
     candidate inside a scored truth clip.

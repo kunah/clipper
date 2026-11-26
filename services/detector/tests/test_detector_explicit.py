@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from clipper_core.contracts import CandidateStatus, DelaySource, MomentType, SuppressReason
+from clipper_core.contracts import CandidateStatus, DelaySource, MomentType
 from clipper_detector.explicit import (
     CLIP_MENTIONS,
     VIEWER_CLIPS,
@@ -22,7 +22,7 @@ from clipper_detector.explicit import (
     total_boost,
 )
 from clipper_detector.lexicon import Lexicon
-from clipper_detector.merge import Delay, PriorCandidate
+from clipper_detector.merge import Delay
 from clipper_detector.params import DetectorParams
 from clipper_detector.service import final_end
 from clipper_detector.settings import DetectorSettings
@@ -200,25 +200,6 @@ def test_signal_draft_times():
     )
     assert draft.chat_peak_utc is None and draft.peak_utc == clips.at  # video time
     assert draft.chat_end_utc == clips.end + timedelta(seconds=8)
-
-
-def test_signal_only_candidates_have_their_own_cap():
-    delay = Delay(8.0, DelaySource.DEFAULT)
-    tracker = MentionTracker(P, CHAN)
-    sig = None
-    for k in range(3):
-        sig = tracker.add(Msg(at(3000 + k), f"u{k}", "clip it"))
-    own = [
-        PriorCandidate(k, CandidateStatus.EMITTED, at(600 * k), at(600 * k + 5), 2.0, CLIP_MENTIONS)
-        for k in range(P.signal_budget_per_hour)
-    ]
-    chat = [PriorCandidate(99, CandidateStatus.EMITTED, at(2900), at(2910), 9.0)]  # not counted
-    kw = {"stream_id": 1, "channel_id": 2, "delay": delay, "params": P, "detector_version": "x"}
-    draft = signal_draft(sig, recent=own + chat, **kw)
-    assert draft.status is CandidateStatus.SUPPRESSED
-    assert draft.suppress_reason is SuppressReason.BUDGET
-    assert draft.features["budget"]["signal_in_window"] == P.signal_budget_per_hour
-    assert signal_draft(sig, recent=own[1:] + chat, **kw).emitted
 
 
 def test_clips_cut_from_the_vod_later():
