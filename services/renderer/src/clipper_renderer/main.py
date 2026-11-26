@@ -95,6 +95,18 @@ async def amain() -> int:
 # --------------------------------------------------------------------------- layout-preview
 
 COLOURS = {"facecam": "red", "face": "orange", "gameplay": "green", "main": "blue"}
+# This checkout's config (src/clipper_renderer/main.py -> services/renderer/config/): natively
+# CLIPPER_RENDERER_LAYOUTS_PATH is usually unset, and the preview is how a rect gets fitted.
+CHECKOUT_LAYOUTS = Path(__file__).resolve().parents[2] / "config" / "layouts.toml"
+
+
+def preview_layouts_path(args: argparse.Namespace, rs: RendererSettings) -> Path | None:
+    """`--layouts`, else CLIPPER_RENDERER_LAYOUTS_PATH, else this checkout's layouts.toml."""
+    if getattr(args, "layouts", None):
+        return Path(args.layouts)
+    if rs.layouts_path is not None:
+        return rs.layouts_path
+    return CHECKOUT_LAYOUTS if CHECKOUT_LAYOUTS.exists() else None
 
 
 async def _find_chunk(args: argparse.Namespace, settings: Settings, at: datetime):
@@ -132,7 +144,8 @@ async def _find_chunk(args: argparse.Namespace, settings: Settings, at: datetime
 
 def _draw_preview(args, store, rs: RendererSettings, stream, chunk, at) -> int:
     tools = Tools(rs.ffmpeg, rs.ffprobe)
-    cfg, _ = load_layouts(rs.layouts_path)
+    layouts_path = preview_layouts_path(args, rs)
+    cfg, _ = load_layouts(layouts_path)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="layout-preview-") as tmp:
@@ -167,6 +180,7 @@ def _draw_preview(args, store, rs: RendererSettings, stream, chunk, at) -> int:
         tools.run([*seek, "-filter_complex", ";".join(chains), "-map", "[canvas]",
                    str(out_dir / "layout.png")])  # fmt: skip
     sys.stdout.write(
+        f"layouts: {layouts_path or 'none (every channel gets the default)'}\n"
         f"stream {stream.id} ({stream.login}, {stream.category}) chunk {chunk.seq} at "
         f"{offset:.2f} s; layout {lay.kind.value}"
         + (f" ({'; '.join(lay.warnings)})" if lay.warnings else "")
@@ -204,6 +218,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     lp.add_argument("--stream", type=int, help="the stream id (default: the channel's latest)")
     lp.add_argument("--layout", default="auto", choices=[k.value for k in LayoutKind])
     lp.add_argument("--out", default="data/layout-preview", help="output directory")
+    lp.add_argument(
+        "--layouts",
+        help="layouts.toml (default CLIPPER_RENDERER_LAYOUTS_PATH, else this checkout's "
+        "services/renderer/config/layouts.toml)",
+    )
     assets = sub.add_parser("assets", help="the SFX/music library")
     asub = assets.add_subparsers(dest="assets_cmd", metavar="command", required=True)
     chk = asub.add_parser("check", help="verify files, sha256 and licences; measure loudness")

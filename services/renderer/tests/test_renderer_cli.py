@@ -57,6 +57,20 @@ def test_layout_preview_draws_the_rects_and_composes_the_layout(
     out = capsys.readouterr().out
     assert "layout facecam_gameplay" in out and "red = facecam [0, 0, 160, 108]" in out
     assert "green = gameplay" in out and "orange = face" in out
+    assert f"layouts: {layouts}" in out
+
+
+def test_layout_preview_finds_the_checkout_config(tmp_path):
+    """Natively CLIPPER_RENDERER_LAYOUTS_PATH is unset: the checkout's file, unless overridden."""
+    unset = RendererSettings(_env_file=None)
+    assert main.CHECKOUT_LAYOUTS.exists()
+    assert main.preview_layouts_path(argparse.Namespace(layouts=None), unset) == (
+        main.CHECKOUT_LAYOUTS
+    )
+    other = tmp_path / "l.toml"
+    assert main.preview_layouts_path(argparse.Namespace(layouts=str(other)), unset) == other
+    configured = RendererSettings(_env_file=None, layouts_path=other)
+    assert main.preview_layouts_path(argparse.Namespace(layouts=None), configured) == other
 
 
 def test_parse_args_rejects_a_naive_time():

@@ -13,14 +13,9 @@
 version = 1
 default = "blurred_fit"   # PROPOSED: the whole frame, full width, over a blurred copy
 
-# Example (not fitted yet: ohnepixel's rect is build item 7c, with the user):
-#
-# [channels.ohnepixel]
-# facecam = { x = 0.0, y = 0.0, w = 0.25, h = 0.30 }   # where the cam sits in the source
-# default = "facecam_gameplay"
-# split = 0.396              # top panel (facecam) share of the 1920 px height (760 px)
-# gameplay_focus_x = 0.5     # the gameplay crop's centre (0 = left, 1 = right)
-#
-# [channels.ohnepixel.categories."Just Chatting"]
-# layout = "full_crop"       # a 9:16 crop of the whole frame
-# focus_x = 0.5
+# ohnepixel (fitted 2026-11-26 with layout-preview on stream 2415, GTA VI, 1080p60): a keyed
+# cutout cam (no border) bottom-left, over the minimap. The rect has the facecam panel's aspect
+# (1080 x 760 = 1.42) so nothing of the head is cropped; it ends at the frame's bottom edge.
+[channels.ohnepixel]
+facecam = { x = 0.0344, y = 0.6111, w = 0.3109, h = 0.3889 }   # x 66-663, y 660-1080 at 1080p
+default = "facecam_gameplay"
