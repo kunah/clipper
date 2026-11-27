@@ -67,6 +67,23 @@ judges, edits and publishes short vertical clips.
 > 73 s), ~2–2.5 min and ~$1.1–1.3 list price per stream. The user rates them on a local page
 > (`clipper-judge rate-ideas`, 127.0.0.1:8766: publish / with changes / no + note per idea, "what
 > did it miss" per run; `data/ideas/ratings.json`). All data is still one streamer and one game: generality is unchecked.
+> **First Opus eval 2026-11-27** (label set v1, 75 cases, prompt `v1`, `claude-opus-5-5` at the
+> CLI's default effort; `clipper-judge eval --labels … --drafts … --model claude-cli`; outputs in
+> the gitignored `data/labels/v1/eval/` of the `clips-transcriber` checkout): Opus clipped 62 and
+> rejected 13. Agreement 31/75; clip precision **0.31** against a 0.27 base rate, recall 0.95
+> (19/20), cut IoU 0.60 over 16 labelled cuts. Counting the 8 "another edit" rejects as clips,
+> precision is 0.44. Its confidence doesn't separate: median 0.55 for true and false clips alike,
+> and precision stays ~0.31 at every cut-off from 0.45 to 0.65. The live candidates (50, nearly
+> all viewer-clip signals) went 45 clip / 5 reject, against 11 labelled clips. The loose-param
+> drafts agree on 15 of 25. 33 of the 43 false clips give the viewer-clip count as evidence. Every
+> plan is one segment (v1 has no cuts), median 44 s (max 59 s, under `max_clip_s` 60), and 41 of
+> 62 flag `copyright_music_risk`. Repairs: 2.1 per clip (snap_in/out). Per call ~10 s (p95 14 s),
+> 1.04 calls per case, ~5.4k tokens in / 1k out, $4.74 list price in all. Over the 78 calls the
+> plan's 5-hour window went 0.24 → 0.54 (~0.4 % per call, including anything else on the plan at
+> the time) and the 7-day one went 0.28 → 0.30. **Verdict: prompt v1 is no filter** (it says yes
+> to almost every live candidate), so live judging waits. Without an hourly cap (~30 candidates
+> per stream-hour on ohnepixel) it would also use ~12 % of the 5-hour window per stream-hour,
+> since the usage guard has no caps set.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -2144,8 +2161,9 @@ model) built 2026-11-22, not deployed (image not built; compose service `judge` 
 `judge`); 6d's buildable part (`ClaudeCliModel`, the startup auth check, the pinned CLI in the
 image, `clipper-judge eval`) built 2026-11-22 against a fake `claude`; first real run and image
 build 2026-11-25; 6e (notices, shadow runs, instruction revisions, drafts export, blind
-labelling: build item 5) built 2026-11-25. Next: the user labels the first set, the Opus eval,
-then live judging (render jobs off until the renderer exists). **Decided by the user (2026-11-21):** the first real model
+labelling: build item 5) built 2026-11-25. Label set v1 labelled 2026-11-26; first Opus eval
+2026-11-27: prompt v1 clips 62 of 75, precision 0.31 vs a 0.27 base rate (status line). Next:
+a better prompt (or inputs), then live judging (render jobs off until the renderer exists). **Decided by the user (2026-11-21):** the first real model
 runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
 **usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
 guard"). Also decided (2026-11-21): the model is **Opus** (pinned full id), **no usage
@@ -2717,7 +2735,10 @@ rate, edit distance, $ per approved clip by model/prompt; eval set = backfill + 
    (`ClaudeCliModel`, `CliProcess`, `child_env`, `parse_reading`, `check_auth`), `adapters`
    (`make_model`, `settings_for_model`, `check_model`, shared by the service and the eval),
    `evalset` (fixtures, labels), `evaluate` (`clipper-judge eval`), `model.ReportsStatus` (the
-   adapter's heartbeat block `model_status`). Settled and deviations:
+   adapter's heartbeat block `model_status`). **Opus eval run 2026-11-27** on label set v1
+   (75 cases): agreement 31/75, clip precision 0.31, recall 0.95, repairs 2.1/clip, p50/p95 per
+   call 10/14 s, ~5.4k tokens in and 1k out per case (details in the status line).
+   Settled and deviations:
    - **Process**: `subprocess.Popen` (no shell) with reader threads, not
      `asyncio.create_subprocess_exec`: Windows' selector event loop (psycopg,
      `clipper_core.runtime.run`) has no subprocess support. Linux: a new session, the tree is
