@@ -61,9 +61,10 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   helpers -> `run_stream`; engine with `default_transaction_read_only`; `--export-drafts FILE`:
   every draft of the base params as JSON, no scoring, for the judge's eval labelling).
   `services/judge/` (`clipper_judge`, DESIGN §19). Pure part (6b): `params` (`JudgeParams`),
-  `inputs` (`JudgeInputs`, one round in memory), `transcript` (sentences `S1…`, snapping
+  `inputs` (`JudgeInputs`, one round in memory; `Frame` stills), `transcript` (sentences `S1…`, snapping
   lookups), `answer` (`JudgeAnswer`, the model's schema), `prompt` (`build_request` -> versioned,
-  byte-stable `JudgeRequest` + `request_hash`, `retry_request`; prompt text in `prompts/v{N}/`),
+  byte-stable `JudgeRequest` + `request_hash`, `retry_request`; prompt text in `prompts/v{N}/`;
+  a `$frames` section in `user.md` (v2) adds the stills as `JudgeRequest.images`, v1 has none),
   `resolver` (answer or `PlanPatch` -> repaired `EditPlan`, reject, context request; repair
   codes), `samples` (fixture candidate). Goldens in `tests/fixtures/`
   (`CLIPPER_JUDGE_UPDATE_GOLDEN=1` rewrites them); tests pin the prompt files and the input format
@@ -83,15 +84,20 @@ and roadmap. When a decision changes or a roadmap step is finished, update `DESI
   deadlines), `rounds` (`JudgeHandler`: one judge job advances one clip), `revisions`
   (`ReviseHandler`: patches -> v+1 + render job; `RevisionSource`, `review_events` not built
   yet), `service` (`JudgeService`: N job runners on `judge` + `revise_plan`, waiter, heartbeat).
+  `frames` (`frame_times` + `FrameGrabber`: JPEG stills from the chunks via ffmpeg; eval only so
+  far, `clipper-judge eval --frames N`; the CLI adapter sends images as `--input-format
+  stream-json`, `claude_cli.stdin_bytes`),
   `evalset` (eval fixtures: one round's `JudgeInputs` as JSON, labels TOML/JSON, detector drafts
   as cases) + `evaluate` (`clipper-judge eval`: read-only DB or fixtures, `--drafts` -> agreement,
   repairs, latency, usage), `label` + `label_page.html` (`clipper-judge label prepare|serve`: blind
   labelling set, videos cut from the chunks, a 127.0.0.1 page writing `labels.json`; sets live in
   the gitignored `data/labels/`). `ideas` (`clipper-judge ideas`, read-only trial of post-stream
-  clips: one call over a whole stream's timeline, prompt `prompts/ideas-v{N}/` (v2 default: editor
-  requests from `--requests`, e.g. `data/labels/v1/requests.json` built from the label notes; pause
-  markers), writes input.md, response.json, ideas.md and `--previews` cuts (pauses cut out by
-  `tighten` unless `--no-tighten`) into the gitignored `data/ideas/<stream>/<prompt>/`; a saved
+  clips: one call over a whole stream's timeline, prompt `prompts/ideas-v{N}/` + its `PromptSpec`
+  in `ideas.SPECS` (frozen once used; v2: editor requests from `--requests`, e.g.
+  `data/labels/v1/requests.json` built from the label notes; pause markers; v3 default: `insert`
+  beats, chat peak seconds, hooks optional), writes input.md, response.json, ideas.md and `--previews` cuts (`place_beats`: edges
+  out to the words a beat's `what` quotes, a hook cut to its quote, else snapped to speech breaks;
+  pauses cut out by `tighten` unless `--no-tighten`) into the gitignored `data/ideas/<stream>/<prompt>/`; a saved
   answer is reused, no call) + `ideas_rate` + `ideas_rate_page.html` (`clipper-judge rate-ideas`: a
   127.0.0.1 page to rate every run's ideas publish / with changes / no + a note, and what each
   run missed; writes `data/ideas/ratings.json`). Shadow runs (`CLIPPER_JUDGE_SHADOW`, `adapters.make_shadows`,
@@ -170,6 +176,7 @@ uv run clipper-detector backtest --stream 2415 --params loose.toml --export-draf
 uv run clipper-judge label prepare --stream 2415 --drafts drafts.json --out data/labels/v1
 uv run clipper-judge label serve data/labels/v1 --open      # http://127.0.0.1:8765, blind labels
 uv run clipper-judge eval --labels data/labels/v1/labels.json --drafts data/labels/v1/drafts.json
+uv run clipper-judge eval --labels … --drafts … --prompt v2 [--frames 8] --model claude-cli --yes  # stills, ffmpeg
 uv run clipper-judge ideas --stream 1412 [--requests data/labels/v1/requests.json] [--model claude-cli --yes] [--previews]
 uv run clipper-judge rate-ideas --open      # http://127.0.0.1:8766, rate the ideas -> data/ideas/ratings.json
 docker compose up -d --build renderer       # profile renderer (GPU; needs migration 0007)

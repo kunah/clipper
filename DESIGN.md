@@ -67,6 +67,71 @@ judges, edits and publishes short vertical clips.
 > 73 s), ~2–2.5 min and ~$1.1–1.3 list price per stream. The user rates them on a local page
 > (`clipper-judge rate-ideas`, 127.0.0.1:8766: publish / with changes / no + note per idea, "what
 > did it miss" per run; `data/ideas/ratings.json`). All data is still one streamer and one game: generality is unchecked.
+> **Preview cuts fixed 2026-11-28** (the user stopped rating: clips started and ended mid-sentence
+> or mid-word): the model reads sentence start times to the second, so of the 323 ideas-v2 beats
+> 121 ended inside a sentence, 21 inside a word, 28 started inside a sentence (53 of 58 ideas
+> hit). `ideas.snap_beat(s)` moves an edge inside speech to the nearest break (a sentence edge or
+> a pause >= 0.35 s between words; back <= 3 s, forward <= 6 s and the beat's length; else the
+> word's edge), pads stop at the neighbouring word, beats the model split stay one take, and
+> `label.Cutter` fades the audio 15 ms only where a preview jumps. After it: no edge inside a
+> word, 16 of 956 edges mid-phrase (11 ideas), previews ~2-4 s longer (median). The 58 previews
+> were cut again from the saved answers (no call); the old ones are in `previews-2026-11-26/`.
+> **Ideas-v2 rated 2026-11-28** (all 58, on the re-cut previews; 5 of 1412's first 8 kept their
+> rating from the old cuts): **22 publish, 21 with changes, 15 no**, so 43 (74 %) are usable ideas
+> and 22 (38 %) publishable as cut. By stream 1412 14/17, 1930 17/20, 2415 12/21; the editor's
+> requests 23/30 usable (9 publish), the model's own 20/28 (13 publish). Kind, preview length and
+> confidence (median 0.6 in every group) don't separate. "What did it miss" stayed empty. The 28
+> notes are about the edit, rarely the idea: **hook choice** 9 (the hook should be the strongest
+> moment itself: the run-over, the scream, the "oh no", a shorter line) and 3 "no hook needed"
+> (the setup grabs on its own); **something on screen** 8 (the crash is cut out or missing; add a
+> 1-2 s shot as a punchline: "I don't crash" then the crash, the knife throw, the dance, entering
+> the room, the selfie): the plan is blind (transcript, chat, sound classes); **endings** 4 (let
+> the last beat play out, a reaction cut mid-line); a beat to drop 3 (a trailing reaction, a 2 s
+> piece); start earlier 2; a missing ad 1; the one content reject with a note: "just the game's
+> story, nothing about the streamer". Checked against the cuts: of 306 beats whose `what` quotes
+> words, 111 end (`to`) before the quote's last word; the snap rescues 73, so **38 beats in 25
+> ideas still cut off words the model quoted** (median 1.7 s; 10 are an idea's last beat, 7 are
+> hooks), e.g. 1412/4's "There it is" ends on "there", 1930/19's last beat loses "you feel the
+> biceps a lot". Hooks: planned median 3 s, cut median 3.7 s, 26 of 58 over 4 s (the snap moves a
+> hook to its sentence start: 1930/19 should start at "Oh yeah").
+> **Edges on the quoted words 2026-11-28** (user's go): `ideas.place_beats` finds the first and
+> last words a beat's `what` quotes in the transcript (3, else 2 words, or one of >= 4 letters,
+> within 8 s of the beat, the copy nearest the model's edge; `anchor_beat`) and moves an edge out
+> to them, then on to the next break (`snap_beat`); a **hook** is cut to exactly its quote, in or
+> out (unless `keep_whole`, or a description comes before or after the quote). Other beats never
+> come in to their quote: tried first, it cut the setup lines around a quoted key line (1412/4's
+> "you shouldn't listen to that crap" before Mom's "I sold three houses"; median idea −5 s, three
+> ideas −20 s). Over the 58 ideas: beat ends that cut off quoted words 41 → 8 (the rest mostly a
+> repeated line where the check picks another copy), hooks median 3.7 → 2.5 s (over 4 s: 26 →
+> 17, max 11.4 → 7.6 s), idea length median 40.5 → 41.6 s, 45 ideas changed. The 58 previews
+> were cut again from the saved answers (no call); the rated ones are in `previews-2026-11-28/`
+> (with that day's `ideas.json`). Notes the cutter can't fix (a different hook, a shot from
+> elsewhere, an earlier setup: 2415/6 quotes the later "I do want to check") wait for the prompt.
+> **`ideas-v3` 2026-11-28** (user's go; the v2 notes turned into general rules, the model doesn't
+> see the ratings): the hook beat is the peak of the clip (the action, the scream, the "oh no",
+> the absurd line), 1-3 s, quoted exactly, or left out when the first setup line grabs on its own;
+> an `insert` beat (a new role: a 1-3 s shot from elsewhere cut in as punchline or proof, kept
+> whole by the cutter); on-screen events found from their traces (loud second, sound class,
+> reaction line, chat peak) and covered by a kept-whole beat, never cut around; `what` quotes the
+> beat's first to last words (the cutter's anchors); a setup starts before the action; beats a few
+> seconds apart are one beat; everything the title names has its beat; the clip ends on its
+> strongest beat (no reaction that repeats the payoff); a game scene counts only if absurd on its
+> own or the streamer makes it. The document adds the **chat peak** to a minute shown at x1.3 the
+> median or busier (the second its busiest 5 s start; 78-89 such minutes per stream). Prompt
+> versions now have a `PromptSpec` (document format, schema, roles; `ideas.SPECS`), v1/v2's
+> hashes pinned by a test. Run on the three streams with the same 28 requests: **52 ideas** (28
+> requests, 24 own; v2 58), $3.74 list, 140-173 s per call, ~110k tokens in / 18k out each. 28
+> ideas open with a hook beat (v2: all 58), but only 3 of the 24 own ideas do; 2 ideas use
+> inserts (a "no crash" supercut of three crashes; "never again" cut to the strip club); 54
+> kept-whole beats (v2 35); quotes in 248 of 249 beats, the cut loses quoted words at 7 beat ends.
+> Previews median 44.8 s (v2 41.6), up to 88.5 s. Spot checks against the v2 notes: 1412/1 now
+> keeps both crashes and the revive, 2415/6's setup starts before the garage opens, 2415/9 ends
+> on the payoff; still not: 1412/3's hook is the line, not the run-over, 1930/1 has no crash
+> insert, 1930/2's hook is "BRO!", not "I was trying to feed it". **v3 stays the default;
+> `ideas-v4` waits for real feedback** (user's call 2026-11-28): the user's ratings of the v3 runs
+> (`data/ideas/<stream>/ideas-v3/`), later published clips. Proposed after it: sight (stills
+> around an idea's beats to place the crash, the insert, the hook), a second streamer and genre,
+> then the post-stream pass as a pipeline into render jobs and review.
 > **First Opus eval 2026-11-27** (label set v1, 75 cases, prompt `v1`, `claude-opus-5-5` at the
 > CLI's default effort; `clipper-judge eval --labels … --drafts … --model claude-cli`; outputs in
 > the gitignored `data/labels/v1/eval/` of the `clips-transcriber` checkout): Opus clipped 62 and
@@ -84,6 +149,20 @@ judges, edits and publishes short vertical clips.
 > to almost every live candidate), so live judging waits. Without an hourly cap (~30 candidates
 > per stream-hour on ohnepixel) it would also use ~12 % of the 5-hour window per stream-hour,
 > since the usage guard has no caps set.
+> **Prompt v2 + stills, eval 2026-11-28** (same 75 cases, 8 stills of 640 px over each core,
+> branch `judge-v2`; outputs `opus_v2.*` beside v1's): clip 14 / reject 61, agreement 53/75,
+> precision **0.43**, recall **0.30**, AUC of the confidence 0.74 (v1 0.59). Split by source:
+> the 25 drafts precision 0.83 (5/6), recall 0.56, AUC 0.84; the 50 live candidates precision
+> 0.12, recall 0.09, AUC 0.66. Candidate moments are long (median 105 s, viewer clips spread over
+> minutes; drafts 18 s), so 8 stills land every 15-25 s and miss the event (its reasons: "the one
+> crash is small", "without seeing the crash frames"). Of the 8 false clips, 4 are rejects whose
+> note proposes another edit and 1 repeats a labelled clip's moment (golden AK). Misses cite
+> Content ID music risk, "the streamer barely reacts", "just a cutscene" and stories spread over
+> minutes (perfume, golden AK: post-stream material), while the user's notes judge what an editor
+> can make of it ("make fun of his driving", "highlight how the game tried to scam us"). Clip
+> confidences sit at 0.60-0.64 (the prompt's floor); with clip at >= 0.25 instead it would pick
+> 33 at precision 0.42, recall 0.70. $5.54 list, p50 4.6 s per call, ~12k tokens in per case,
+> 5-hour window +0.29.
 > See [Roadmap](#14-roadmap). Keep this file updated when decisions change.
 
 ---
@@ -2162,8 +2241,29 @@ model) built 2026-11-22, not deployed (image not built; compose service `judge` 
 image, `clipper-judge eval`) built 2026-11-22 against a fake `claude`; first real run and image
 build 2026-11-25; 6e (notices, shadow runs, instruction revisions, drafts export, blind
 labelling: build item 5) built 2026-11-25. Label set v1 labelled 2026-11-26; first Opus eval
-2026-11-27: prompt v1 clips 62 of 75, precision 0.31 vs a 0.27 base rate (status line). Next:
-a better prompt (or inputs), then live judging (render jobs off until the renderer exists). **Decided by the user (2026-11-21):** the first real model
+2026-11-27: prompt v1 clips 62 of 75, precision 0.31 vs a 0.27 base rate (status line).
+**Frames + prompt v2 built 2026-11-28** (branch `judge-v2`, not evaluated yet): the judge never
+saw the picture, while most of the user's clip notes are visual (crashes, falls, "zoom on
+Jason") and the Shorts teardowns found hits are premises readable muted in 2 s. Checked with
+one real call (CLI 2.1.332, Opus): `claude -p --input-format stream-json` takes a user message
+of text + base64 JPEG blocks together with `--json-schema` (3 stills, all described, ~450 input
+tokens per 768 px still). Built: `inputs.Frame`, `JudgeRequest.images` (in the hash by sha256,
+absent without images, so v1's requests and hashes are unchanged), a `$frames` section that only
+prompts asking for it get (`PromptTemplate.frames`, `FRAMES_FORMAT` in their version),
+`claude_cli.stdin_bytes` (stream-json only with images), `frames.py` (`frame_times`: up to
+`frames_n` 8 evenly over the core, >= 2 s apart, only with video; `FrameGrabber`: stills from the
+chunks, 640 px JPEG, 5 s pre-roll seek as the label cutter), `clipper-judge eval --frames N`
+(database cases; checked against the label video: same picture at the same UTC). Prompt
+`prompts/v2/` (not pinned until used): be selective ("most candidates should be rejected"), a
+premise test (a stranger gets it muted in 2 s), chat and viewer clips as weak evidence (nearly
+every ohnepixel candidate has them and scores 1.00), frames explained, confidence anchors (clip
+only at >= 0.6), the premise as the second reason. The live service takes no stills yet (it would
+need ffmpeg and chunk downloads in the judge's image: proposed). v2 eval 2026-11-28 (status line):
+precision 0.43, recall 0.30, AUC 0.74; drafts good, long viewer-clip candidates not. Next
+(proposed): stills where things happen (chat bursts, loudness peaks, denser in long windows), a
+prompt v3 (music risk is a flag, not a reason; what an editor can make of it; game satire counts
+without a reaction), stories left to the post-stream ideas pass, then live judging (render jobs
+off until the renderer exists). **Decided by the user (2026-11-21):** the first real model
 runs through the **Claude Code CLI** on the user's Claude subscription (no API key), and a
 **usage guard** replaces the USD cost guard (design below: "Claude Code CLI adapter", "Usage
 guard"). Also decided (2026-11-21): the model is **Opus** (pinned full id), **no usage
