@@ -23,8 +23,10 @@ from clipper_judge.label import (
     ChunkVideo,
     LabelError,
     LabelStore,
+    Piece,
     case_key,
     pick_drafts,
+    piece_command,
     plan_pieces,
     spread,
 )
@@ -367,3 +369,16 @@ async def test_prepare_cuts_the_videos_and_the_eval_runs_the_drafts(
             store=evaluate._ReadOnlyStore(world.store),
             now=world.clock.now,
         )
+
+
+def test_piece_command_fades_only_when_asked():
+    piece = Piece(0.0, datetime(2026, 11, 20, tzinfo=UTC), 4.0, "k", 12.0)
+    plain = piece_command("ffmpeg", "src.ts", piece, "libx264", "out.mp4")
+    assert "afade" not in plain[plain.index("-filter_complex") + 1]
+    faded = piece_command(
+        "ffmpeg", "src.ts", piece, "libx264", "out.mp4", fade_in_s=0.015, fade_out_s=0.015
+    )
+    graph = faded[faded.index("-filter_complex") + 1]
+    assert graph.endswith(
+        "asetpts=N/48000/TB,afade=t=in:st=0:d=0.015,afade=t=out:st=3.985:d=0.015[a]"
+    )

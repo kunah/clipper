@@ -25,6 +25,8 @@ messages, users, busyness against the median minute, top emotes and repeated mes
 sounds, loud seconds, long music), then the minute's sentences (`transcript_segments`, not
 provisional), `[h:mm:ss N s no speech]` for pauses of `pause_mark_s` or more, holes as
 `[h:mm:ss→h:mm:ss not recorded]`. The prompt names no channel or game (DESIGN §15: general).
+Each prompt version has a `PromptSpec` (document format, schema, beat roles), frozen once used;
+v3 adds `insert` beats (a shot from elsewhere cut in) and a busy minute's chat peak second.
 """
 
 from __future__ import annotations
@@ -43,9 +45,10 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from functools import cache
 from importlib import resources
+from itertools import pairwise
 from pathlib import Path
 from string import Template
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -75,12 +78,11 @@ from clipper_judge.transcript import clean_text
 
 log = get_logger(__name__)
 
-PROMPT = "ideas-v2"
-IDEAS_FORMAT = 2  # bump with every change to the document's line formats
-SCHEMA_VERSION = 2
+PROMPT = "ideas-v3"
 IDEAS_FILE_FORMAT = "clipper-ideas-v1"  # ideas.json, read by ideas_rate
 KINDS = ("story", "callback", "running_bit", "moment")
 ROLES = ("hook", "setup", "build", "payoff", "reaction", "context")
+INSERT = "insert"  # v3: a 1-3 s shot from elsewhere, cut in as a punchline (kept whole)
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLIP_MAX_S = 180.0  # contracts.CLIP_MAX
 LONG_BEAT_S = 60.0
@@ -97,6 +99,32 @@ class IdeasError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class PromptSpec:
+    """The document and schema a prompt version gets. Its fields go into the prompt's version
+    hash, so a used prompt's entry is frozen like its files (its saved answers match it): a
+    change to the document or the schema goes into a new prompt version."""
+
+    doc_format: int  # the document's line formats
+    schema_version: int
+    roles: tuple[str, ...]
+    chat_peaks: bool = False  # a busy minute's header names its busiest seconds
+
+
+SPECS: dict[str, PromptSpec] = {
+    "ideas-v1": PromptSpec(doc_format=2, schema_version=2, roles=ROLES),
+    "ideas-v2": PromptSpec(doc_format=2, schema_version=2, roles=ROLES),
+    "ideas-v3": PromptSpec(doc_format=3, schema_version=3, roles=(*ROLES, INSERT), chat_peaks=True),
+}
+
+
+def prompt_spec(name: str) -> PromptSpec:
+    spec = SPECS.get(name)
+    if spec is None:
+        raise IdeasError(f"unknown prompt {name!r} (known: {', '.join(SPECS)})")
+    return spec
+
+
+@dataclass(frozen=True, slots=True)
 class IdeasParams:
     minute_s: int = 60
     top_n: int = 3  # top emotes / messages per minute
@@ -107,6 +135,8 @@ class IdeasParams:
     loud_db: float = 9.0  # a second this far above the stream's median loudness is notable
     music_min: float = 0.6  # a second with music this strong counts as music
     music_min_s: int = 20  # ... and this many of them in a minute are shown
+    peak_busy: float = 1.3  # v3: a minute this busy (as shown, x1.3) shows its chat peak
+    peak_window_s: int = 5  # ... the start of its busiest window of this many seconds
     max_ideas: int = 30  # the requests' ideas + the model's own
     max_beats: int = 12
     pause_mark_s: float = 5.0  # the timeline marks pauses between sentences this long
@@ -115,6 +145,14 @@ class IdeasParams:
     pad_before_s: float = 0.15  # kept before a word
     pad_after_s: float = 0.25  # kept after a word
     min_piece_s: float = 0.4  # shorter kept pieces are dropped (unless all are)
+    # previews (`snap_beat`): a beat's edges move to breaks, never inside a word or a phrase
+    break_gap_s: float = 0.35  # a pause between words this long ends a phrase
+    snap_back_max_s: float = 3.0  # a start moves back at most this far
+    snap_forward_max_s: float = 6.0  # an end moves forward at most this far (and the beat's length)
+    # previews (`anchor_beat`): a beat's edges go to the first and last words its `what` quotes
+    anchor_reach_s: float = 8.0  # the quoted words are looked for this far outside the beat
+    anchor_min_chars: int = 4  # a one-word quote anchors only with this many letters
+    fade_s: float = 0.015  # audio fade in/out of every piece: no clicks at the joins
 
 
 DEFAULT_PARAMS = IdeasParams()
@@ -200,9 +238,12 @@ def parse_clock(value: str) -> float | None:
 
 
 class _Doc:
-    def __init__(self, inputs: StreamInputs, params: IdeasParams) -> None:
+    def __init__(
+        self, inputs: StreamInputs, params: IdeasParams, *, chat_peaks: bool = False
+    ) -> None:
         self.i = inputs
         self.p = params
+        self.chat_peaks = chat_peaks
         self.t0 = ensure_utc(inputs.started_at)
         self.delay = timedelta(seconds=inputs.chat_delay_s)
         self.recorded = bridge_jitter(merge(inputs.recorded))
@@ -343,6 +384,8 @@ class _Doc:
         label = self.clk(self.minute_start(k))[:-3]  # h:mm
         users = {user_key(m) for _, m in msgs} - {None}
         busy = f", {_TIMES}{len(msgs) / median:.1f}" if median > 0 else ""
+        if self.chat_peaks and median > 0 and round(len(msgs) / median, 1) >= p.peak_busy:
+            busy += f", peak {self.clk(self.chat_peak([t for t, _ in msgs]))}"
         parts = [f"== {label}", f"chat {len(msgs)} msgs, {len(users)} users{busy}"]
         emotes: Counter[str] = Counter()
         texts: Counter[str] = Counter()
@@ -366,6 +409,22 @@ class _Doc:
             parts.append("top: " + ", ".join(shown))
         parts.extend(sounds)
         return " | ".join(parts)
+
+    def chat_peak(self, times: Sequence[datetime]) -> datetime:
+        """The whole second where the busiest `peak_window_s` of these messages start (the
+        earliest of equals): chat reacts a few seconds after the thing on screen."""
+        seconds = sorted(ensure_utc(t).replace(microsecond=0) for t in times)
+        window = timedelta(seconds=self.p.peak_window_s)
+        best, best_n, j = seconds[0], 0, 0
+        for i, start in enumerate(seconds):
+            if i and start == seconds[i - 1]:
+                continue
+            j = max(j, i)
+            while j < len(seconds) and seconds[j] < start + window:
+                j += 1
+            if j - i > best_n:
+                best, best_n = start, j - i
+        return best
 
     def sounds_by_minute(self) -> dict[int, list[str]]:
         p = self.p
@@ -438,17 +497,24 @@ class _Doc:
 # --------------------------------------------------------------------------- prompt, request
 
 
-def ideas_schema() -> dict[str, Any]:
+def ideas_schema(spec: PromptSpec | None = None) -> dict[str, Any]:
     """Lenient on purpose (no length or count limits): `parse_ideas` repairs and reports."""
+    spec = spec or SPECS[PROMPT]
+    what: dict[str, Any] = {"type": "string"}
+    if spec.schema_version >= 3:
+        what["description"] = (
+            "the beat's words quoted exactly, its first to its last; what is on screen outside "
+            "the quotes"
+        )
     beat = {
         "type": "object",
         "additionalProperties": False,
         "required": ["role", "from", "to", "what", "keep_whole"],
         "properties": {
-            "role": {"type": "string", "enum": list(ROLES)},
+            "role": {"type": "string", "enum": list(spec.roles)},
             "from": {"type": "string", "description": "stream clock, h:mm:ss"},
             "to": {"type": "string", "description": "stream clock, h:mm:ss"},
-            "what": {"type": "string"},
+            "what": what,
             "keep_whole": {
                 "type": "boolean",
                 "description": "its point happens without words: keep its silence",
@@ -506,11 +572,16 @@ class IdeasPrompt:
 
 @cache
 def load_ideas_prompt(name: str = PROMPT) -> IdeasPrompt:
+    spec = prompt_spec(name)
     base = resources.files("clipper_judge").joinpath("prompts", name)
     system = base.joinpath("system.md").read_text(encoding="utf-8").replace("\r\n", "\n")
     user = base.joinpath("user.md").read_text(encoding="utf-8").replace("\r\n", "\n")
     digest = hashlib.sha256()
-    for part in (system, user, str(IDEAS_FORMAT), str(SCHEMA_VERSION), _canonical(ideas_schema())):
+    parts = [system, user, str(spec.doc_format), str(spec.schema_version)]
+    parts.append(_canonical(ideas_schema(spec)))
+    if spec.chat_peaks:  # v1/v2 were hashed without it (their saved answers keep matching)
+        parts.append("chat_peaks")
+    for part in parts:
         digest.update(part.encode("utf-8"))
         digest.update(b"\0")
     return IdeasPrompt(name, f"{name}-{digest.hexdigest()[:8]}", system, Template(user))
@@ -521,7 +592,8 @@ def build_ideas_request(
 ) -> JudgeRequest:
     """Pure: the same inputs give the same bytes."""
     template = load_ideas_prompt(prompt)
-    doc = _Doc(inputs, params)
+    spec = prompt_spec(prompt)
+    doc = _Doc(inputs, params, chat_peaks=spec.chat_peaks)
     user = template.user.substitute(
         meta=doc.meta(),
         requests=doc.requests(),
@@ -531,15 +603,17 @@ def build_ideas_request(
         sound_min=f"{params.sound_min:g}",
         loud_db=f"{params.loud_db:g}",
         pause_s=f"{params.pause_mark_s:g}",
+        peak_busy=f"{params.peak_busy:g}",
+        peak_s=f"{params.peak_window_s:g}",
     )
     return JudgeRequest(
         prompt_version=template.version,
-        schema_version=SCHEMA_VERSION,
+        schema_version=spec.schema_version,
         final=True,
         system=template.system,
         user=user,
         schema_name="stream_ideas",
-        schema=ideas_schema(),
+        schema=ideas_schema(spec),
         max_tokens=MAX_OUTPUT_TOKENS,
     )
 
@@ -934,6 +1008,222 @@ def tighten(
     return kept or out
 
 
+def snap_beat(
+    beat: Interval,
+    words: Sequence[Interval],
+    sentences: Sequence[Interval] = (),
+    params: IdeasParams = DEFAULT_PARAMS,
+) -> Interval:
+    """The beat with its edges on breaks (pure). The model reads sentence start times to the second
+    and picks its edges from them, so a third of the beats ended inside a sentence (2026-11-28).
+    An edge inside speech (inside a sentence or a word, or in a pause shorter than `break_gap_s`)
+    moves to the nearest break: the start back to a sentence start or the first word after a
+    pause (at most `snap_back_max_s`), the end forward to a sentence end or the last word before a
+    pause (at most `snap_forward_max_s` and the beat's own length). Without a break in reach, an
+    edge inside a word moves to that word's edge. A moved edge gets the pad (`pad_before_s`,
+    `pad_after_s`) that `tighten` would add to a word, never into the neighbouring word."""
+    p = params
+    ws = sorted((w for w in words if w.end > w.start), key=lambda w: (w.start, w.end))
+    gap = timedelta(seconds=p.break_gap_s)
+    starts = {s.start for s in sentences}
+    ends = {s.end for s in sentences}
+    for i, w in enumerate(ws):
+        if i == 0 or w.start - ws[i - 1].end >= gap:
+            starts.add(w.start)
+        if i == len(ws) - 1 or ws[i + 1].start - w.end >= gap:
+            ends.add(w.end)
+
+    def in_speech(t: datetime) -> bool:
+        if any(s.start < t < s.end for s in sentences) or any(w.start < t < w.end for w in ws):
+            return True
+        return any(a.end <= t <= b.start and b.start - a.end < gap for a, b in pairwise(ws))
+
+    start, end = beat.start, beat.end
+    if in_speech(start):
+        back = [b for b in starts if start - timedelta(seconds=p.snap_back_max_s) <= b <= start]
+        word = next((w for w in ws if w.start < start < w.end), None)
+        new = max(back) if back else word.start if word is not None else None
+        if new is not None:
+            prev = [w.end for w in ws if w.end <= new]
+            start = new - timedelta(seconds=p.pad_before_s)
+            start = max(start, max(prev)) if prev else start
+    if in_speech(end):
+        reach = timedelta(seconds=min(p.snap_forward_max_s, max(beat.seconds, 2.0)))
+        fwd = [b for b in ends if end <= b <= end + reach]
+        word = next((w for w in ws if w.start < end < w.end), None)
+        new = min(fwd) if fwd else word.end if word is not None else None
+        if new is not None:
+            nxt = [w.start for w in ws if w.start >= new]
+            end = new + timedelta(seconds=p.pad_after_s)
+            end = min(end, min(nxt)) if nxt else end
+    return Interval(start, end) if end > start else beat
+
+
+def snap_beats(
+    beats: Sequence[Interval],
+    words: Sequence[Interval],
+    sentences: Sequence[Interval] = (),
+    params: IdeasParams = DEFAULT_PARAMS,
+) -> list[Interval]:
+    """`snap_beat` over an idea's beats in their order; a beat that follows the previous one in
+    time and now overlaps it starts where that one ends (no audio twice)."""
+    return _one_take(beats, [snap_beat(b, words, sentences, params) for b in beats])
+
+
+def _one_take(beats: Sequence[Interval], placed: Sequence[Interval]) -> list[Interval]:
+    """A placed beat that follows the previous beat in time and now overlaps it starts where that
+    one ends (no audio twice); nothing new left: an empty interval."""
+    out: list[Interval] = []
+    for k, (beat, new) in enumerate(zip(beats, placed, strict=True)):
+        if out and beats[k - 1].start <= beat.start and new.start < out[-1].end:
+            if new.end <= out[-1].end:
+                out.append(Interval(out[-1].end, out[-1].end))
+                continue
+            new = Interval(out[-1].end, new.end)
+        out.append(new)
+    return out
+
+
+class WordLike(Protocol):
+    text: str
+    start_utc: datetime
+    end_utc: datetime
+
+
+# a quote in a beat's `what`: "...", curly double quotes, or '...' (not an apostrophe)
+_QUOTE = re.compile(r'"([^"]+)"|\u201c([^\u201d]+)\u201d|(?<!\w)\'(.+?)\'(?!\w)')
+_SPEAKER = re.compile(r"[\w.'-]+:")  # "Mom:" before a quote ("He laughs:" describes)
+_ELLIPSIS = re.compile(r"\.\.\.|\u2026")
+
+
+def _tokens(text_: str) -> list[str]:
+    s = text_.lower().replace("\u2019", "'").replace("-", " ")
+    return [t.strip("'") for t in re.sub(r"[^\w' ]+", " ", s).split() if t.strip("'")]
+
+
+def quotes(what: str) -> tuple[list[str], bool, bool]:
+    """The quotes in a beat's `what`, and whether it starts / ends with one (a speaker label
+    before it and punctuation after it don't count): then the quote is the edge itself, else
+    the text describes something on screen before or after it."""
+    s = what.strip()
+    found = list(_QUOTE.finditer(s))
+    if not found:
+        return [], False, False
+    texts = [next(g for g in m.groups() if g is not None) for m in found]
+    head = s[: found[0].start()].strip()
+    tail = s[found[-1].end() :].strip()
+    starts = head == "" or _SPEAKER.fullmatch(head) is not None
+    ends = re.fullmatch(r"[\s.,;:!?)\]]*", tail) is not None
+    return texts, starts, ends
+
+
+def anchor_beat(
+    beat: Interval,
+    what: str,
+    words: Sequence[WordLike],
+    *,
+    tight: bool = False,
+    params: IdeasParams = DEFAULT_PARAMS,
+) -> tuple[Interval, bool, bool]:
+    """The beat with its edges on the words its `what` quotes (pure), and which edges moved. The
+    model's times are read off sentence starts, while the quote says what it wants heard: of 306
+    quoting beats of ideas-v2, 111 ended before the quote's last word (2026-11-28). The first
+    quote's first words (3, else 2, else one long word) are looked for from `anchor_reach_s`
+    before the beat to its end, the last quote's last words after those up to `anchor_reach_s`
+    past it, each nearest the model's edge. An edge goes out to its quoted word. With `tight` (a
+    hook: the line itself, nothing around it) it also comes in to it, but only where the quote is
+    that edge of `what` (a description before or after it is something to see); without, the
+    words around the quote stay (a beat quotes its key line, not the lines that set it up). Pads
+    as `snap_beat`."""
+    p = params
+    texts, starts, ends = quotes(what)
+    if not texts:
+        return beat, False, False
+    reach = timedelta(seconds=p.anchor_reach_s)
+    ws = sorted(
+        (w for w in words if w.end_utc > w.start_utc and w.end_utc > beat.start - reach),
+        key=lambda w: (w.start_utc, w.end_utc),
+    )
+    ws = [w for w in ws if w.start_utc < beat.end + reach]
+    toks: list[str] = []
+    owner: list[int] = []
+    for k, w in enumerate(ws):
+        for t in _tokens(w.text):
+            toks.append(t)
+            owner.append(k)
+    first = _tokens(_ELLIPSIS.split(texts[0])[0])
+    last = _tokens(_ELLIPSIS.split(texts[-1])[-1])
+
+    def matches(seq: list[str], *, tail: bool) -> list[int]:
+        """Token positions of the anchor word (the match's first, or with tail its last)."""
+        for k in (3, 2, 1):
+            if len(seq) < k or (k == 1 and (len(seq) > 1 or len(seq[0]) < p.anchor_min_chars)):
+                continue
+            pat = seq[-k:] if tail else seq[:k]
+            hits = [i for i in range(len(toks) - k + 1) if toks[i : i + k] == pat]
+            if hits:
+                return [i + k - 1 for i in hits] if tail else hits
+        return []
+
+    def gap(t: datetime, edge: datetime) -> float:
+        return abs((t - edge).total_seconds())
+
+    a = [i for i in matches(first, tail=False) if ws[owner[i]].start_utc < beat.end]
+    a_word = min(
+        (ws[owner[i]] for i in a), key=lambda w: gap(w.start_utc, beat.start), default=None
+    )
+    after = a_word.start_utc if a_word is not None else beat.start - reach
+    z = [i for i in matches(last, tail=True) if ws[owner[i]].start_utc >= after]
+    z_word = min((ws[owner[i]] for i in z), key=lambda w: gap(w.end_utc, beat.end), default=None)
+    start, end = beat.start, beat.end
+    moved_a = moved_z = False
+    if a_word is not None and (a_word.start_utc < beat.start or (tight and starts)):
+        prev = [w.end_utc for w in ws if w.end_utc <= a_word.start_utc]
+        start = a_word.start_utc - timedelta(seconds=p.pad_before_s)
+        start = max(start, max(prev)) if prev else start
+        moved_a = True
+    if z_word is not None and (z_word.end_utc > beat.end or (tight and ends)):
+        nxt = [w.start_utc for w in ws if w.start_utc >= z_word.end_utc]
+        end = z_word.end_utc + timedelta(seconds=p.pad_after_s)
+        end = min(end, min(nxt)) if nxt else end
+        moved_z = True
+    if end <= start:
+        return beat, False, False
+    return Interval(start, end), moved_a, moved_z
+
+
+def place_beats(
+    beats: Sequence[Beat],
+    words: Sequence[WordLike],
+    sentences: Sequence[Interval] = (),
+    params: IdeasParams = DEFAULT_PARAMS,
+) -> list[Interval]:
+    """An idea's beats (with times) as cut (pure): each edge out to the word its quote names,
+    then on to the next break (`anchor_beat`, `snap_beat`: the quote's last word may be
+    mid-phrase); a hook exactly its quote (in or out, no snap: the line, nothing around it); then
+    no audio twice (`_one_take`)."""
+    speech = [Interval(w.start_utc, w.end_utc) for w in words if w.end_utc > w.start_utc]
+    given = [
+        Interval(b.start_utc, b.end_utc)
+        for b in beats
+        if b.start_utc is not None and b.end_utc is not None
+    ]
+    if len(given) != len(beats):
+        raise ValueError("place_beats needs beats with times")
+    placed = []
+    for b, iv in zip(beats, given, strict=True):
+        tight = b.role == "hook" and not b.keep_whole
+        anchored, at_a, at_z = anchor_beat(iv, b.what, words, tight=tight, params=params)
+        snapped = snap_beat(anchored, speech, sentences, params)  # edges only go further out
+        placed.append(
+            Interval(
+                anchored.start if tight and at_a else snapped.start,
+                anchored.end if tight and at_z else snapped.end,
+            )
+        )
+    return _one_take(given, placed)
+
+
 def notable_seconds(inputs: StreamInputs, params: IdeasParams = DEFAULT_PARAMS) -> list[Interval]:
     """Seconds with a notable sound (a non-speech, non-music class >= sound_min, or loudness
     >= loud_db over the stream's median): kept by `tighten` even without words."""
@@ -964,51 +1254,72 @@ async def cut_previews(
     tight: bool = True,
     params: IdeasParams = DEFAULT_PARAMS,
 ) -> dict[int, Preview]:
-    """`previews/NN-kind.mp4`: each idea's beats in their order (holes skipped), 540p; with
-    `tight`, each beat cut down to its words and notable sounds (`tighten`), unless the model
-    marked it `keep_whole`."""
+    """`previews/NN-kind.mp4`: each idea's beats in their order (holes skipped), 540p, their edges
+    on the words the beat quotes, else moved to breaks in the speech (`place_beats`: no cut inside
+    a word or a phrase); with `tight`, each beat cut down to its words and notable sounds
+    (`tighten`), unless the model marked it `keep_whole`. Every piece fades its audio in and out
+    where the preview jumps (`fade_s`)."""
     from clipper_judge.label import Cutter, chunk_videos, pick_encoder, plan_pieces
 
     work = _ensure_dir(out / "work")
-    cutter = Cutter(store, ffmpeg, pick_encoder(ffmpeg, encoder), work)
+    cutter = Cutter(store, ffmpeg, pick_encoder(ffmpeg, encoder), work, fade_s=params.fade_s)
     sounds = notable_seconds(inputs, params) if tight else []
-    margin = timedelta(seconds=5)
+    reach = max(params.snap_back_max_s, params.snap_forward_max_s, params.anchor_reach_s)
+    margin = timedelta(seconds=reach + 5.0)  # the words any edge can move to, and their pads
+    sentences = [
+        Interval(ensure_utc(s.start_utc), ensure_utc(s.end_utc))
+        for s in inputs.sentences
+        if s.end_utc > s.start_utc
+    ]
     done: dict[int, Preview] = {}
     try:
         for idea in result.ideas:
             path = out / "previews" / f"{idea.n:02d}-{idea.kind}.mp4"
             rel = path.relative_to(out).as_posix()
+            beats = [
+                (b, Interval(b.start_utc, b.end_utc))
+                for b in idea.beats
+                if b.seconds is not None and b.start_utc is not None and b.end_utc is not None
+            ]
+            words: list[transcripts.TranscriptWord] = []
+            for span in merge(iv.expand(margin, margin) for _, iv in beats):
+                async with sessions() as session:
+                    words += await transcripts.words(session, store, inputs.stream_id, span)
+            speech = [Interval(w.start_utc, w.end_utc) for w in words if w.end_utc > w.start_utc]
+            snapped = place_beats([b for b, _ in beats], words, sentences, params)
             ranges: list[Interval] = []
-            for b in idea.beats:
-                if b.seconds is None:
+            for (b, _), beat in zip(beats, snapped, strict=True):
+                if beat.seconds <= 0:
                     continue
-                assert b.start_utc is not None and b.end_utc is not None
-                beat = Interval(b.start_utc, b.end_utc)
-                if not tight or b.keep_whole:
+                if not tight or b.keep_whole or b.role == INSERT:  # an insert is a shot
                     ranges.append(beat)
                     continue
-                async with sessions() as session:
-                    words = await transcripts.words(
-                        session, store, inputs.stream_id, beat.expand(margin, timedelta(0))
-                    )
-                speech = [
-                    Interval(w.start_utc, w.end_utc) for w in words if w.end_utc > w.start_utc
-                ]
-                ranges += tighten(beat, speech, (s for s in sounds if s.overlaps(beat)), params)
+                said = [w for w in speech if w.overlaps(beat)]
+                ranges += tighten(beat, said, (s for s in sounds if s.overlaps(beat)), params)
+            joined: list[Interval] = []  # a range that goes on where the last ended: no jump
+            for r in ranges:
+                if joined and joined[-1].start <= r.start <= joined[-1].end:
+                    joined[-1] = Interval(joined[-1].start, max(joined[-1].end, r.end))
+                else:
+                    joined.append(r)
+            ranges = joined
             seconds = sum(r.seconds for r in ranges)
             if path.exists() and not force:
                 done[idea.n] = Preview(rel, seconds, idea.seconds)
                 continue
             pieces = []
+            jumps: list[tuple[bool, bool]] = []  # fades only where the preview jumps
             for r in ranges:
                 async with sessions() as session:
                     chunks = await chunk_videos(session, inputs.stream_id, r)
-                pieces += plan_pieces(r, chunks)
+                part = plan_pieces(r, chunks)
+                pieces += part
+                jumps += [(k == 0, k == len(part) - 1) for k in range(len(part))]
             if not pieces:
                 log.warning("no video for an idea's beats", idea=idea.n)
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
-            cutter.cut(pieces, path)
+            cutter.cut(pieces, path, jumps)
             done[idea.n] = Preview(rel, seconds, idea.seconds)
             log.info("preview cut", idea=idea.n, file=rel, pieces=len(pieces), seconds=seconds)
     finally:

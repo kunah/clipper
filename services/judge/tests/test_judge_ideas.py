@@ -17,19 +17,26 @@ from clipper_core.timeline import Interval
 from clipper_judge import ideas
 from clipper_judge.fakes import ScriptedJudgeModel
 from clipper_judge.ideas import (
+    Beat,
     EditorRequest,
     IdeasParams,
     LiveMoment,
     SentenceRow,
     StreamInputs,
+    anchor_beat,
     build_ideas_request,
     clock,
     ideas_schema,
+    load_ideas_prompt,
     load_requests,
     notable_seconds,
     parse_clock,
     parse_ideas,
+    place_beats,
+    quotes,
     run_ideas,
+    snap_beat,
+    snap_beats,
     tighten,
 )
 from clipper_judge.label import Cutter, Piece
@@ -144,13 +151,50 @@ def test_request_is_stable_and_general():
     a, b = build_ideas_request(sample()), build_ideas_request(sample())
     assert a.canonical() == b.canonical()
     assert a.schema == ideas_schema() and a.final
-    assert a.prompt_version.startswith("ideas-v2-")
+    assert a.prompt_version.startswith("ideas-v3-")
     assert build_ideas_request(sample(), prompt="ideas-v1").prompt_version.startswith("ideas-v1-")
     other = replace(sample(), sentences=())
     assert build_ideas_request(other).user != a.user
     # the prompt itself names no channel, game or platform
     for word in ("somechannel", "Some Game", "Twitch", "GTA"):
         assert word not in a.system
+
+
+def test_used_prompts_are_frozen():
+    # the saved answers of a used prompt match its version: its files, document and schema stay
+    assert load_ideas_prompt("ideas-v1").version == "ideas-v1-125946fa"
+    assert load_ideas_prompt("ideas-v2").version == "ideas-v2-26f50d51"
+    with pytest.raises(ideas.IdeasError, match="unknown prompt"):
+        build_ideas_request(sample(), prompt="ideas-v99")
+
+
+def test_v3_adds_insert_shots_and_chat_peaks():
+    v2 = build_ideas_request(sample(), prompt="ideas-v2")
+    v3 = build_ideas_request(sample(), prompt="ideas-v3")
+    roles = lambda r: r.schema["properties"]["ideas"]["items"]["properties"]["beats"]["items"]  # noqa: E731
+    assert "insert" in roles(v3)["properties"]["role"]["enum"]
+    assert "insert" not in roles(v2)["properties"]["role"]["enum"]
+    assert "description" not in roles(v2)["properties"]["what"]  # v2's schema as it was
+    assert (v2.schema_version, v3.schema_version) == (2, 3)
+    # one message a minute, and a burst in minute 1 (video time = sent - 2 s of chat delay)
+    msgs = [Msg(at(s + 2), f"m{s}", f"u{s}", f"user{s}", "hi") for s in (40, 130, 200, 250, 610)]
+    burst = (61, 70, 71, 72, 73, 90)
+    msgs += [Msg(at(s + 2), f"b{s}", f"v{s}", f"viewer{s}", "no way") for s in burst]
+    inputs = replace(sample(), chat=msgs)
+    header = next(
+        line
+        for line in build_ideas_request(inputs, prompt="ideas-v3").user.splitlines()
+        if line.startswith("== 0:01")
+    )
+    assert f"chat 6 msgs, 6 users, {TIMES}6.0, peak 0:01:10 |" in header
+    plain = build_ideas_request(inputs, prompt="ideas-v2").user
+    assert ", peak " not in plain and f"chat 6 msgs, 6 users, {TIMES}6.0 |" in plain
+    quiet = next(  # a minute at the median: no peak
+        line
+        for line in build_ideas_request(inputs, prompt="ideas-v3").user.splitlines()
+        if line.startswith("== 0:02")
+    )
+    assert "peak" not in quiet
 
 
 def answer() -> dict:
@@ -388,6 +432,139 @@ def test_tighten():
     assert tighten(beat, [], []) == [beat]  # nothing to go by: the point is on screen
     loose = IdeasParams(max_pause_s=10.0)
     assert tighten(beat, words, [], loose) == [Interval(at(0.85), at(11.25))]
+
+
+def iv(a: float, b: float) -> Interval:
+    return Interval(at(a), at(b))
+
+
+# words of two sentences: S1 [10, 14.2] with a 0.2 s pause inside, a 0.5 s break, S2 [14.7, 20]
+WORDS = [iv(10, 11), iv(11.2, 12.4), iv(12.6, 14.2), iv(14.7, 16), iv(16.1, 18), iv(18.1, 20)]
+SENTENCES = [iv(10, 14.2), iv(14.7, 20)]
+
+
+def test_snap_beat_moves_edges_inside_speech_to_breaks():
+    p = IdeasParams()
+    # the end inside S1 (the model gave the next line's second): out to S1's end + pad
+    assert snap_beat(iv(10, 13), WORDS, SENTENCES, p) == iv(10, 14.45)
+    # the start inside S2: back to its start - pad; an end in a long pause stays
+    assert snap_beat(iv(15.5, 23), WORDS, SENTENCES, p) == iv(14.55, 23)
+    # edges already in pauses stay
+    assert snap_beat(iv(9, 14.5), WORDS, SENTENCES, p) == iv(9, 14.5)
+    # a break between words (>= break_gap_s) counts without sentences
+    words = [iv(10, 11), iv(11.5, 12), iv(12.5, 13)]
+    assert snap_beat(iv(10.5, 11.7), words, (), p) == iv(9.85, 12.25)
+    # no break in reach: the word containing the edge; pads stop at the neighbouring word
+    far = IdeasParams(snap_forward_max_s=1.0, snap_back_max_s=0.5)
+    long_words = [iv(0, 5), iv(5.1, 9), iv(9.1, 30)]
+    assert snap_beat(iv(7, 20), long_words, (), far) == iv(5, 30.25)
+    # an end reaches at most the beat's own length (here 2 s) forward
+    assert snap_beat(iv(15, 17), WORDS, (), p) == iv(14.55, 18.1)
+
+
+def test_snap_beats_never_plays_audio_twice():
+    p = IdeasParams()
+    # two beats the model split inside S2's first word: the second goes on where the first ends
+    first, second = snap_beats([iv(14.7, 15.5), iv(15.6, 20)], WORDS, SENTENCES, p)
+    assert first == iv(14.7, 16.1)
+    assert second == iv(16.1, 20)
+    # a hook that shows a later moment first: the next beat is earlier in time, left alone
+    hook, body = snap_beats([iv(16.1, 18), iv(10, 13)], WORDS, SENTENCES, p)
+    assert hook == iv(14.55, 20.25)
+    assert body == iv(10, 14.45)
+
+
+@dataclass(frozen=True)
+class W:
+    text: str
+    start_utc: datetime
+    end_utc: datetime
+
+
+def say(start: float, line: str, word_s: float = 0.4, gap_s: float = 0.1) -> list[W]:
+    """One phrase: words of `word_s` with `gap_s` between them (no break inside)."""
+    out = []
+    for k, word in enumerate(line.split()):
+        a = start + k * (word_s + gap_s)
+        out.append(W(word, at(a), at(a + word_s)))
+    return out
+
+
+def beat(a: float, b: float, what: str, role: str = "build") -> Beat:
+    return Beat(role, clock(a), clock(b), what, at(a), at(b))
+
+
+def test_quotes_and_whether_they_are_the_edges():
+    assert quotes('Mom: "Pendeja!"') == (["Pendeja!"], True, True)
+    assert quotes("'You suck.' / 'Maybe I'm just bad, bro.'") == (
+        ["You suck.", "Maybe I'm just bad, bro."], True, True,
+    )  # fmt: skip
+    assert quotes('"Classic." then a scream as he crashes') == (["Classic."], True, False)
+    pulls_up = 'They pull up to the house: "No! Oh my god!"'
+    assert quotes(pulls_up) == (["No! Oh my god!"], False, True)
+    assert quotes('He laughs: "There it is"')[1:] == (False, True)  # only a one-word speaker
+    assert quotes("I'm addicted, he's not") == ([], False, False)  # apostrophes aren't quotes
+    assert quotes("“So blessed”.") == (["So blessed"], True, True)
+
+
+def test_anchor_beat_moves_edges_to_the_quoted_words():
+    p = IdeasParams()
+    words = say(10, "installments of 200 dollars") + say(14, "there it is") + say(18, "so what")
+    # the model's end (14.6) is inside the quote: out to its last word (15.4) + pad; the words
+    # before the quote stay
+    placed, a, z = anchor_beat(iv(13, 14.6), '"There it is"', words, params=p)
+    assert (placed, a, z) == (iv(13, 15.65), False, True)
+    # tight (a hook): the start also comes in to "there"
+    placed, a, z = anchor_beat(iv(13, 14.6), '"There it is"', words, tight=True, params=p)
+    assert (placed, a, z) == (iv(13.85, 15.65), True, True)
+    # ... but not past a description before the quote (something to see)
+    laughs = 'He laughs: "There it is"'
+    placed, a, z = anchor_beat(iv(13, 14.6), laughs, words, tight=True, params=p)
+    assert (placed, a, z) == (iv(13, 15.65), False, True)
+    # a beat around its quote: kept as is; tight: cut to the quote
+    assert anchor_beat(iv(13, 17.5), '"There it is"', words, params=p) == (
+        iv(13, 17.5), False, False,
+    )  # fmt: skip
+    hook = anchor_beat(iv(13, 17.5), '"There it is"', words, tight=True, params=p)
+    assert hook == (iv(13.85, 15.65), True, True)
+    # the quote starts before the beat: the start goes out to it (its pad stops at the word before)
+    placed, a, z = anchor_beat(iv(12, 13.5), '"200 dollars"', words, params=p)
+    assert (placed, a, z) == (iv(10.9, 13.5), True, False)
+    # not in the transcript, one short word, or no quote: unchanged
+    unchanged = (iv(13, 14.6), False, False)
+    assert anchor_beat(iv(13, 14.6), '"never said"', words, tight=True, params=p) == unchanged
+    assert anchor_beat(iv(18, 19), '"So"', words, tight=True, params=p) == (
+        iv(18, 19), False, False,
+    )  # fmt: skip
+    assert anchor_beat(iv(13, 14.6), "the car flips", words, tight=True, params=p) == unchanged
+
+
+def test_anchor_beat_picks_the_occurrence_nearest_the_edge():
+    p = IdeasParams()
+    words = say(10, "I'm addicted") + say(13, "I'm addicted") + say(16, "I'm addicted")
+    placed, _, _ = anchor_beat(iv(12.8, 14.0), "'I'm addicted'", words, tight=True, params=p)
+    assert placed == iv(12.85, 14.15)
+
+
+def test_place_beats_anchors_then_snaps_then_one_take():
+    p = IdeasParams()
+    words = say(10, "you okay mother") + say(14, "go get me that big clothing")
+    # the end goes out to the quoted word; a description starts the beat, so its start (inside
+    # "okay") snaps back to the phrase start
+    placed = place_beats([beat(10.6, 11.2, 'The attack, then "mother"')], words, (), p)
+    assert placed == [iv(9.85, 11.65)]
+    # a hook is cut to its quote; the same beat as a build keeps the words around it
+    assert place_beats([beat(13.5, 16.6, '"go get me"', "hook")], words, (), p) == [iv(13.85, 15.5)]
+    assert place_beats([beat(13.5, 16.6, '"go get me"')], words, (), p) == [iv(13.5, 17.15)]
+    # a quote ending mid-phrase ("me", then "that" 0.1 s later): the end goes on to the phrase's
+    # end, so a second beat from the same phrase has nothing new left (no audio twice)
+    first, second = place_beats(
+        [beat(14, 15, '"go get me"'), beat(14.8, 16.6, '"me that big clothing"')], words, (), p
+    )
+    assert first == iv(14, 17.15) and second == iv(17.15, 17.15)
+    # with a pause after the quote's last word, the end stays there
+    words = say(10, "go get me") + say(12, "that big clothing")
+    assert place_beats([beat(9.5, 10.6, '"go get me"')], words, (), p) == [iv(9.5, 11.65)]
 
 
 def test_notable_seconds():

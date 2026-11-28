@@ -330,13 +330,29 @@ def codec_args(encoder: str) -> list[str]:
     return [*video, "-g", str(FPS), "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-ac", "2"]
 
 
-def piece_command(ffmpeg: str, source: str, piece: Piece, encoder: str, out: str) -> list[str]:
+def piece_command(
+    ffmpeg: str,
+    source: str,
+    piece: Piece,
+    encoder: str,
+    out: str,
+    *,
+    fade_in_s: float = 0.0,
+    fade_out_s: float = 0.0,
+) -> list[str]:
     """One piece as its own file of exactly its length on both tracks (frames on the FPS grid,
-    samples at 48 kHz; a short track is padded), so the pieces concatenate without drift."""
+    samples at 48 kHz; a short track is padded), so the pieces concatenate without drift.
+    `fade_in_s`/`fade_out_s`: an audio fade at the piece's start/end (a jump in a preview)."""
     ss = max(piece.offset_s - SEEK_PREROLL_S, 0.0)
     pre = piece.offset_s - ss
     frames = max(round(piece.duration_s * FPS), 1)
     samples = max(round(piece.duration_s * SAMPLE_RATE), 1)
+    fades = ""
+    if fade_in_s > 0:
+        fades += f",afade=t=in:st=0:d={fade_in_s:.3f}"
+    if fade_out_s > 0:
+        start = max(piece.duration_s - fade_out_s, 0.0)
+        fades += f",afade=t=out:st={start:.3f}:d={fade_out_s:.3f}"
     graph = (
         f"[0:v:0]trim=start={pre:.3f},setpts=PTS-{pre:.3f}/TB,scale=-2:{HEIGHT},"
         f"fps=fps={FPS}:start_time=0:round=near,"
@@ -344,7 +360,7 @@ def piece_command(ffmpeg: str, source: str, piece: Piece, encoder: str, out: str
         f"setpts=N/{FPS}/TB[v];"
         f"[0:a:0]atrim=start={pre:.3f},asetpts=PTS-{pre:.3f}/TB,"
         f"aresample={SAMPLE_RATE}:async=1:first_pts=0,apad,atrim=end_sample={samples},"
-        f"asetpts=N/{SAMPLE_RATE}/TB[a]"
+        f"asetpts=N/{SAMPLE_RATE}/TB{fades}[a]"
     )
     return [
         ffmpeg, "-v", "error", "-y",
@@ -363,11 +379,14 @@ def _run(cmd: list[str]) -> None:
 class Cutter:
     """Cuts a case's video from the chunks (each chunk downloaded once per run)."""
 
-    def __init__(self, store: Any, ffmpeg: str, encoder: str, work: Path) -> None:
+    def __init__(
+        self, store: Any, ffmpeg: str, encoder: str, work: Path, *, fade_s: float = 0.0
+    ) -> None:
         self.store = store
         self.ffmpeg = ffmpeg
         self.encoder = encoder
         self.work = work
+        self.fade_s = fade_s  # audio fade where `cut`'s `jumps` say a piece starts/ends a jump
         self.files: dict[str, Path] = {}
 
     def chunk_file(self, key: str) -> Path:
@@ -382,14 +401,33 @@ class Cutter:
             self.files[key] = path
         return self.files[key]
 
-    def cut(self, pieces: Sequence[Piece], out: Path) -> None:
+    def cut(
+        self,
+        pieces: Sequence[Piece],
+        out: Path,
+        jumps: Sequence[tuple[bool, bool]] | None = None,
+    ) -> None:
+        """`jumps`: per piece, whether a jump comes before / after it (fades with `fade_s`)."""
         tmp = Path(tempfile.mkdtemp(prefix="cut-", dir=self.work))
         try:
             parts = []
             for i, p in enumerate(pieces):
                 part = tmp / f"p{i:03d}.mp4"
                 source = str(self.chunk_file(p.chunk_key))
-                _run(piece_command(self.ffmpeg, source, p, self.encoder, str(part)))
+                before, after = jumps[i] if jumps is not None else (False, False)
+                fade_in = self.fade_s if before else 0.0
+                fade_out = self.fade_s if after else 0.0
+                _run(
+                    piece_command(
+                        self.ffmpeg,
+                        source,
+                        p,
+                        self.encoder,
+                        str(part),
+                        fade_in_s=fade_in,
+                        fade_out_s=fade_out,
+                    )
+                )
                 parts.append(part)
             listing = tmp / "list.txt"
             listing.write_text("".join(f"file '{p.name}'\n" for p in parts), encoding="utf-8")
