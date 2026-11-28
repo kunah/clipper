@@ -266,6 +266,10 @@ PROMPT_PINS = {
         "system.md": "7e6609225105b9e408f274d53d26f912edd9d7c2aac266ca760a0c3c1c074000",
         "user.md": "07cf6a46ca0ba274e83441d41ef9a5a63100e4f5ff68c26aa02f06d052abc694",
     },
+    "v2": {  # first used 2026-11-28 (the eval on label set v1 with stills)
+        "system.md": "aa2f323d3f0c6413839d691410bf41865c57cad4c54c4727d4967ccd02331de9",
+        "user.md": "f139a45fe127fb2822edabb535c8b6ec1953913eb1493176d8b4266969b472dd",
+    },
 }
 INPUT_FORMAT_PINS = {  # INPUT_FORMAT -> sha256 of the v1 sample document (judge_input_v1.txt)
     1: "e53cd515939689bcf8df380240e6c85d009dca355678acd27ce6960e5c3b8cf2",

@@ -37,6 +37,10 @@ class JudgeParams:
     loud_db: float = 6.0  # ... or loudness this far above the context's median
     music_risk: float = 0.6  # music this strong = Content ID risk
     core_pad_s: float = 5.0  # core = [moment_from - pad, moment_to + pad]
+    # stills of the video (prompts with a $frames section, `frames.py`): evenly over the core
+    frames_n: int = 8
+    frame_min_gap_s: float = 2.0
+    frame_width: int = 640  # px; 640x360 is ~300 input tokens per still
 
     # ---- resolver: cut points
     snap_window_s: float = 1.5  # a sentence (else word) edge this close is snapped to
@@ -71,6 +75,8 @@ class JudgeParams:
             raise ValueError("zoom_max_scale must lie in [1.0, 1.6] (EditPlan)")
         if self.chat_bucket_s <= 0 or self.words_per_emphasis < 1:
             raise ValueError("chat_bucket_s must be > 0 and words_per_emphasis >= 1")
+        if self.frames_n < 0 or self.frame_min_gap_s < 0 or not 64 <= self.frame_width <= 1920:
+            raise ValueError("frames_n and frame_min_gap_s >= 0, frame_width in [64, 1920]")
 
 
 DEFAULT_PARAMS = JudgeParams()

@@ -39,11 +39,14 @@ check first. The default model is `fake`. Exit 2: invalid arguments, labels or f
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import itertools
 import json
 import math
+import shutil
 import sys
+import tempfile
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -75,7 +78,9 @@ from clipper_judge.evalset import (
     load_labels,
     write_fixture,
 )
+from clipper_judge.frames import FrameGrabber, frame_times
 from clipper_judge.inputs import JudgeInputs, PriorRound
+from clipper_judge.label import chunk_videos
 from clipper_judge.model import (
     JudgeModel,
     ModelError,
@@ -116,6 +121,13 @@ class _ReadOnlyStore:
 
     def get_bytes(self, key: str) -> bytes:
         return self._store.get_bytes(key)
+
+    def download_file(self, key: str, path: Path | str) -> None:
+        download = getattr(self._store, "download_file", None)
+        if download is None:
+            Path(path).write_bytes(self._store.get_bytes(key))
+        else:
+            download(key, path)
 
     def put_bytes(self, key: str, data: bytes, content_type: str | None = None) -> None:
         raise RuntimeError("clipper-judge eval is read-only")
@@ -163,6 +175,11 @@ def add_parser(sub: argparse._SubParsersAction) -> argparse.ArgumentParser:
     )
     e.add_argument("--prompt", metavar="NAME", help="prompt dir (default CLIPPER_JUDGE_PROMPT)")
     e.add_argument(
+        "--frames", type=int, metavar="N",
+        help="stills of the video per case for prompts with a $frames section (default "
+        f"{JudgeParams().frames_n}; 0 = none); database cases only, needs ffmpeg on PATH",
+    )  # fmt: skip
+    e.add_argument(
         "--partial", action="store_true",
         help="judge contexts not fully transcribed (as the service at its hard deadline)",
     )  # fmt: skip
@@ -200,6 +217,8 @@ def check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Non
         parser.error("--save-fixtures writes database cases: not with --fixtures")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be > 0")
+    if getattr(args, "frames", None) is not None and args.frames < 0:
+        parser.error("--frames must be >= 0")
 
 
 def judge_settings(args: argparse.Namespace, base: JudgeSettings) -> JudgeSettings:
@@ -593,6 +612,7 @@ class DbLoader:
         *,
         now: datetime,
         partial: bool,
+        grabber: FrameGrabber | None = None,
     ) -> None:
         self.sessions = sessions
         self.store = store
@@ -602,6 +622,7 @@ class DbLoader:
         self.stream_info = stream_info
         self.now = now
         self.partial = partial
+        self.grabber = grabber  # stills of the video (prompts with $frames), else None
 
     async def __call__(
         self, context: Interval, round_: int, prior: tuple[PriorRound, ...]
@@ -654,7 +675,13 @@ class DbLoader:
                 sfx_tags=self.settings.sfx_tags,
                 audio_only=self.settings.judge_audio_only,
             )
-        return replace(inputs, prior_rounds=prior)
+            chunks = await chunk_videos(s, s_info.id, context) if self.grabber is not None else []
+        inputs = replace(inputs, prior_rounds=prior)
+        if self.grabber is not None:
+            times = frame_times(inputs, self.params)
+            stills = await asyncio.to_thread(self.grabber.grab, chunks, times)
+            inputs = replace(inputs, frames=tuple(stills))
+        return inputs
 
 
 async def db_cases(
@@ -666,6 +693,7 @@ async def db_cases(
     params: JudgeParams,
     *,
     now: datetime,
+    grabber: FrameGrabber | None = None,
 ) -> list[Case]:
     drafts = load_drafts(args.drafts) if getattr(args, "drafts", None) else []
     selected = bool(args.candidate or args.stream or args.channel)
@@ -688,7 +716,15 @@ async def db_cases(
             assert cand is not None
             stream_info = await reads.stream(s, cand.stream_id)
             loader = DbLoader(
-                sessions, store, settings, params, cand, stream_info, now=now, partial=args.partial
+                sessions,
+                store,
+                settings,
+                params,
+                cand,
+                stream_info,
+                now=now,
+                partial=args.partial,
+                grabber=grabber,
             )
             cases.append(
                 Case(
@@ -710,6 +746,7 @@ async def db_cases(
                 stream_info,
                 now=now,
                 partial=args.partial,
+                grabber=grabber,
             )
             cases.append(
                 Case(
@@ -925,7 +962,12 @@ async def run_eval(
     now = now or utc_now()
     labels = load_labels(args.labels) if args.labels else {}
     params = settings.params()
-    prompt_version = load_prompt(settings.prompt).version
+    template = load_prompt(settings.prompt)
+    prompt_version = template.version
+    if getattr(args, "frames", None) is not None:
+        params = replace(params, frames_n=args.frames)
+    grabber: FrameGrabber | None = None
+    work: Path | None = None
     if args.fixtures:
         fixtures = load_fixtures(args.fixtures)
         cases = [
@@ -937,7 +979,14 @@ async def run_eval(
         source = "fixtures"
     else:
         assert sessions is not None and store is not None
-        cases = await db_cases(sessions, store, args, labels, settings, params, now=now)
+        if template.frames and params.frames_n > 0:
+            if shutil.which("ffmpeg") is None:
+                raise UsageError(f"prompt {settings.prompt} takes stills: ffmpeg not on PATH")
+            work = Path(tempfile.mkdtemp(prefix="clipper-judge-frames-"))
+            grabber = FrameGrabber(store, work, width=params.frame_width)
+        cases = await db_cases(
+            sessions, store, args, labels, settings, params, now=now, grabber=grabber
+        )
         source = "database"
         if args.save_fixtures:
             n = await save_fixtures(cases, args.save_fixtures)
@@ -945,7 +994,13 @@ async def run_eval(
     if not await check_model(model):
         return 1
     started = utc_now()
-    results, stopped = await Evaluator(model, params, prompt=settings.prompt).run(cases)
+    try:
+        results, stopped = await Evaluator(model, params, prompt=settings.prompt).run(cases)
+    finally:
+        if grabber is not None:
+            grabber.close()
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
     meta = {
         "model": model.name,
         "options": dict(model.options),
@@ -958,7 +1013,12 @@ async def run_eval(
             "min_clip_s": params.min_clip_s,
             "max_clip_s": params.max_clip_s,
             "max_rounds": params.max_rounds,
+            "frames_n": params.frames_n if template.frames else 0,
+            "frame_width": params.frame_width,
         },
+        "frames": None
+        if grabber is None
+        else {"grabbed": grabber.grabbed, "failed": grabber.failed},
         "stopped": stopped,
     }
     summary = summarize(results)

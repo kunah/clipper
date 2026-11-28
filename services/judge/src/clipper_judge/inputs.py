@@ -75,6 +75,16 @@ class AudioSecondLike(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class Frame:
+    """A still of the stream's video at `at_utc` (video time), e.g. a JPEG (`frames.py`). Only
+    prompts whose `user.md` has a `$frames` section send them (`prompt.PromptTemplate.frames`)."""
+
+    at_utc: datetime
+    data: bytes
+    media_type: str = "image/jpeg"
+
+
+@dataclass(frozen=True, slots=True)
 class PriorRound:
     """An earlier round of this clip that asked for more context (`clip_plans` row)."""
 
@@ -100,6 +110,7 @@ class JudgeInputs:
     - `chat`: raw `chat_messages` over the context shifted by `+ chat_delay_s` (chat time).
     - `sfx_tags`: the tags of the asset manifest (§20); other SFX tags are dropped.
     - `flags`: set by the service, copied into the plan (e.g. `partial_context`).
+    - `frames`: stills of the video (`frames.py`), in time order; empty when none were taken.
     """
 
     clip_id: int
@@ -122,6 +133,7 @@ class JudgeInputs:
     sfx_tags: Sequence[str] = ()
     bots: BotFilter = field(default_factory=NoBots)
     flags: Sequence[str] = ()
+    frames: Sequence[Frame] = ()
 
     def __post_init__(self) -> None:
         anchor = ensure_utc(self.candidate.peak_utc)

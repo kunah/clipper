@@ -8,7 +8,9 @@ One headless `claude -p` process per call, no shell:
            --restricted --system-prompt-file <file> --json-schema <json>
            [--effort <level>] [--max-budget-usd <x>]
 
-with the user content on stdin (closed after writing) and an empty temp dir as the working dir.
+with the user content on stdin (closed after writing) and an empty temp dir as the working dir;
+a request with images (frames) adds `--input-format stream-json` and sends one user message of
+content blocks instead (`stdin_bytes`).
 `--json-schema` works through the CLI's built-in StructuredOutput tool (2 turns, hence
 `--max-turns 3`; seen 2026-11-25: one model request, the second "turn" is the CLI accepting the
 tool call). `--safe-mode --disable-slash-commands --restricted` (`HARDENING`) leave out
@@ -73,6 +75,7 @@ the same environment and requires `authMethod` `oauth_token` or `claude.ai` (and
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import os
@@ -295,6 +298,29 @@ def resolve_command(command: Sequence[str], env: Mapping[str, str]) -> list[str]
 
 
 # --------------------------------------------------------------------------- the process
+
+
+def stdin_bytes(request: JudgeRequest) -> bytes:
+    """What the CLI reads: the user text as is, or with images one stream-json user message
+    (`--input-format stream-json`): the text, then per image its label and the image (base64).
+    Checked 2026-11-28 with CLI 2.1.332: three JPEGs + `--json-schema`, structured answer."""
+    if not request.images:
+        return request.user.encode("utf-8")
+    content: list[dict[str, Any]] = [{"type": "text", "text": request.user}]
+    for im in request.images:
+        content.append({"type": "text", "text": f"{im.label}:"})
+        content.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": im.media_type,
+                    "data": base64.b64encode(im.data).decode("ascii"),
+                },
+            }
+        )
+    message = {"type": "user", "message": {"role": "user", "content": content}}
+    return (json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 class CliProcess:
@@ -689,6 +715,8 @@ class ClaudeCliModel:
             str(MAX_TURNS),
             *HARDENING,
         ]
+        if request.images:  # the user message as content blocks on stdin (`stdin_bytes`)
+            args += ["--input-format", "stream-json"]
         if system_file is not None:
             args += ["--system-prompt-file", str(system_file)]
         else:
@@ -721,7 +749,7 @@ class ClaudeCliModel:
                 system_file.write_bytes(request.system.encode("utf-8"))
             argv = [*command, *self.argv(request, system_file)]
             try:
-                proc = CliProcess(argv, env=self.env, cwd=cwd, stdin=request.user.encode("utf-8"))
+                proc = CliProcess(argv, env=self.env, cwd=cwd, stdin=stdin_bytes(request))
             except OSError as exc:
                 raise PermanentModelError(f"claude could not be started: {exc}") from exc
             try:

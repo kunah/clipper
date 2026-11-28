@@ -18,8 +18,13 @@ instruction; its own version `v{N}r-{sha8}` (system, revise.md, the line format,
 schema), so adding it leaves `v{N}` as it was.
 `request_hash(model, request, options)` = sha256 over the model name, the provider options
 (temperature, reasoning effort, ...: everything that changes the answer) and the canonical
-request (prompt version, schema version, system, user, schema, max tokens):
-`judge_calls.request_hash`.
+request (prompt version, schema version, system, user, schema, max tokens, and the images by
+sha256): `judge_calls.request_hash`.
+
+Frames (stills of the video, `inputs.Frame`): a prompt whose `user.md` has a `$frames` section
+gets a line per frame (`F1 at -12.0 s`) there and the images as `JudgeRequest.images`, labelled
+the same, after the text; its version also covers `FRAMES_FORMAT`. Prompts without the section
+(v1) get neither, and their requests and versions are unchanged.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ import math
 import statistics
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from functools import cache
 from importlib import resources
@@ -49,12 +54,13 @@ from clipper_core.contracts import (
 )
 from clipper_core.timeline import Interval, ensure_utc, merge, uncovered
 from clipper_judge.answer import ANSWER_SCHEMA_VERSION, answer_schema
-from clipper_judge.inputs import ChatMessageLike, JudgeInputs, bridge_jitter
+from clipper_judge.inputs import ChatMessageLike, Frame, JudgeInputs, bridge_jitter
 from clipper_judge.params import DEFAULT_PARAMS, JudgeParams
 from clipper_judge.transcript import Sentence, Transcript, clean_text
 
 PROMPT = "v1"  # the prompt directory used by default
 INPUT_FORMAT = 1  # bump with every change to the line formats built in this module
+FRAMES_FORMAT = 1  # bump with a change to the frame lines or labels (prompts with `$frames`)
 _TRAILING = ".,!?;:"  # a low-confidence marker goes before these: "go(?)."
 _TIMES = chr(0xD7)  # multiplication sign: '"no way" x3'
 
@@ -67,6 +73,11 @@ class PromptTemplate:
     user: Template
     revise: Template | None = None  # revise.md, when the directory has one
     revise_version: str | None = None  # "v1r-<sha8>"
+    frames: bool = False  # user.md has a $frames section: the request carries the stills
+
+
+def _uses(template: str, name: str) -> bool:
+    return f"${name}" in template or f"${{{name}}}" in template
 
 
 @cache
@@ -75,6 +86,7 @@ def load_prompt(name: str = PROMPT) -> PromptTemplate:
     base = resources.files("clipper_judge").joinpath("prompts", name)
     system = base.joinpath("system.md").read_text(encoding="utf-8").replace("\r\n", "\n")
     user = base.joinpath("user.md").read_text(encoding="utf-8").replace("\r\n", "\n")
+    frames = _uses(user, "frames")
     digest = hashlib.sha256()
     for part in (
         system,
@@ -83,6 +95,7 @@ def load_prompt(name: str = PROMPT) -> PromptTemplate:
         str(ANSWER_SCHEMA_VERSION),
         _canonical(answer_schema(False)),
         _canonical(answer_schema(True)),
+        *((f"frames{FRAMES_FORMAT}",) if frames else ()),  # v1's version stays as it was
     ):
         digest.update(part.encode("utf-8"))
         digest.update(b"\0")
@@ -108,7 +121,25 @@ def load_prompt(name: str = PROMPT) -> PromptTemplate:
         Template(user),
         revise,
         revise_version,
+        frames,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class RequestImage:
+    """An image sent after the user text, introduced by its `label` ("F1 (-12.0 s)")."""
+
+    label: str
+    media_type: str
+    data: bytes = field(repr=False)
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.data).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        """Without the bytes (hashes, call records)."""
+        return {"label": self.label, "media_type": self.media_type, "sha256": self.sha256}
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,9 +154,10 @@ class JudgeRequest:
     schema_name: str
     schema: Mapping[str, Any]
     max_tokens: int
+    images: tuple[RequestImage, ...] = ()  # after the user text, in order
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "prompt_version": self.prompt_version,
             "schema_version": self.schema_version,
             "final": self.final,
@@ -135,6 +167,9 @@ class JudgeRequest:
             "schema": self.schema,
             "max_tokens": self.max_tokens,
         }
+        if self.images:  # absent without images: requests of prompts without frames unchanged
+            out["images"] = [im.as_dict() for im in self.images]
+        return out
 
     def canonical(self) -> str:
         """Canonical JSON (sorted keys, no spaces, UTF-8 text): what the hash covers."""
@@ -174,7 +209,36 @@ def build_request(
         schema_name="judge_answer_final" if final else "judge_answer",
         schema=answer_schema(final),
         max_tokens=params.max_output_tokens,
+        images=request_images(inputs) if template.frames else (),
     )
+
+
+def frame_labels(inputs: JudgeInputs) -> list[tuple[str, Frame]]:
+    """The frames inside the context in time order, labelled F1, F2, ... (the frame lines and
+    the images use the same labels)."""
+    ctx = inputs.context
+    inside = sorted(
+        (f for f in inputs.frames if ctx.start <= ensure_utc(f.at_utc) <= ctx.end),
+        key=lambda f: ensure_utc(f.at_utc),
+    )
+    return [(f"F{n}", f) for n, f in enumerate(inside, 1)]
+
+
+def request_images(inputs: JudgeInputs) -> tuple[RequestImage, ...]:
+    t = inputs.anchor
+    return tuple(
+        RequestImage(
+            f"{label} ({_rel(f.at_utc, t)} s)",
+            f.media_type,
+            f.data,
+        )
+        for label, f in frame_labels(inputs)
+    )
+
+
+def _rel(ts: datetime, t: datetime) -> str:
+    s = round((ensure_utc(ts) - t).total_seconds(), 1)
+    return f"{s + 0.0 if s else 0.0:+.1f}"
 
 
 RETRY_ERROR_CHARS = 600  # the stated error is cut to this length
@@ -223,6 +287,7 @@ def _sections(doc: _Doc) -> dict[str, str]:
         "loud_db": _num(p.loud_db),
         "music_risk": _num(p.music_risk),
         "audio": doc.audio(),
+        "frames": doc.frames(),  # used only by templates with a $frames section
     }
 
 
@@ -363,8 +428,7 @@ class _Doc:
         self.delay = timedelta(seconds=inputs.candidate.chat_delay_s)
 
     def rel(self, ts: datetime) -> str:
-        s = round((ensure_utc(ts) - self.t).total_seconds(), 1)
-        return f"{s + 0.0 if s else 0.0:+.1f}"
+        return _rel(ts, self.t)
 
     def span(self, a: datetime, b: datetime) -> str:
         return f"[{self.rel(a)}→{self.rel(b)}]"
@@ -437,6 +501,14 @@ class _Doc:
             labelled = ", ".join(f"{self.span(h.start, h.end)} {self.hole_label(h)}" for h in holes)
             lines.append(f"no video: {labelled}")
         return "\n".join(lines)
+
+    def frames(self) -> str:
+        """One line per still (`frame_labels`): the label and its time; the images follow the
+        text in the same order."""
+        labelled = frame_labels(self.i)
+        if not labelled:
+            return "none (no stills of the video for this context)"
+        return "\n".join(f"{label} at {self.rel(f.at_utc)} s" for label, f in labelled)
 
     def hole_label(self, hole: Interval) -> str:
         """Why media is missing: the overlapping gap row's reason, else off air / none."""
